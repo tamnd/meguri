@@ -22,6 +22,14 @@ type Partition struct {
 	Hosts   []m.HostRecord
 	Strings []byte // arena the URLRef/ETagRef/HostRef/RegistrableRef offsets index
 
+	// SeenFilter is the optional serialized resident seen-set filter (doc 10
+	// section 6, the seen-set filter region). It is the approximate dedup tier
+	// (dedup.SeenSet.MarshalFilter) carried across a checkpoint so a reload does
+	// not re-add every key; empty means the region is omitted and the filter is
+	// rebuilt from the urlkey column on load. The bytes are opaque to the format:
+	// the dedup package owns their layout, the format frames them with a CRC.
+	SeenFilter []byte
+
 	Meta map[string]string // optional string metadata, keys sorted on write
 }
 

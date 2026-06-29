@@ -32,6 +32,13 @@ func Encode(p *Partition) ([]byte, error) {
 	hostOff := pos
 	pos += uint64(len(hostRegion))
 
+	// The seen-set filter region sits between the host table and the string blob
+	// (doc 10 section 2, the region order). It is present only when the caller
+	// carried a serialized filter into the partition.
+	seenRegion := encodeSeensetRegion(p.SeenFilter, uint64(len(p.URLs)), codec)
+	seenOff := pos
+	pos += uint64(len(seenRegion))
+
 	blobRegion := encodeBlobRegion(p.Strings, codec)
 	strOff := pos
 	pos += uint64(len(blobRegion))
@@ -41,6 +48,11 @@ func Encode(p *Partition) ([]byte, error) {
 	regions := []regionDesc{
 		{id: RegionURLTable, offset: urlOff, length: uint64(len(urlRegion)), crc: crc32c(urlRegion)},
 		{id: RegionHostTable, offset: hostOff, length: uint64(len(hostRegion)), crc: crc32c(hostRegion)},
+	}
+	if len(seenRegion) > 0 {
+		regions = append(regions, regionDesc{
+			id: RegionSeenset, offset: seenOff, length: uint64(len(seenRegion)), crc: crc32c(seenRegion),
+		})
 	}
 	if len(blobRegion) > 0 {
 		regions = append(regions, regionDesc{
@@ -76,6 +88,9 @@ func Encode(p *Partition) ([]byte, error) {
 	footerBytes := encodeFooter(footer)
 
 	flags := FlagSorted
+	if len(seenRegion) > 0 {
+		flags |= FlagHasSeenset
+	}
 	if len(p.Strings) > 0 {
 		flags |= FlagHasBlob
 	}
@@ -98,6 +113,7 @@ func Encode(p *Partition) ([]byte, error) {
 	out = append(out, h.Encode()...)
 	out = append(out, urlRegion...)
 	out = append(out, hostRegion...)
+	out = append(out, seenRegion...)
 	out = append(out, blobRegion...)
 	out = append(out, footerBytes...)
 
@@ -171,6 +187,13 @@ func Decode(b []byte) (*Partition, error) {
 		URLs:         urls,
 		Hosts:        hosts,
 		Meta:         metaMap(f.meta),
+	}
+	if reg, ok := findRegion(f.regions, RegionSeenset); ok {
+		blob, err := decodeSeensetRegion(b[reg.offset : reg.offset+reg.length])
+		if err != nil {
+			return nil, err
+		}
+		p.SeenFilter = blob
 	}
 	if reg, ok := findRegion(f.regions, RegionStringBlob); ok {
 		arena, err := decodeBlobRegion(b[reg.offset : reg.offset+reg.length])

@@ -100,7 +100,7 @@ func openLog(path string, dur Durability) (*log, error) {
 	}
 	size, err := f.Seek(0, io.SeekEnd)
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, err
 	}
 	l := &log{f: f, off: size, dur: dur, nextLSN: 1}
@@ -232,7 +232,7 @@ func (l *log) replay(fn func(frame) error) error {
 	if err != nil {
 		return err
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 
 	var off int64
 	br := bufio.NewReaderSize(r, 1<<20)

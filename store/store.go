@@ -437,7 +437,7 @@ func (s *Store) Checkpoint() error {
 		logName:  newLogName,
 	}
 	if err := writeSuperblock(s.superPath(), meta); err != nil {
-		newLog.close()
+		_ = newLog.close()
 		return err
 	}
 
@@ -445,7 +445,7 @@ func (s *Store) Checkpoint() error {
 	s.log = newLog
 	s.logName = newLogName
 	s.gen = nextGen
-	old.close()
+	_ = old.close()
 
 	// Reclaim the superseded log and snapshot; their loss is harmless because the
 	// new checkpoint is the durable home of everything they held.

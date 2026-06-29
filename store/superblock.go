@@ -44,7 +44,7 @@ func encodeSlot(m checkpointMeta) []byte {
 	binary.LittleEndian.PutUint64(b[20:], m.arenaLen)
 	i := 28
 	i += putStr(b[i:], m.snapshot)
-	i += putStr(b[i:], m.logName)
+	putStr(b[i:], m.logName)
 	binary.LittleEndian.PutUint32(b[slotSize-4:], crc32c(b[:slotSize-4]))
 	return b
 }
@@ -132,11 +132,11 @@ func writeSuperblock(path string, m checkpointMeta) error {
 		return err
 	}
 	if _, err := f.WriteAt(b, 0); err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	}
 	if err := f.Sync(); err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	}
 	return f.Close()

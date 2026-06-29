@@ -77,6 +77,13 @@ func (f *Frontier) markCrawled(rec *meguri.URLRecord, h *hostEntry, o meguri.Out
 	if f.prio != nil && len(o.Links) > 0 {
 		f.spreadCash(rec, h, o.Links, now)
 	}
+	// Schedule index (doc 06, M6): file the recrawl. A page that stayed Crawled
+	// re-enters the schedule as DueRecrawl when its NextDue hour arrives; a soft-404
+	// that just tombstoned to Gone is not refiled, so a dead URL leaves the wheel.
+	// Off by default, so the earlier milestones leave a crawl terminal.
+	if f.wheelOn && rec.Status == meguri.StatusCrawled {
+		f.wheel.add(rec.URLKey, rec.NextDue)
+	}
 }
 
 // failURL handles a failed fetch (doc 13, the state update). A 410 Gone, or a

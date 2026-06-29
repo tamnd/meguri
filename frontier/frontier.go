@@ -173,6 +173,15 @@ type Frontier struct {
 	// a 404/410 tombstones, and a redirect creates the target record and points the
 	// source at it.
 	stateOn bool
+
+	// wheelOn turns on the resident due-time schedule index (doc 06, doc 05 near
+	// tier, M6). Off by default, so the earlier milestones treat every seed as
+	// immediately schedulable and a crawl is terminal, byte-for-byte. When set, a
+	// not-yet-due URL waits in the wheel instead of the front bank, and a crawled
+	// URL re-enters the schedule as DueRecrawl when its recrawl interval elapses, so
+	// recrawl happens in the live loop. The wheel is nil until New builds it.
+	wheelOn bool
+	wheel   *dueWheel
 }
 
 // tauTickEvery is how many reschedules pass between background re-estimates of
@@ -325,6 +334,21 @@ func WithStateMachine() Option {
 	return func(f *Frontier) { f.stateOn = true }
 }
 
+// WithScheduleIndex turns on the resident due-time schedule index (doc 06, doc 05
+// near tier, M6): a hashed timing wheel that defers a not-yet-due URL until its
+// NextDue arrives instead of leaving it in the front bank for the dispatch path
+// to keep skipping. With it on, a future-dated seed waits until its hour and a
+// crawled URL re-enters the schedule as DueRecrawl when its recrawl interval
+// elapses, so recrawl actually runs in the live loop rather than a crawl being
+// terminal. Off by default, so the earlier milestones treat every seed as
+// immediately schedulable and their dispatch sequences are byte-for-byte
+// unchanged. The wheel is derived from the URL table's NextDue and Status, so
+// Recover rebuilds it without serializing it. Pair it with WithStateMachine and
+// WithFreshness for a live recrawling partition.
+func WithScheduleIndex() Option {
+	return func(f *Frontier) { f.wheelOn = true }
+}
+
 // New returns an empty frontier for partition id, stamped created (epoch-hours)
 // as its build time.
 func New(id, created uint32, opts ...Option) *Frontier {
@@ -345,6 +369,9 @@ func New(id, created uint32, opts ...Option) *Frontier {
 	f.ips = politeness.NewIPTable(f.pol.IPFloor)
 	for _, o := range opts {
 		o(f)
+	}
+	if f.wheelOn {
+		f.wheel = newDueWheel(f.created)
 	}
 	return f
 }
@@ -392,9 +419,9 @@ func (f *Frontier) Pending() int {
 // Seed inserts a first-crawl candidate. url is the canonical URL, host its
 // grouping string, priority its initial importance, firstSeen and nextDue
 // epoch-hours, and crawlDelay the host's politeness interval in deciseconds. A
-// URL already present is ignored, so seeding is idempotent. M1 treats every
-// seed as immediately schedulable; the due-time index that would defer a
-// not-yet-due URL is the timing wheel of M6.
+// URL already present is ignored, so seeding is idempotent. Without the schedule
+// index every seed is immediately schedulable; with it on (WithScheduleIndex) a
+// seed dated into the future waits in the due-time wheel until its hour.
 func (f *Frontier) Seed(url, host string, priority float32, firstSeen, nextDue uint32, crawlDelay uint16) {
 	hk := meguri.HostKeyOf(host)
 	key := meguri.URLKey{HostKey: hk, PathKey: meguri.PathKeyOf(PathOf(url))}
@@ -430,7 +457,10 @@ func (f *Frontier) Seed(url, host string, priority float32, firstSeen, nextDue u
 		f.prio.SeedCash(key, priority)
 		rec.Priority = f.prio.Priority(rec, &h.rec)
 	}
-	f.frontPush(key, rec.Priority, firstSeen)
+	// With the schedule index on, a seed dated into the future waits in the wheel
+	// until its hour rather than dispatching at once; a same-hour seed (nextDue at
+	// or before its first-seen hour, the common case) front-pushes immediately.
+	f.schedule(key, rec, firstSeen, firstSeen)
 }
 
 // Discover is the idempotent intake of a routed out-link (doc 08, section 9.3,
@@ -550,6 +580,7 @@ func (f *Frontier) Warm(key meguri.URLKey, etag string, lastModified uint32, pre
 // would open a host. The caller fetches the returned Request and feeds the
 // outcome back through Report.
 func (f *Frontier) Dispatch(now uint32) (fetch.Request, bool) {
+	f.promoteDue(now) // fire any recrawl whose hour has arrived back into the schedule
 	f.promote(now)
 	f.distribute(now)
 
@@ -602,11 +633,23 @@ func (f *Frontier) Dispatch(now uint32) (fetch.Request, bool) {
 // drained for this run). When Dispatch returns false, the scheduler advances
 // its clock to this time and tries again.
 func (f *Frontier) NextEligible() (uint32, bool) {
-	it, ok := f.wait.peekMin()
-	if !ok {
-		return 0, false
+	var best uint32
+	var ok bool
+	if it, has := f.wait.peekMin(); has {
+		best, ok = it.eligible, true
 	}
-	return it.eligible, true
+	// The schedule index can hold the earliest event when no host is parked: a
+	// recrawl due later than any open politeness window. Advancing to it lets the
+	// loop sleep to the next due recrawl rather than reporting the frontier drained.
+	if f.wheelOn {
+		if dueH, has := f.wheel.nextDue(); has {
+			t := dueH * 3600
+			if !ok || t < best {
+				best, ok = t, true
+			}
+		}
+	}
+	return best, ok
 }
 
 // Report records the outcome of a dispatched URL at clock time now. It marks the
@@ -712,6 +755,50 @@ func (f *Frontier) frontPush(key meguri.URLKey, priority float32, enqueued uint3
 	f.urlFront.push(key, priority)
 	if f.bounded {
 		f.frontAge = append(f.frontAge, frontWait{key: key, enqueued: enqueued})
+	}
+}
+
+// schedule files a schedulable URL into either the resident due-time wheel or the
+// front bank. With the wheel off it always front-pushes, the M1 behavior. With
+// the wheel on, a URL whose NextDue is still ahead of nowHours waits in the wheel
+// until its hour, while one already due (the common case for a fresh seed or
+// discovery, NextDue at or before nowHours) front-pushes at once. enqueued is the
+// front-bank wait clock the anti-starvation sweep reads.
+func (f *Frontier) schedule(key meguri.URLKey, rec *meguri.URLRecord, nowHours, enqueued uint32) {
+	if f.wheelOn && rec.NextDue > nowHours {
+		f.wheel.add(key, rec.NextDue)
+		return
+	}
+	f.frontPush(key, rec.Priority, enqueued)
+}
+
+// promoteDue fires the schedule index: every URL whose NextDue has arrived by now
+// leaves the wheel and re-enters the front bank, a crawled URL coming back as
+// DueRecrawl and a deferred seed as the Scheduled URL it already was. It runs at
+// the head of every Dispatch so a due recrawl competes for a host slot the moment
+// its hour passes, and is a no-op when the wheel is off.
+func (f *Frontier) promoteDue(now uint32) {
+	if !f.wheelOn {
+		return
+	}
+	for _, key := range f.wheel.due(now / 3600) {
+		rec := f.records[key]
+		if rec == nil {
+			continue
+		}
+		switch rec.Status {
+		case meguri.StatusCrawled:
+			rec.Status = meguri.StatusDueRecrawl // a recrawl interval elapsed
+		case meguri.StatusScheduled, meguri.StatusDueRecrawl:
+			// a deferred seed or an already-due recrawl keeps its status
+		default:
+			continue // Gone, Excluded, or Trapped never recrawl
+		}
+		if f.hosts[rec.HostKey] == nil {
+			host := HostOf(f.arena.str(rec.URLRef))
+			f.hosts[rec.HostKey] = f.newHost(rec.HostKey, f.arena.intern(host), host, 10)
+		}
+		f.frontPush(key, rec.Priority, now/3600)
 	}
 }
 
@@ -914,6 +1001,15 @@ func Recover(p *format.Partition, opts ...Option) *Frontier {
 			// the sweep at its first-seen hour, so a host already starving before the
 			// checkpoint keeps its claim to promotion after it.
 			f.frontPush(r.URLKey, r.Priority, r.FirstSeen)
+		case meguri.StatusCrawled:
+			// Rebuild the schedule index from the durable URL table: a crawled URL
+			// with a due time is a pending recrawl, so it goes back in the wheel and
+			// re-enters the front bank when its hour arrives (doc 11, the durable form
+			// of the index). An overdue one fires on the first Dispatch. A no-op when
+			// the wheel is off, so recovery is otherwise byte-for-byte unchanged.
+			if f.wheelOn && r.NextDue > 0 {
+				f.wheel.add(r.URLKey, r.NextDue)
+			}
 		}
 	}
 	return f

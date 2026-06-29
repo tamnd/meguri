@@ -1,5 +1,7 @@
 package meguri
 
+import "strconv"
+
 // URLStatus is the state-machine state of a frontier entry. The values are
 // stable and stored in the status column (doc 03, doc 10).
 type URLStatus uint8
@@ -15,6 +17,34 @@ const (
 	StatusExcludedRobots                  // disallowed by robots.txt
 	StatusTrapped                         // flagged by trap detection
 )
+
+// String names the status for human-readable reports (meguri stats, inspect).
+// An out-of-range value prints its number so a forward-compatible reader never
+// loses information.
+func (s URLStatus) String() string {
+	switch s {
+	case StatusDiscovered:
+		return "discovered"
+	case StatusScheduled:
+		return "scheduled"
+	case StatusReady:
+		return "ready"
+	case StatusInFlight:
+		return "in_flight"
+	case StatusCrawled:
+		return "crawled"
+	case StatusDueRecrawl:
+		return "due_recrawl"
+	case StatusGone:
+		return "gone"
+	case StatusExcludedRobots:
+		return "excluded_robots"
+	case StatusTrapped:
+		return "trapped"
+	default:
+		return "status(" + strconv.Itoa(int(s)) + ")"
+	}
+}
 
 // DiscoverySource records how a URL entered the frontier.
 type DiscoverySource uint8

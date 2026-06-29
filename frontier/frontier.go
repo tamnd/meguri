@@ -123,6 +123,15 @@ type Frontier struct {
 	// Because the sink sees the links only after the split, a remote link still
 	// carries the cash its source granted, which its owner credits on receipt.
 	linkSink func([]meguri.Discovery) []meguri.Discovery
+
+	// stateOn turns on the full outcome state machine (doc 13, the state update).
+	// nil/false keeps the earlier milestones' behavior: every outcome marks the URL
+	// Crawled and folds into AIMD once, so the M3 corpus gate (a 5xx counts as one
+	// folded error, not a retried one) is byte-for-byte unchanged. When set, a
+	// transient failure backs off and re-queues up to a retry limit then tombstones,
+	// a 404/410 tombstones, and a redirect creates the target record and points the
+	// source at it.
+	stateOn bool
 }
 
 // tauTickEvery is how many reschedules pass between background re-estimates of
@@ -214,6 +223,19 @@ func WithPrioritizer(p prioritize.Params) Option {
 // so the fold splits local from remote in one place.
 func WithLinkRouter(sink func([]meguri.Discovery) []meguri.Discovery) Option {
 	return func(f *Frontier) { f.linkSink = sink }
+}
+
+// WithStateMachine turns on the full outcome state machine (doc 13, the state
+// update). Without it every outcome marks the URL Crawled, the earlier
+// milestones' behavior. With it the outcome drives the URL through its
+// transitions: a 200 or 304 to Crawled, a transient failure (Retryable, or a
+// 429/5xx) backed off and re-queued up to a retry limit then to Gone, a 404 or
+// 410 to Gone, and a redirect to Crawled with the target canonicalized, created
+// as its own record, and the source's redirect_ref pointed at it. The engine
+// turns this on for a live crawl; the scheduler-only gates leave it off so their
+// dispatch counts stay exact.
+func WithStateMachine() Option {
+	return func(f *Frontier) { f.stateOn = true }
 }
 
 // New returns an empty frontier for partition id, stamped created (epoch-hours)
@@ -475,63 +497,28 @@ func (f *Frontier) Report(o meguri.Outcome, now uint32) {
 	if h != nil && len(h.back) > 0 && h.back[0] == o.URLKey {
 		h.back = h.back[1:]
 	}
-	rec.Status = meguri.StatusCrawled
 	rec.HTTPStatus = o.HTTPStatus
-	if rec.FirstSeen == 0 {
-		rec.FirstSeen = o.FetchedAt // anchor the history clock on the first crawl
-	}
-	rec.LastCrawled = o.FetchedAt
-	rec.CrawlCount++
-	rec.NextDue = o.FetchedAt + recrawlGapHours
 
-	// Classify the change against the stored signals (doc 08, section 7.4). A
-	// soft-404 template is recorded as Gone, restoring the stop signal the 200
-	// tried to defeat (doc 08, section 8.6). A meaningful change increments the
-	// change count and stamps last-changed, the signal doc 06's rate estimator
-	// reads; a cosmetic change (simhash within Hamming 3) does not, so a rotating
-	// ad never poisons lambda.
-	if !o.NotModified && o.ContentFP != 0 {
-		if f.soft.Observe(rec.HostKey, o.ContentFP, o.URLKey) {
-			rec.Status = meguri.StatusGone
+	// Drive the URL through its outcome state machine (doc 13, the state update).
+	// With the state machine off, every outcome is a crawl: the earlier milestones
+	// fold a 5xx into AIMD and call it done, which is what their gates assert. With
+	// it on, the outcome's status and Retryable flag pick the transition.
+	if f.stateOn {
+		switch {
+		case o.NotModified:
+			f.markCrawled(rec, h, o, now) // 304: a no-change crawl
+		case o.RedirectTarget != "" || (o.HTTPStatus >= 300 && o.HTTPStatus < 400):
+			f.recordRedirect(rec, o, now) // create the target, point the source at it
+			f.markCrawled(rec, h, o, now) // the source resolved
+		case o.Retryable || (o.HTTPStatus >= 400 && o.HTTPStatus <= 599):
+			f.failURL(rec, h, o) // transient backoff-and-retry, or 404/410 to Gone
+		default:
+			f.markCrawled(rec, h, o, now) // 2xx
 		}
-		if rec.ContentFP != 0 { // a prior fetch left a signal to compare against
-			switch dedup.ClassifyChange(rec.ContentFP, o.ContentFP, rec.Simhash, o.Simhash) {
-			case dedup.NoChange, dedup.CosmeticChange:
-				rec.NoChangeStreak++
-			case dedup.RealChange:
-				rec.ChangeCount++
-				rec.NoChangeStreak = 0
-				rec.LastChanged = o.FetchedAt
-			}
-		}
-		rec.ContentFP = o.ContentFP
-		rec.Simhash = o.Simhash
+	} else {
+		f.markCrawled(rec, h, o, now)
 	}
-	// A 304 is a no-change observation: the conditional GET saved the body and
-	// the freshness model reads the streak (doc 06).
-	if o.NotModified {
-		rec.NoChangeStreak++
-	}
-	// Store fresh validators so the next fetch can go conditional.
-	if o.ETag != "" {
-		rec.ETagRef = f.arena.intern(o.ETag)
-	}
-	if o.LastModified != 0 {
-		rec.LastModified = o.LastModified
-	}
-	// Freshness rescheduling (doc 06): with the rescheduler on, the change counters
-	// updated just above feed the Poisson estimate, and the URL's next_due and
-	// status come from the allocation rather than the flat M1 placeholder.
-	if f.fresh != nil {
-		f.reschedule(rec, h, now)
-	}
-	// Prioritization (doc 09): a crawled page distributes its accumulated OPIC cash
-	// across its extracted out-links and ingests them, so importance flows to what
-	// it links to and the front bank reorders as the crawl learns the graph. Off by
-	// default, so the earlier milestones never run it.
-	if f.prio != nil && len(o.Links) > 0 {
-		f.spreadCash(rec, h, o.Links, now)
-	}
+
 	if h == nil {
 		return
 	}

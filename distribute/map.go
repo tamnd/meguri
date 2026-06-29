@@ -68,6 +68,7 @@ type PartitionMeta struct {
 	Health    HealthState
 	HostKeyLo uint64
 	HostKeyHi uint64
+	Primary   MachineID     // the machine running this partition (0 when unplaced)
 	Replicas  []PartitionID // the N-1 replicas for this partition's hosts
 }
 

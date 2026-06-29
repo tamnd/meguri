@@ -10,20 +10,31 @@ import "sync"
 // control plane is down the fleet keeps crawling against its last-known map; only
 // the four control operations (add, remove, pin, fail over) wait on it.
 type Control struct {
-	mu       sync.Mutex
-	m        *Map
-	machines []Machine // the fleet, for rendezvous replica placement
+	mu            sync.Mutex
+	m             *Map
+	machines      []Machine           // the fleet, for rendezvous replica placement
+	misses        map[PartitionID]int // consecutive missed heartbeats per partition
+	failThreshold int                 // missed heartbeats before a partition is Failed
 }
+
+// DefaultFailThreshold is the number of consecutive missed heartbeats that moves
+// a partition from Degraded to Failed. A handful of misses rides out a transient
+// stall; a sustained run is a real loss (doc 12, section 5).
+const DefaultFailThreshold = 3
 
 // NewControl starts a control plane with a single partition and no replicas,
 // the smallest valid fleet, which a caller grows with AddPartition.
 func NewControl() *Control {
-	return &Control{m: &Map{
-		Epoch:         1,
-		NumPartitions: 1,
-		Replicas:      0,
-		Partitions:    []PartitionMeta{{ID: 0, Health: Alive}},
-	}}
+	return &Control{
+		m: &Map{
+			Epoch:         1,
+			NumPartitions: 1,
+			Replicas:      0,
+			Partitions:    []PartitionMeta{{ID: 0, Health: Alive}},
+		},
+		misses:        map[PartitionID]int{},
+		failThreshold: DefaultFailThreshold,
+	}
 }
 
 // FetchMap returns a snapshot of the current map for a router to cache. It is a
@@ -122,9 +133,12 @@ func (c *Control) SetHealth(id PartitionID, h HealthState) {
 // bump increments the epoch; callers hold the lock.
 func (c *Control) bump() { c.m.Epoch++ }
 
-// replace recomputes every partition's replica set from the current machine list
-// by rendezvous placement; callers hold the lock. With no machines or no replica
-// factor it clears the replica sets, the single-box default.
+// replace recomputes every partition's primary and replica set from the current
+// machine list by rendezvous placement; callers hold the lock. With no machines
+// or no replica factor it clears the replica sets and leaves the primary as the
+// single-box default. When a machine carries an Address the partition's routing
+// address follows its primary, so a promotion that moves the primary also moves
+// where discoveries land (doc 12, section 5).
 func (c *Control) replace() {
 	if len(c.machines) == 0 || c.m.Replicas <= 0 {
 		for i := range c.m.Partitions {
@@ -146,7 +160,15 @@ func (c *Control) replace() {
 		} else {
 			pref = preferenceList(c.m.Partitions[i].ID, machineIDs(c.machines), c.m.Replicas)
 		}
+		if len(pref) == 0 {
+			c.m.Partitions[i].Replicas = nil
+			continue
+		}
 		// The first entry is the primary; the rest are the replicas.
+		c.m.Partitions[i].Primary = pref[0]
+		if addr := c.addressOf(pref[0]); addr != "" {
+			c.m.Partitions[i].Address = addr
+		}
 		if len(pref) > 1 {
 			ids := make([]PartitionID, 0, len(pref)-1)
 			for _, mid := range pref[1:] {
@@ -157,6 +179,17 @@ func (c *Control) replace() {
 			c.m.Partitions[i].Replicas = nil
 		}
 	}
+}
+
+// addressOf returns a machine's address, or "" if the machine is unknown or
+// carries no address; callers hold the lock.
+func (c *Control) addressOf(id MachineID) string {
+	for _, mac := range c.machines {
+		if mac.ID == id {
+			return mac.Address
+		}
+	}
+	return ""
 }
 
 func machineIDs(machines []Machine) []MachineID {

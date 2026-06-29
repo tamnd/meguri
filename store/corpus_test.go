@@ -230,6 +230,162 @@ func TestCorpusLargerThanMemory(t *testing.T) {
 		len(urls), s.Resident(), 100*float64(budget)/float64(len(urls)), spilled)
 }
 
+// TestCorpusCheckpointReclaims is the M6 compaction gate on the real slice (doc 11
+// section 4.2, audit 237): the log and string arena accumulate superseded frames
+// and dead strings as records are rewritten, and the checkpoint rotation is what
+// reclaims them. It loads the slice, then rewrites every record and re-interns its
+// URL across many checkpoint generations, the churn that would grow an unrotated
+// log without bound, and checks two reclamation properties after each generation.
+//
+// First, the directory holds exactly the live working set: the superblock, one
+// snapshot, and one active log. An old generation's snapshot and log are removed on
+// commit, so the file set never grows with the number of generations. Second, the
+// on-disk footprint stays bounded: generation twelve sits within a small factor of
+// generation one, proving the rotation reclaims the superseded state rather than
+// letting it pile up. A store that kept every superseded frame would grow its
+// footprint linearly in the generation count and fail both checks.
+//
+// This is the meguri side of compaction: the checkpoint subsumes a GC for M6. The
+// continuous live-copy-forward compactor under epoch protection (Spec 2070 hashlog)
+// is the external follow-up; the reclamation meguri itself owns is gated here.
+func TestCorpusCheckpointReclaims(t *testing.T) {
+	path := os.Getenv("MEGURI_CORPUS")
+	if path == "" {
+		t.Skip("set MEGURI_CORPUS to the pinned ccrawl jsonl slice (corpus/urls.jsonl)")
+	}
+	urls := loadCorpusURLs(t, path, 20000)
+	if len(urls) < 5000 {
+		t.Fatalf("corpus too thin: %d distinct URLs", len(urls))
+	}
+	dir := t.TempDir()
+	s := loadStore(t, dir, Options{Durability: DurabilityNormal}, urls)
+	defer s.Close()
+	wantURLs := s.URLCount()
+
+	if err := s.Checkpoint(); err != nil {
+		t.Fatalf("checkpoint gen 1: %v", err)
+	}
+	names, base := storeFootprint(t, dir)
+	assertLiveFileSet(t, names, 1)
+
+	// Churn many generations: each one rewrites every record with a changed field
+	// and re-interns its URL, superseding the prior frames and orphaning the prior
+	// arena bytes, then checkpoints. An unrotated log would grow with every pass.
+	const generations = 12
+	for gen := 2; gen <= generations; gen++ {
+		for i := range urls {
+			u := &urls[i]
+			ref, err := s.Intern(u.url)
+			if err != nil {
+				t.Fatalf("re-intern gen %d: %v", gen, err)
+			}
+			if _, err := s.PutURL(&meguri.URLRecord{
+				URLKey:          meguri.MakeURLKey(u.host, u.path),
+				HostKey:         meguri.HostKeyOf(u.host),
+				Status:          meguri.StatusScheduled,
+				Priority:        float32((i+gen)%1000) / 1000,
+				URLRef:          ref,
+				HTTPStatus:      u.status,
+				FirstSeen:       100,
+				LastCrawled:     uint32(gen),
+				DiscoverySource: meguri.SourceSeed,
+			}); err != nil {
+				t.Fatalf("re-put gen %d: %v", gen, err)
+			}
+		}
+		if err := s.Checkpoint(); err != nil {
+			t.Fatalf("checkpoint gen %d: %v", gen, err)
+		}
+		if s.URLCount() != wantURLs {
+			t.Fatalf("gen %d changed the live count: %d, want %d", gen, s.URLCount(), wantURLs)
+		}
+		names, size := storeFootprint(t, dir)
+		assertLiveFileSet(t, names, gen)
+		// The footprint must not grow with generations. A 2x ceiling over generation
+		// one absorbs the active log relative to the snapshot while still failing any
+		// store that retained superseded generations.
+		if size > 2*base {
+			t.Fatalf("gen %d footprint %d bytes exceeded 2x the gen-1 footprint %d, rotation is not reclaiming",
+				gen, size, base)
+		}
+	}
+
+	// The reclaimed store still recovers the full live set byte for byte.
+	s.Close()
+	r, err := Open(dir, Options{Durability: DurabilityNormal})
+	if err != nil {
+		t.Fatalf("recover after churn: %v", err)
+	}
+	defer r.Close()
+	if r.URLCount() != wantURLs {
+		t.Fatalf("recovery after churn lost rows: %d, want %d", r.URLCount(), wantURLs)
+	}
+	var checked int
+	for i := range urls {
+		if i%97 != 0 {
+			continue
+		}
+		u := urls[i]
+		rec, ok := r.GetURL(meguri.MakeURLKey(u.host, u.path))
+		if !ok || r.Str(rec.URLRef) != u.url {
+			t.Fatalf("churned recovery lost %s: ok=%v got %q", u.url, ok, r.Str(rec.URLRef))
+		}
+		if rec.LastCrawled != uint32(generations) {
+			t.Fatalf("recovered stale generation for %s: LastCrawled %d, want %d", u.url, rec.LastCrawled, generations)
+		}
+		checked++
+	}
+	_, finalSize := storeFootprint(t, dir)
+	t.Logf("M6 reclamation gate: %d URLs over %d checkpoint generations, footprint held at %d bytes (gen-1 %d, %.2fx), %d records verified",
+		wantURLs, generations, finalSize, base, float64(finalSize)/float64(base), checked)
+}
+
+// storeFootprint returns the names and total byte size of every file in a store
+// directory, the on-disk cost a reclamation gate watches across generations.
+func storeFootprint(tb testing.TB, dir string) (names []string, total int64) {
+	tb.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			tb.Fatal(err)
+		}
+		names = append(names, e.Name())
+		total += info.Size()
+	}
+	return names, total
+}
+
+// assertLiveFileSet checks a store directory holds only the live working set after
+// a checkpoint: the superblock, exactly one .meguri snapshot, and exactly one log.
+// Any superseded snapshot or log still present is a reclamation leak.
+func assertLiveFileSet(tb testing.TB, names []string, gen int) {
+	tb.Helper()
+	var snaps, logs, supers int
+	for _, n := range names {
+		switch {
+		case strings.HasSuffix(n, ".meguri"):
+			snaps++
+		case strings.HasPrefix(n, "log-"):
+			logs++
+		case n == "super":
+			supers++
+		default:
+			tb.Fatalf("gen %d: unexpected file %q in store dir", gen, n)
+		}
+	}
+	if snaps != 1 || logs != 1 || supers != 1 {
+		tb.Fatalf("gen %d: live file set not reclaimed, have %d snapshots %d logs %d superblocks (%v)",
+			gen, snaps, logs, supers, names)
+	}
+}
+
 // snapshotSize returns the byte size of the .meguri snapshot the checkpoint wrote.
 func snapshotSize(tb testing.TB, dir string) int64 {
 	tb.Helper()

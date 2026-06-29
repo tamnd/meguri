@@ -48,6 +48,52 @@ func seedPartitionDir(t *testing.T, host string, n int) string {
 	return dir
 }
 
+// seedScheduledDir builds a wheel-on partition directory whose URLs carry an
+// explicit due hour, so the checkpoint serializes the durable schedule region and
+// both the live and cold schedule reads have due work to find. It returns the dir.
+func seedScheduledDir(t *testing.T, host string, n int, due uint32) string {
+	t.Helper()
+	dir := t.TempDir()
+	p, err := engine.OpenPartition(dir, store.Options{}, frontier.WithStateMachine(), frontier.WithScheduleIndex())
+	if err != nil {
+		t.Fatalf("open partition: %v", err)
+	}
+	for i := range n {
+		p.Frontier().Seed("https://"+host+"/p/"+string(rune('a'+i)), host, 0.5, 0, due, 10)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("close partition: %v", err)
+	}
+	return dir
+}
+
+// TestScheduleCommand gates the schedule command on both reads: live recovers the
+// frontier and lists due URLs with their strings; cold reads the same partition's
+// .meguri through the durable timing wheel, the predicate pushdown D13 wires in.
+func TestScheduleCommand(t *testing.T) {
+	dir := seedScheduledDir(t, "alpha.example", 4, 10)
+
+	live := runCmd(t, newScheduleCmd(), "--data", dir, "--before", "100")
+	if !strings.Contains(live, "(live)") {
+		t.Fatalf("live schedule missing live marker:\n%s", live)
+	}
+	if !strings.Contains(live, "4 shown") {
+		t.Fatalf("live schedule did not list the four due URLs:\n%s", live)
+	}
+	if !strings.Contains(live, "https://alpha.example/p/a") {
+		t.Fatalf("live schedule missing a canonical URL:\n%s", live)
+	}
+
+	megFile := findMeguriFile(t, dir)
+	cold := runCmd(t, newScheduleCmd(), "--data", megFile, "--before", "100")
+	if !strings.Contains(cold, "durable schedule wheel") {
+		t.Fatalf("cold schedule did not use the durable wheel pushdown:\n%s", cold)
+	}
+	if !strings.Contains(cold, "hour 100: 4") {
+		t.Fatalf("cold schedule did not count the four due keys:\n%s", cold)
+	}
+}
+
 // TestStatsCommandLiveAndCold gates the stats command on both inputs the spec
 // names: a partition directory (recover the frontier, print the per-status
 // distribution and seen-set occupancy) and a single .meguri file (print the footer

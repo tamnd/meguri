@@ -97,10 +97,12 @@ func TestScheduleIndexDefersFutureSeed(t *testing.T) {
 	}
 }
 
-// TestScheduleIndexSurvivesRecover checks the wheel is rebuilt from the durable
-// URL table: a crawled URL with a pending recrawl, checkpointed and recovered,
-// still re-enters the schedule at its NextDue hour, so recrawl survives a restart
-// without the index being serialized.
+// TestScheduleIndexSurvivesRecover checks the wheel survives a restart two ways:
+// the checkpoint now serializes the durable timing-wheel region (decision D13, so a
+// cold reader can pushdown), and Recover still rebuilds the resident wheel from the
+// URL table, so recrawl re-enters the schedule at its NextDue hour either way. A
+// crawled URL with a pending recrawl, checkpointed and recovered, still re-dispatches
+// at the due hour.
 func TestScheduleIndexSurvivesRecover(t *testing.T) {
 	f := New(1, 0, WithScheduleIndex(), WithStateMachine())
 	host := "persist.test"
@@ -111,6 +113,15 @@ func TestScheduleIndexSurvivesRecover(t *testing.T) {
 	blob, err := f.CheckpointBytes()
 	if err != nil {
 		t.Fatalf("checkpoint: %v", err)
+	}
+	// The wheel-on checkpoint now carries the durable schedule region (D13): the
+	// cold read path can find due work without recovering the frontier.
+	rd, err := format.NewReader(blob)
+	if err != nil {
+		t.Fatalf("reader: %v", err)
+	}
+	if !rd.HasSchedule() {
+		t.Fatal("wheel-on checkpoint did not serialize the durable schedule region")
 	}
 	p, err := format.Decode(blob)
 	if err != nil {

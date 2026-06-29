@@ -94,6 +94,84 @@ func TestScheduleCommand(t *testing.T) {
 	}
 }
 
+// TestPackCommand gates the pack command: it writes a partition directory's live
+// state to a fresh .meguri file, and the file reads back through the cold stats
+// path with the same six seeded URLs. Packing must not mutate the source.
+func TestPackCommand(t *testing.T) {
+	dir := seedPartitionDir(t, "alpha.example", 6)
+	out := filepath.Join(t.TempDir(), "snap.meguri")
+
+	res := runCmd(t, newPackCmd(), "--data", dir, "--out", out)
+	if !strings.Contains(res, "packed") || !strings.Contains(res, out) {
+		t.Fatalf("pack did not report the output file:\n%s", res)
+	}
+	if _, err := os.Stat(out); err != nil {
+		t.Fatalf("pack output missing: %v", err)
+	}
+
+	cold := runCmd(t, newStatsCmd(), "--data", out)
+	if !strings.Contains(cold, "urls           6") {
+		t.Fatalf("packed file did not carry the six urls:\n%s", cold)
+	}
+}
+
+// packGoneAndLive builds a one-Gone-one-live .meguri file: it seeds two URLs,
+// drives one to Gone with a 410 and one to Crawled with a 200, and packs the
+// frontier to a file. It returns the file path, the fixture the --gc gate needs.
+func packGoneAndLive(t *testing.T) string {
+	t.Helper()
+	f := frontier.New(1, 0, frontier.WithStateMachine())
+	// Two hosts so the second dispatch is not blocked by the first host's polite
+	// crawl delay: one URL goes to Gone on a 410, the other to Crawled on a 200.
+	f.Seed("https://gone.example/p", "gone.example", 0.5, 0, 0, 10)
+	f.Seed("https://live.example/p", "live.example", 0.5, 0, 0, 10)
+	for _, status := range []uint16{410, 200} {
+		req, ok := f.Dispatch(0)
+		if !ok {
+			t.Fatal("nothing dispatched")
+		}
+		f.Report(meguri.Outcome{URLKey: req.URLKey, HTTPStatus: status, FetchedAt: 0, ContentFP: req.URLKey.PathKey | 1}, 0)
+	}
+	blob, err := f.CheckpointBytes()
+	if err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "gc.meguri")
+	if err := os.WriteFile(path, blob, 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	return path
+}
+
+// TestCompactCommand gates the compact command both ways: merging two disjoint
+// single-host files folds their URL counts into one file, and --gc on a file
+// holding a Gone tombstone drops it while keeping the live row.
+func TestCompactCommand(t *testing.T) {
+	dirA := seedPartitionDir(t, "alpha.example", 4)
+	dirB := seedPartitionDir(t, "bravo.example", 4)
+	fileA := filepath.Join(t.TempDir(), "a.meguri")
+	fileB := filepath.Join(t.TempDir(), "b.meguri")
+	runCmd(t, newPackCmd(), "--data", dirA, "--out", fileA)
+	runCmd(t, newPackCmd(), "--data", dirB, "--out", fileB)
+
+	mergedOut := filepath.Join(t.TempDir(), "merged.meguri")
+	merge := runCmd(t, newCompactCmd(), "--out", mergedOut, fileA, fileB)
+	if !strings.Contains(merge, "2 file(s)") || !strings.Contains(merge, "8 urls") {
+		t.Fatalf("compact merge did not fold the two files:\n%s", merge)
+	}
+	cold := runCmd(t, newStatsCmd(), "--data", mergedOut)
+	if !strings.Contains(cold, "urls           8") {
+		t.Fatalf("merged file did not carry all eight urls:\n%s", cold)
+	}
+
+	gcFile := packGoneAndLive(t)
+	gcOut := filepath.Join(t.TempDir(), "gc-out.meguri")
+	res := runCmd(t, newCompactCmd(), "--gc", "--out", gcOut, gcFile)
+	if !strings.Contains(res, "1 urls") || !strings.Contains(res, "1 Gone dropped") {
+		t.Fatalf("compact --gc did not drop the Gone tombstone:\n%s", res)
+	}
+}
+
 // TestStatsCommandLiveAndCold gates the stats command on both inputs the spec
 // names: a partition directory (recover the frontier, print the per-status
 // distribution and seen-set occupancy) and a single .meguri file (print the footer

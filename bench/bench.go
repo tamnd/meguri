@@ -370,6 +370,17 @@ type Baseline struct {
 	NaiveFleetBytes  float64 // naive bits/url x TotalURLs / 8
 	MeguriFleetBytes float64 // meguri bits/url x TotalURLs / 8
 	Calc             string  // the paired multiplication, shown
+
+	// The approximate-membership model arm: a plain bloom filter sized to hit
+	// meguri's own measured false-positive rate, computed from the optimal-bloom
+	// formula m/n = -ln(p)/(ln2)^2, not run. It is the fair lower bound on any
+	// approximate set at the same accuracy, and the gap to meguri's measured cost is
+	// the premium meguri pays for the exact tier (zero false negatives plus the
+	// ability to enumerate), named not hidden. Zero when no FP rate was measured.
+	BloomFPRate       float64 // the FP rate the bloom is sized for, meguri's own
+	BloomBitsPerURL   float64 // optimal bloom bits/url at BloomFPRate
+	BloomFleetBytes   float64 // bloom bits/url x TotalURLs / 8
+	MeguriPremiumBits float64 // meguri bits/url minus the bloom optimum
 }
 
 // NaiveFrontierBaseline builds the seen-set baseline comparison: the naive
@@ -384,7 +395,7 @@ func NaiveFrontierBaseline(meas Measured, totalURLs float64) Baseline {
 	if meas.BitsPerURL > 0 {
 		ratio = naiveKeyBits / meas.BitsPerURL
 	}
-	return Baseline{
+	bl := Baseline{
 		NaiveBitsPerURL:  naiveKeyBits,
 		MeguriBitsPerURL: meas.BitsPerURL,
 		MemoryRatio:      ratio,
@@ -393,6 +404,19 @@ func NaiveFrontierBaseline(meas Measured, totalURLs float64) Baseline {
 		Calc: fmt.Sprintf("naive %d bits/url -> %s vs meguri %.2f bits/url -> %s (%.1fx)",
 			naiveKeyBits, humanBytes(naiveFleet), meas.BitsPerURL, humanBytes(meguriFleet), ratio),
 	}
+
+	// The bloom arm is defined only when a real FP rate was measured: a bloom sized
+	// for a zero (or one) FP rate is degenerate. The optimal-bloom bits/url is
+	// -ln(p)/(ln2)^2, the well-known minimum for an independent-hash bloom at FP p.
+	if meas.FPRate > 0 && meas.FPRate < 1 {
+		const ln2sq = 0.4804530139182014 // (ln 2)^2
+		bloomBits := -math.Log(meas.FPRate) / ln2sq
+		bl.BloomFPRate = meas.FPRate
+		bl.BloomBitsPerURL = bloomBits
+		bl.BloomFleetBytes = bloomBits * totalURLs / 8
+		bl.MeguriPremiumBits = meas.BitsPerURL - bloomBits
+	}
+	return bl
 }
 
 // PolitenessPoint is one point on the polite-dispatch ceiling curve: when the

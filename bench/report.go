@@ -92,6 +92,12 @@ func BaselineReport(bl Baseline) string {
 	fmt.Fprintf(&b, "  meguri seen-set         %.2f bits/url (measured, tiered filter)\n", bl.MeguriBitsPerURL)
 	fmt.Fprintf(&b, "  memory ratio            %.1fx smaller\n", bl.MemoryRatio)
 	fmt.Fprintf(&b, "  fleet                   %s\n", bl.Calc)
+	if bl.BloomBitsPerURL > 0 {
+		fmt.Fprintf(&b, "  plain bloom (model)     %.2f bits/url at the same %.2f%% fp (optimal -ln(p)/(ln2)^2, not run)\n",
+			bl.BloomBitsPerURL, bl.BloomFPRate*100)
+		fmt.Fprintf(&b, "  meguri premium          %+.2f bits/url over the bloom optimum, the exact tier's cost (zero false negatives, enumerable)\n",
+			bl.MeguriPremiumBits)
+	}
 	b.WriteString("  externals cited separately: a RocksDB-backed set adds SST index, per-SST bloom, and write\n")
 	b.WriteString("  amplification; Nutch keeps the whole CrawlDatum per URL; Frontera stores the URL string. The\n")
 	b.WriteString("  128-bit floor is the optimistic lower bound they sit above; their measured overhead is the\n")

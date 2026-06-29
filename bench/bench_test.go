@@ -196,6 +196,91 @@ func TestBenchOnCorpus(t *testing.T) {
 	t.Logf("projection: seen-set %s, .meguri %s", proj.SeenSetFleetCalc, proj.MeguriFleetCalc)
 }
 
+// TestPolitenessCurveOrders checks the curve machinery without a corpus: over a
+// synthetic partition of mixed crawl delays the ceiling at k active hosts must be
+// the sum of the k fastest hosts' rates (fastest first), monotone in k, clamped
+// to the whole partition, and the full-partition point must equal the summed
+// polite ceiling the walls report.
+func TestPolitenessCurveOrders(t *testing.T) {
+	// Delays in deciseconds: 5 (=2 fetch/s), 10 (=1), 20 (=0.5), 40 (=0.25).
+	part := &format.Partition{Hosts: []m.HostRecord{
+		{CrawlDelay: 20}, {CrawlDelay: 5}, {CrawlDelay: 40}, {CrawlDelay: 10},
+	}}
+	curve := PolitenessCurve(part, []int{1, 2, 3, 4, 99})
+
+	// One active host is the single fastest (2 fetch/s), then the prefix sums add
+	// the next-fastest each step: 2, 3, 3.5, 3.75.
+	want := []struct {
+		hosts   int
+		ceiling float64
+	}{{1, 2}, {2, 3}, {3, 3.5}, {4, 3.75}, {4, 3.75}}
+	if len(curve) != len(want) {
+		t.Fatalf("curve has %d points, want %d", len(curve), len(want))
+	}
+	for i, w := range want {
+		if curve[i].ActiveHosts != w.hosts || math.Abs(curve[i].CeilingFPS-w.ceiling) > 1e-9 {
+			t.Errorf("point %d = {%d hosts, %.3f}, want {%d, %.3f}", i, curve[i].ActiveHosts, curve[i].CeilingFPS, w.hosts, w.ceiling)
+		}
+	}
+	for i := 1; i < len(curve); i++ {
+		if curve[i].CeilingFPS < curve[i-1].CeilingFPS {
+			t.Errorf("curve not monotone at %d: %.3f < %.3f", i, curve[i].CeilingFPS, curve[i-1].CeilingFPS)
+		}
+	}
+}
+
+// TestCorpusThroughputAnalysis is the doc 14 section 5.3 throughput gate on the
+// real slice: the scheduler's selection rate is enormous next to the politeness
+// ceiling the same host set imposes, so the partition is fetcher-bound and the
+// only lever on throughput is more active hosts. It checks the analysis math
+// against the partition's real crawl delays and logs the curve and the gap.
+func TestCorpusThroughputAnalysis(t *testing.T) {
+	path := corpusPath()
+	if path == "" {
+		t.Skip("set MEGURI_CORPUS to a ccrawl jsonl slice (see scripts/fetch-corpus.sh)")
+	}
+	part := loadCorpusPartition(t, path)
+	if len(part.Hosts) == 0 {
+		t.Skip("corpus partition carries no hosts with crawl delays")
+	}
+
+	// The measured scheduler selection rate from BenchmarkCorpusDispatchSelections;
+	// a conservative floor well under the benchmark's observed sel/s so the gate
+	// does not depend on a wall-clock measurement.
+	const measuredSelFPS = 1e6
+	thr := Analyze(part, measuredSelFPS)
+
+	if thr.PoliteCeilingFPS <= 0 {
+		t.Fatalf("polite ceiling is %.3f, want positive over %d hosts", thr.PoliteCeilingFPS, thr.ActiveHosts)
+	}
+	// The full-partition curve point is the summed ceiling the walls report.
+	last := thr.Curve[len(thr.Curve)-1]
+	if last.ActiveHosts != thr.ActiveHosts || math.Abs(last.CeilingFPS-thr.PoliteCeilingFPS) > 1e-6 {
+		t.Errorf("curve tail {%d, %.3f} does not match the summed ceiling {%d, %.3f}", last.ActiveHosts, last.CeilingFPS, thr.ActiveHosts, thr.PoliteCeilingFPS)
+	}
+	// The fetcher-bound gap and the hosts-to-saturate count are the two derived
+	// numbers; check they follow from the inputs.
+	if math.Abs(thr.FetcherBoundGap-measuredSelFPS/thr.PoliteCeilingFPS) > 1e-3 {
+		t.Errorf("fetcher-bound gap %.3f does not match sel/ceiling %.3f", thr.FetcherBoundGap, measuredSelFPS/thr.PoliteCeilingFPS)
+	}
+	// The scheduler outruns this slice's host set by a wide margin: a polite crawler
+	// here is fetcher-bound, and it would take far more active hosts than the slice
+	// holds to make the scheduler the bottleneck. That is the whole analysis.
+	if !(thr.FetcherBoundGap > 1) {
+		t.Errorf("scheduler not faster than the polite ceiling: gap %.3f", thr.FetcherBoundGap)
+	}
+	if !(thr.HostsToSaturate > float64(thr.ActiveHosts)) {
+		t.Errorf("hosts-to-saturate %.0f is not above the slice's %d active hosts; the slice would already be scheduler-bound", thr.HostsToSaturate, thr.ActiveHosts)
+	}
+
+	t.Logf("throughput: scheduler %s sel/s vs polite ceiling %.1f fetch/s over %d hosts, fetcher-bound gap %sx",
+		sci(thr.SchedulerFPS), thr.PoliteCeilingFPS, thr.ActiveHosts, sci(thr.FetcherBoundGap))
+	t.Logf("throughput: %s active hosts would be needed to saturate the scheduler at this selection rate", sci(thr.HostsToSaturate))
+	for _, p := range thr.Curve {
+		t.Logf("  polite ceiling at %d active hosts: %.1f fetch/s", p.ActiveHosts, p.CeilingFPS)
+	}
+}
+
 // TestBytesPerURLBudget is the section-8 per-commit budget guard: the .meguri
 // bytes/url on the pinned slice must not grow past the tens-of-bytes target, so a
 // new column or a worse default encoding that silently inflates the file fails

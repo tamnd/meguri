@@ -41,3 +41,24 @@ func Report(meas Measured, proj Projection, walls []Wall) string {
 	}
 	return b.String()
 }
+
+// ThroughputReport renders the doc 14 section 5.3 throughput analysis: the
+// measured scheduler selection rate against the politeness ceiling the same
+// partition imposes, the fetcher-bound gap between them, and the polite-dispatch
+// ceiling as the number of active hosts grows. It is printed under the main
+// report so the headline scheduler number never stands without the host-set
+// ceiling it actually runs against.
+func ThroughputReport(t Throughput) string {
+	var b strings.Builder
+	b.WriteString("throughput analysis (scheduler vs politeness, doc 14 section 5.3)\n")
+	fmt.Fprintf(&b, "  scheduler selection   %s sel/s (measured, BenchmarkCorpusDispatchSelections)\n", sci(t.SchedulerFPS))
+	fmt.Fprintf(&b, "  polite ceiling        %.1f fetch/s over %d active hosts (sum of 1/crawl_delay)\n", t.PoliteCeilingFPS, t.ActiveHosts)
+	fmt.Fprintf(&b, "  median host floor     %.3f fetch/s (1/crawl_delay at the median host)\n", t.MedianHostFPS)
+	fmt.Fprintf(&b, "  fetcher-bound gap     %sx (scheduler outruns this host set by this factor)\n", sci(t.FetcherBoundGap))
+	fmt.Fprintf(&b, "  active hosts to saturate the scheduler   %s (= scheduler rate / median host floor)\n", sci(t.HostsToSaturate))
+	b.WriteString("  polite ceiling vs active hosts\n")
+	for _, p := range t.Curve {
+		fmt.Fprintf(&b, "    %8d hosts   %12.1f fetch/s\n", p.ActiveHosts, p.CeilingFPS)
+	}
+	return b.String()
+}

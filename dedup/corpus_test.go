@@ -59,6 +59,42 @@ func loadCorpusKeys(tb testing.TB, path string) []meguri.URLKey {
 	return keys
 }
 
+// loadCorpusURLs reads the frozen ccrawl slice and returns the canonical URL text
+// of every record, the input the trap detector reads (it parses paths and queries,
+// not just keys). It runs the same canonicalization the discovery path does, so the
+// detector sees exactly the URLs the frontier would admit.
+func loadCorpusURLs(tb testing.TB, path string) []string {
+	tb.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		tb.Fatalf("open corpus: %v", err)
+	}
+	defer f.Close()
+
+	var urls []string
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 1<<20), 1<<24)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var rec cdxRecord
+		if json.Unmarshal([]byte(line), &rec) != nil || rec.URL == "" {
+			continue
+		}
+		canon, ok := Canonicalize(rec.URL, "", nil)
+		if !ok {
+			continue
+		}
+		urls = append(urls, canon)
+	}
+	if err := sc.Err(); err != nil {
+		tb.Fatalf("scan corpus: %v", err)
+	}
+	return urls
+}
+
 // TestCorpusSeenSetZeroFalseNegatives is the M2 gate on real data: feed every
 // canonical key from the frozen CC-MAIN-2026-25 slice through the seen-set in
 // stream order and require it to agree with a brute-force map oracle on every

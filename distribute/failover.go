@@ -19,6 +19,27 @@ package distribute
 func (c *Control) Heartbeat(id PartitionID) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.heartbeatLocked(id)
+}
+
+// HeartbeatLoad records a live beat that also carries the partition's current
+// pending-work depth, the backlog signal the elasticity loop scales on. It does
+// the same liveness restore Heartbeat does and stores the reported depth so
+// Control.Backlog can serve the latest value per partition. This is the live
+// binding of the elasticity loop to the fleet (doc 12, section 7): the control
+// plane already hears from every partition, so the backlog rides the beat it
+// already pulls rather than a separate channel.
+func (c *Control) HeartbeatLoad(id PartitionID, backlog int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.backlog[id] = backlog
+	c.heartbeatLocked(id)
+}
+
+// heartbeatLocked clears a partition's miss counter and restores it to Alive if it
+// had been marked down, bumping the epoch on a real health change. Callers hold the
+// lock. It is the shared body of Heartbeat and HeartbeatLoad.
+func (c *Control) heartbeatLocked(id PartitionID) {
 	delete(c.misses, id)
 	for i := range c.m.Partitions {
 		if c.m.Partitions[i].ID == id {

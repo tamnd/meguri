@@ -37,6 +37,25 @@ func readArena(arena []byte, off uint64) string {
 	return string(arena[start:end])
 }
 
+// readArenaBytes is readArena for a span the caller needs as raw bytes rather
+// than a string, the form a packed robots blob is read in before it is unpacked.
+// A zero or out-of-range offset, or a corrupt length, returns nil.
+func readArenaBytes(arena []byte, off uint64) []byte {
+	if off == 0 || off >= uint64(len(arena)) {
+		return nil
+	}
+	n, k := binary.Uvarint(arena[off:])
+	if k <= 0 {
+		return nil
+	}
+	start := off + uint64(k)
+	end := start + n
+	if end > uint64(len(arena)) {
+		return nil
+	}
+	return arena[start:end]
+}
+
 // writeFileSync writes b to path and fsyncs it before returning, so the file is
 // on the device when the call completes. The checkpoint uses it for the .meguri
 // snapshot, whose durability the superblock commit then depends on.

@@ -33,6 +33,12 @@ type Request struct {
 	// connection to the IP the per-IP politeness bucket accounted for.
 	ResolvedIP [16]byte
 
+	// Depth is the URL's own link distance from the nearest seed, carried so a
+	// fetcher that extracts out-links can stamp each candidate's depth as this
+	// plus one without consulting the frontier. The frontier fills it from the
+	// dispatched record; a seed dispatches at depth zero.
+	Depth uint16
+
 	// Robots is set when this request is the host's robots.txt, fetched before
 	// any of its content URLs (doc 07). CanonicalURL is the robots.txt URL; the
 	// fetcher returns the raw body in Outcome.RobotsBody for meguri to parse.

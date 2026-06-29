@@ -115,3 +115,9 @@ func (f *filter) bitsPerKey() float64 {
 	}
 	return float64(len(f.blocks)*64) / float64(f.n)
 }
+
+// The residentMembership adapters let a reconstructed blocked-Bloom filter answer
+// the same one-sided probe as the ribbon snapshot behind ResidentFilter.
+func (f *filter) maybeContains(key meguri.URLKey) bool { return f.maybeSeen(key) }
+func (f *filter) bitsPerURL() float64                  { return f.bitsPerKey() }
+func (f *filter) length() uint64                       { return f.n }

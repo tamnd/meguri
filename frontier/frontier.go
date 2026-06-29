@@ -85,6 +85,7 @@ type Frontier struct {
 	arena   arena
 	seen    *dedup.SeenSet // M2 dedup authority, idempotent intake (doc 08, D5)
 	soft    *dedup.SoftDetector
+	traps   *dedup.TrapDetector // calendar/faceted/session-id pattern detector (doc 08, 8.4)
 
 	urlFront   prioRing[meguri.URLKey] // URLs not yet bound to a host back queue
 	readyHosts prioRing[uint64]        // hosts eligible now, keyed by best URL priority
@@ -250,6 +251,7 @@ func New(id, created uint32, opts ...Option) *Frontier {
 		arena:   newArena(),
 		seen:    dedup.NewSeenSet(),
 		soft:    dedup.NewSoftDetector(),
+		traps:   dedup.NewTrapDetector(),
 		target:  defaultTarget,
 		pol:     politeness.DefaultConfig(),
 		agent:   "meguri",
@@ -361,7 +363,27 @@ func (f *Frontier) Discover(d meguri.Discovery, now uint32) bool {
 		prioritize.UpdateHostBudget(&h.rec, indeg, f.prio.Params())
 	}
 
-	status := dedup.Admit(d.Depth, &h.rec, true)
+	// Trap pattern detection (doc 08, section 8.4): fold the discovery into the
+	// host's calendar/faceted/session accumulation, and the first time the host
+	// crosses a threshold set the sticky flag on its HostRecord, so it is serialized
+	// into the .meguri file and survives a checkpoint. The discovery is then routed
+	// through the pattern heuristics: a host not yet a suspect passes everything, so
+	// admission is unchanged until a host trips a rule.
+	// The trap detector's calendar horizon is measured in epoch-hours (the data
+	// model clock), while the dispatch clock here is epoch-seconds, so convert.
+	nowHours := now / 3600
+	if _, newlySuspect := f.traps.Observe(hk, d.URLKey, d.CanonicalURL, nowHours); newlySuspect {
+		dedup.FlagTrapSuspect(&h.rec)
+	}
+	passes := f.traps.Passes(hk, d.CanonicalURL, nowHours)
+	if dedup.IsTrapSuspect(&h.rec) && !f.traps.Suspect(hk) {
+		// The flag came back from a checkpoint but this detector instance has not yet
+		// re-accumulated the host, so it does not know which rule fired. Apply every
+		// pattern rule until it re-learns: any trap-signature URL is parked, a clean
+		// one passes. This keeps the serialized flag tightening admission on reload.
+		passes = f.traps.Violation(d.CanonicalURL, nowHours) == dedup.PatternNone
+	}
+	status := dedup.Admit(d.Depth, &h.rec, passes)
 	rec := &meguri.URLRecord{
 		URLKey:          d.URLKey,
 		HostKey:         hk,

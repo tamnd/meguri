@@ -85,6 +85,65 @@ func (t *chanTransport) Recv(self PartitionID) ([]m.Discovery, bool) {
 	}
 }
 
+// chanWireTransport is the fleet transport's in-process double: it serializes
+// each batch through the columnar delta+FSST body (batch.go) and carries the
+// bytes over a bounded channel per destination, exactly what a partitioned-log
+// binding does on the wire, minus the network and the durability. The plain
+// chanTransport passes live slices and so never exercises the body codec; this
+// one does, so a test drives a discovery from one partition to another the way a
+// fleet would, encode and decode included. A batch that does not round-trip is a
+// dropped message, the same failure a corrupt log record is, surfaced as a Recv
+// that reports nothing rather than a panic.
+type chanWireTransport struct {
+	mu    sync.Mutex
+	chans map[PartitionID]chan []byte
+	cap   int
+}
+
+// NewWireChannelTransport builds the in-process wire transport whose
+// per-destination channels buffer up to depth encoded batches. It is the binding
+// a single-box run uses when it wants the fleet body codec on the path, and the
+// one a test uses to exercise encode and decode end to end.
+func NewWireChannelTransport(depth int) Transport {
+	if depth < 1 {
+		depth = 1
+	}
+	return &chanWireTransport{chans: map[PartitionID]chan []byte{}, cap: depth}
+}
+
+func (t *chanWireTransport) chanFor(p PartitionID) chan []byte {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	ch, ok := t.chans[p]
+	if !ok {
+		ch = make(chan []byte, t.cap)
+		t.chans[p] = ch
+	}
+	return ch
+}
+
+func (t *chanWireTransport) Send(to PartitionID, batch []m.Discovery) error {
+	if len(batch) == 0 {
+		return nil
+	}
+	t.chanFor(to) <- EncodeBatch(batch)
+	return nil
+}
+
+func (t *chanWireTransport) Recv(self PartitionID) ([]m.Discovery, bool) {
+	ch := t.chanFor(self)
+	select {
+	case body := <-ch:
+		batch, ok := DecodeBatch(body)
+		if !ok {
+			return nil, false
+		}
+		return batch, true
+	default:
+		return nil, false
+	}
+}
+
 // batcher accumulates discoveries per destination and flushes a destination as
 // one transport message when its batch fills or the caller flushes. It turns a
 // per-link message rate into a per-destination message rate: a page with a

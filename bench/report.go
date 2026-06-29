@@ -62,3 +62,20 @@ func ThroughputReport(t Throughput) string {
 	}
 	return b.String()
 }
+
+// BaselineReport renders the doc 14 section 7 seen-set baseline comparison: the
+// naive exact-key frontier floor paired against meguri's measured seen-set, with
+// the named external systems cited as the floor's ceiling, not measured here.
+func BaselineReport(bl Baseline) string {
+	var b strings.Builder
+	b.WriteString("baseline comparison (seen-set vs a naive exact-key frontier, doc 14 section 7)\n")
+	fmt.Fprintf(&b, "  naive exact-key store   %.0f bits/url (one 128-bit URLKey per seen URL)\n", bl.NaiveBitsPerURL)
+	fmt.Fprintf(&b, "  meguri seen-set         %.2f bits/url (measured, tiered filter)\n", bl.MeguriBitsPerURL)
+	fmt.Fprintf(&b, "  memory ratio            %.1fx smaller\n", bl.MemoryRatio)
+	fmt.Fprintf(&b, "  fleet                   %s\n", bl.Calc)
+	b.WriteString("  externals cited separately: a RocksDB-backed set adds SST index, per-SST bloom, and write\n")
+	b.WriteString("  amplification; Nutch keeps the whole CrawlDatum per URL; Frontera stores the URL string. The\n")
+	b.WriteString("  128-bit floor is the optimistic lower bound they sit above; their measured overhead is the\n")
+	b.WriteString("  fleet-box follow-up.\n")
+	return b.String()
+}

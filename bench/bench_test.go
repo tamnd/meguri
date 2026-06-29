@@ -281,6 +281,58 @@ func TestCorpusThroughputAnalysis(t *testing.T) {
 	}
 }
 
+// TestNaiveFrontierBaseline checks the section-7 paired ratio: a naive exact-key
+// frontier pays 128 bits/url and meguri's measured seen-set pays its bits/url, so
+// the ratio is 128 over the measured cost and the fleet bytes follow the same
+// multiplication as the projection. At 11 bits/url the tiered filter is ~11.6x
+// smaller than an exact key set.
+func TestNaiveFrontierBaseline(t *testing.T) {
+	const total = 100e9
+	bl := NaiveFrontierBaseline(Measured{BitsPerURL: 11}, total)
+
+	if bl.NaiveBitsPerURL != 128 {
+		t.Errorf("naive floor = %.0f bits/url, want 128", bl.NaiveBitsPerURL)
+	}
+	if math.Abs(bl.MemoryRatio-128.0/11.0) > 1e-9 {
+		t.Errorf("memory ratio = %.4f, want %.4f", bl.MemoryRatio, 128.0/11.0)
+	}
+	wantNaive := 128.0 * total / 8
+	if math.Abs(bl.NaiveFleetBytes-wantNaive) > 1 {
+		t.Errorf("naive fleet = %.0f, want %.0f", bl.NaiveFleetBytes, wantNaive)
+	}
+	wantMeguri := 11.0 * total / 8
+	if math.Abs(bl.MeguriFleetBytes-wantMeguri) > 1 {
+		t.Errorf("meguri fleet = %.0f, want %.0f", bl.MeguriFleetBytes, wantMeguri)
+	}
+	// The naive store must come out larger, the whole point of the tiered filter.
+	if !(bl.NaiveFleetBytes > bl.MeguriFleetBytes) {
+		t.Errorf("naive fleet %.0f not larger than meguri %.0f", bl.NaiveFleetBytes, bl.MeguriFleetBytes)
+	}
+}
+
+// TestCorpusNaiveBaseline pins the baseline ratio on the real slice: meguri's
+// measured seen-set bits/url against the naive exact-key floor, so the paired
+// ratio is reported on real data, not an assumed bits/url.
+func TestCorpusNaiveBaseline(t *testing.T) {
+	path := corpusPath()
+	if path == "" {
+		t.Skip("set MEGURI_CORPUS to a ccrawl jsonl slice (see scripts/fetch-corpus.sh)")
+	}
+	part := loadCorpusPartition(t, path)
+	if len(part.URLs) < 1000 {
+		t.Skipf("corpus has %d urls, need at least 1000", len(part.URLs))
+	}
+	meas, err := Measure(part)
+	if err != nil {
+		t.Fatalf("measure: %v", err)
+	}
+	bl := NaiveFrontierBaseline(meas, 100e9)
+	if !(bl.MemoryRatio > 1) {
+		t.Fatalf("tiered filter not smaller than the naive key set: ratio %.2f", bl.MemoryRatio)
+	}
+	t.Logf("baseline: meguri %.2f bits/url vs naive 128 bits/url = %.1fx smaller; %s", meas.BitsPerURL, bl.MemoryRatio, bl.Calc)
+}
+
 // TestBytesPerURLBudget is the section-8 per-commit budget guard: the .meguri
 // bytes/url on the pinned slice must not grow past the tens-of-bytes target, so a
 // new column or a worse default encoding that silently inflates the file fails

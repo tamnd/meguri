@@ -63,6 +63,25 @@ func ThroughputReport(t Throughput) string {
 	return b.String()
 }
 
+// RebalanceReport renders the doc 12 section 8 rebalance-vs-bandwidth arm: when
+// the fleet grows from one source partition to NewParts, how many hosts and URLs
+// move, the .meguri bytes that ships, and the transfer-time floor at the stated
+// device bandwidth. It is printed under the walls so the redistribution floor that
+// Walls names in formula gets a measured count beside it. The bandwidth is the
+// caller-named wall, not a measured disk; the fleet-box re-run that times a real
+// link is the companion noted in the block.
+func RebalanceReport(c RebalanceCost) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "rebalance vs bandwidth (1 -> %d partitions, doc 12 section 8)\n", c.NewParts)
+	fmt.Fprintf(&b, "  source partition      %d hosts / %d urls / %s\n", c.SourceHosts, c.SourceURLs, humanBytes(float64(c.SourceBytes)))
+	fmt.Fprintf(&b, "  moved by jump hash    %d hosts / %d urls to %d destinations\n", c.MovedHosts, c.MovedURLs, c.Destinations)
+	fmt.Fprintf(&b, "  shipped               %s (%.1f%% of the source)\n", humanBytes(float64(c.ShippedBytes)), c.MovedFraction*100)
+	fmt.Fprintf(&b, "  transfer floor        %.4f s at %.0f MB/s (shipped bytes / bandwidth)\n", c.TransferSec, c.BandwidthMBps)
+	b.WriteString("  the bandwidth is the named device wall, not a measured disk; the at-scale re-run that times a\n")
+	b.WriteString("  real NVMe and link on the fleet box is the timed companion.\n")
+	return b.String()
+}
+
 // BaselineReport renders the doc 14 section 7 seen-set baseline comparison: the
 // naive exact-key frontier floor paired against meguri's measured seen-set, with
 // the named external systems cited as the floor's ceiling, not measured here.

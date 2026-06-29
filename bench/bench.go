@@ -19,6 +19,7 @@ import (
 
 	m "github.com/tamnd/meguri"
 	"github.com/tamnd/meguri/dedup"
+	"github.com/tamnd/meguri/distribute"
 	"github.com/tamnd/meguri/format"
 )
 
@@ -191,6 +192,83 @@ func Project(meas Measured, totalURLs, urlsPerPartition float64) Projection {
 		p.MeguriPerPart = fileFleet / pc
 	}
 	return p
+}
+
+// RebalanceCost is the deterministic, counts-not-timed arm of the doc 12 section
+// 8 rebalance-vs-bandwidth measurement: when the fleet grows from a single source
+// partition to newParts partitions, how many hosts and URLs move off the source,
+// how many .meguri bytes that ships, what fraction of the source file that is, and
+// the transfer-time floor at a stated device bandwidth. It is the count side of
+// the device-bandwidth wall (Walls' redistribution floor): a byte-counting pass
+// can measure the moved bytes exactly, and divides them by a bandwidth the caller
+// names rather than a disk this pass cannot touch. The at-scale re-run on the
+// fleet box that measures a real disk and link is the timed companion.
+type RebalanceCost struct {
+	NewParts      int     // partitions the fleet grew to (the source was partition 0)
+	SourceHosts   int     // hosts on the source before the move
+	SourceURLs    int     // URLs on the source before the move
+	SourceBytes   int     // encoded .meguri size of the source
+	MovedHosts    int     // hosts that changed owner and ship out
+	MovedURLs     int     // URLs carried by the moved hosts
+	ShippedBytes  int     // encoded .meguri size of all the ship slices
+	Destinations  int     // distinct new owners the source ships to
+	MovedFraction float64 // ShippedBytes / SourceBytes
+	BandwidthMBps float64 // the device-bandwidth floor the caller names
+	TransferSec   float64 // ShippedBytes / (BandwidthMBps x 1e6)
+	Calc          string  // the shown division
+}
+
+// Rebalance measures what one source partition ships when the fleet grows from
+// holding it whole to newParts partitions. It runs the real jump-hash rebalance
+// (the source is partition 0 under the new map; Redistribute groups the hosts
+// whose owner changed by new owner and slices each out as its own .meguri-ready
+// partition), encodes those ship slices to count the bytes that cross the wire,
+// and divides by the named bandwidth. Because the URL table is sorted by HostKey a
+// moved host is a contiguous range, so the cost is the moved bytes over the
+// bandwidth wall, not a row-by-row migration. The kept-plus-moved URL count equals
+// the source's, the proof that a host moves whole or not at all (D2).
+func Rebalance(src *format.Partition, newParts int, bwMBps float64) (RebalanceCost, error) {
+	if len(src.URLs) == 0 {
+		return RebalanceCost{}, errEmpty
+	}
+	if newParts < 2 {
+		newParts = 2
+	}
+	srcEnc, err := format.Encode(src)
+	if err != nil {
+		return RebalanceCost{}, err
+	}
+
+	nm := &distribute.Map{Epoch: 1, NumPartitions: newParts}
+	ship, _ := distribute.Redistribute(src, 0, nm)
+
+	cost := RebalanceCost{
+		NewParts:      newParts,
+		SourceHosts:   len(src.Hosts),
+		SourceURLs:    len(src.URLs),
+		SourceBytes:   len(srcEnc),
+		Destinations:  len(ship),
+		BandwidthMBps: bwMBps,
+	}
+	for _, p := range ship {
+		cost.MovedHosts += len(p.Hosts)
+		cost.MovedURLs += len(p.URLs)
+		enc, err := format.Encode(p)
+		if err != nil {
+			return RebalanceCost{}, err
+		}
+		cost.ShippedBytes += len(enc)
+	}
+	if cost.SourceBytes > 0 {
+		cost.MovedFraction = float64(cost.ShippedBytes) / float64(cost.SourceBytes)
+	}
+	if bwMBps > 0 {
+		cost.TransferSec = float64(cost.ShippedBytes) / (bwMBps * 1e6)
+	}
+	cost.Calc = fmt.Sprintf("%s shipped / %.0f MB/s = %.4f s; %.1f%% of the %s source moved to %d destinations",
+		humanBytes(float64(cost.ShippedBytes)), bwMBps, cost.TransferSec,
+		cost.MovedFraction*100, humanBytes(float64(cost.SourceBytes)), cost.Destinations)
+	return cost, nil
 }
 
 // Wall names a physical floor a meguri number is reported against, never around

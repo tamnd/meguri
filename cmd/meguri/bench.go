@@ -29,6 +29,8 @@ func newBenchCmd() *cobra.Command {
 		priority   float64
 		crawlDelay uint16
 		selRate    float64
+		rebalTo    int
+		rebalBw    float64
 	)
 	cmd := &cobra.Command{
 		Use:   "bench",
@@ -107,6 +109,21 @@ func newBenchCmd() *cobra.Command {
 				return err
 			}
 
+			// The rebalance-vs-bandwidth arm: grow this slice from one source
+			// partition to --rebalance-to and count the .meguri bytes the jump-hash
+			// move ships against the named device floor (doc 12 section 8). The
+			// transfer time is the count side of the redistribution wall; the
+			// fleet-box timing on a real disk is the companion (audit 252).
+			if rebalTo >= 2 {
+				cost, rerr := bench.Rebalance(part, rebalTo, rebalBw)
+				if rerr != nil {
+					return fmt.Errorf("rebalance: %w", rerr)
+				}
+				if _, err = fmt.Fprint(cmd.OutOrStdout(), "\n"+bench.RebalanceReport(cost)); err != nil {
+					return err
+				}
+			}
+
 			// The host-key range the input covers, the range-pinned form of the
 			// benchmark slice: the interval a fleet partition would carry in its
 			// .meguri header, not a domain list (doc 14, audit 288).
@@ -124,5 +141,7 @@ func newBenchCmd() *cobra.Command {
 	cmd.Flags().Float64Var(&priority, "priority", 0.5, "initial priority for every seeded URL")
 	cmd.Flags().Uint16Var(&crawlDelay, "crawl-delay", 10, "default per-host crawl delay in deciseconds")
 	cmd.Flags().Float64Var(&selRate, "scheduler-sel-rate", 1e6, "measured scheduler selections/s (from BenchmarkCorpusDispatchSelections) to report the politeness ceiling against")
+	cmd.Flags().IntVar(&rebalTo, "rebalance-to", 16, "partitions to grow the slice to for the rebalance-vs-bandwidth arm (under 2 skips it)")
+	cmd.Flags().Float64Var(&rebalBw, "rebalance-bw", 1200.0, "device read bandwidth in MB/s the shipped bytes are divided by (the named wall, not a measured disk)")
 	return cmd
 }

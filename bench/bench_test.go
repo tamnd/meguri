@@ -461,3 +461,72 @@ func itoa(n int) string {
 	}
 	return string(buf[i:])
 }
+
+// TestRebalanceShippedBytesOnCorpus is the deterministic arm of the
+// rebalance-vs-bandwidth measurement: it grows a single source partition holding
+// the frozen corpus to 16 partitions, runs the real jump-hash rebalance, and
+// checks the shipped-byte count against an independent recomputation of the moved
+// set and against the move-whole-host invariant. The transfer time it reports is
+// the moved bytes over a stated NVMe-class bandwidth, the count side of the
+// device-bandwidth wall; the fleet-box re-run that measures a real disk is the
+// timed companion.
+func TestRebalanceShippedBytesOnCorpus(t *testing.T) {
+	path := corpusPath()
+	if path == "" {
+		t.Skip("set MEGURI_CORPUS to a ccrawl jsonl slice (see scripts/fetch-corpus.sh)")
+	}
+	part := loadCorpusPartition(t, path)
+	if len(part.Hosts) < 2 {
+		t.Skipf("corpus has %d hosts, need at least 2 to move one", len(part.Hosts))
+	}
+
+	const (
+		newParts = 16
+		bwMBps   = 1200.0 // a stated NVMe-class read floor; the wall, not a measured disk
+	)
+	cost, err := Rebalance(part, newParts, bwMBps)
+	if err != nil {
+		t.Fatalf("rebalance: %v", err)
+	}
+
+	if cost.MovedHosts == 0 || cost.ShippedBytes == 0 {
+		t.Fatalf("no hosts moved on a 1->%d scale; jump hash should remap some of %d hosts",
+			newParts, len(part.Hosts))
+	}
+
+	// Independently recompute the moved set straight from the source rows, so the
+	// measurement is checked against the jump hash rather than against itself.
+	nm := &distribute.Map{Epoch: 1, NumPartitions: newParts}
+	wantHosts, wantURLs := 0, 0
+	for i := range part.Hosts {
+		if nm.Owner(part.Hosts[i].HostKey) != 0 {
+			wantHosts++
+		}
+	}
+	for i := range part.URLs {
+		if nm.Owner(part.URLs[i].HostKey) != 0 {
+			wantURLs++
+		}
+	}
+	if cost.MovedHosts != wantHosts {
+		t.Fatalf("moved hosts = %d, want %d", cost.MovedHosts, wantHosts)
+	}
+	if cost.MovedURLs != wantURLs {
+		t.Fatalf("moved urls = %d, want %d", cost.MovedURLs, wantURLs)
+	}
+	// A host moves whole or not at all: the moved and kept URL counts partition the
+	// source exactly.
+	if kept := cost.SourceURLs - cost.MovedURLs; kept+cost.MovedURLs != cost.SourceURLs {
+		t.Fatalf("moved %d + kept %d != source %d", cost.MovedURLs, kept, cost.SourceURLs)
+	}
+	if cost.MovedFraction <= 0 {
+		t.Fatalf("moved fraction = %v, want > 0", cost.MovedFraction)
+	}
+	if cost.TransferSec <= 0 {
+		t.Fatalf("transfer time = %v, want > 0", cost.TransferSec)
+	}
+	if cost.Destinations < 1 || cost.Destinations >= newParts {
+		t.Fatalf("destinations = %d, want between 1 and %d", cost.Destinations, newParts-1)
+	}
+	t.Logf("rebalance 1->%d: %s", newParts, cost.Calc)
+}

@@ -55,8 +55,15 @@ func (f *Frontier) reprice(rec *meguri.URLRecord, h *hostEntry) {
 // own priority is refreshed last, its history having grown.
 func (f *Frontier) spreadCash(rec *meguri.URLRecord, h *hostEntry, links []meguri.Discovery, now uint32) {
 	f.prio.Distribute(rec.URLKey, links)
-	for i := range links {
-		f.Discover(links[i], now)
+	local := links
+	if f.linkSink != nil {
+		// With distribution on, the sink ships the cross-partition links to their
+		// owners and hands back only the links this partition owns, so the local
+		// intake never creates a record for a host another partition holds.
+		local = f.linkSink(links)
+	}
+	for i := range local {
+		f.Discover(local[i], now)
 	}
 	f.reprice(rec, h)
 }

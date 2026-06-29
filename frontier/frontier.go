@@ -114,6 +114,15 @@ type Frontier struct {
 	// and is admitted under the STAR budget, and a crawl distributes its cash
 	// across its out-links, so the front bank orders by online importance.
 	prio *prioritize.Prioritizer
+
+	// linkSink, when set, splits a crawl's out-links into local and remote as the
+	// cash spreads (doc 04, doc 12, section 6). It receives every out-link after
+	// the OPIC cash split has stamped each one's LinkWeight, ships the remote ones
+	// to their owning partitions, and returns the subset this partition owns for
+	// the local intake. nil is the single-partition case where every link is local.
+	// Because the sink sees the links only after the split, a remote link still
+	// carries the cash its source granted, which its owner credits on receipt.
+	linkSink func([]meguri.Discovery) []meguri.Discovery
 }
 
 // tauTickEvery is how many reschedules pass between background re-estimates of
@@ -195,6 +204,16 @@ func WithPrioritizer(p prioritize.Params) Option {
 	return func(f *Frontier) {
 		f.prio = prioritize.New(p)
 	}
+}
+
+// WithLinkRouter routes a crawl's out-links to their owning partitions (doc 04,
+// doc 12). sink receives every out-link after the OPIC cash split, ships the
+// remote ones to their owners, and returns the subset this partition owns for the
+// local intake. Without it every out-link is treated as local, the
+// single-partition behavior. The engine wires the router's RouteLinks behind this
+// so the fold splits local from remote in one place.
+func WithLinkRouter(sink func([]meguri.Discovery) []meguri.Discovery) Option {
+	return func(f *Frontier) { f.linkSink = sink }
 }
 
 // New returns an empty frontier for partition id, stamped created (epoch-hours)
@@ -342,6 +361,30 @@ func (f *Frontier) Discover(d meguri.Discovery, now uint32) bool {
 	}
 	f.urlFront.push(d.URLKey, rec.Priority)
 	return true
+}
+
+// Warm pre-populates a never-crawled URL with the validators a prior crawl left,
+// so its first fetch this campaign goes straight to a conditional GET (doc 13's
+// seed pre-population). It stamps the ETag, the Last-Modified epoch-hours, and the
+// prior content fingerprint a seed list carried from an earlier crawl. It is a
+// no-op on a missing record or one already crawled this campaign, so re-warming a
+// live URL never rewrites fresher state. The prior fingerprint seeds the
+// change-rate comparison, so the first refetch is classified as change or
+// no-change rather than treated as a first sighting.
+func (f *Frontier) Warm(key meguri.URLKey, etag string, lastModified uint32, prevDigest uint64) {
+	rec := f.records[key]
+	if rec == nil || rec.CrawlCount > 0 {
+		return
+	}
+	if etag != "" {
+		rec.ETagRef = f.arena.intern(etag)
+	}
+	if lastModified != 0 {
+		rec.LastModified = lastModified
+	}
+	if prevDigest != 0 {
+		rec.ContentFP = prevDigest
+	}
 }
 
 // Dispatch returns the next URL to fetch at clock time now (epoch-seconds), or

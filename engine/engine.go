@@ -44,6 +44,13 @@ type Config struct {
 	// wired with RouteSink), so a partition both ships and receives cross-partition
 	// links. Nil is the single-partition case.
 	Router *distribute.Router
+	// Signals, when set, is the inbound side of tsumugi signal import (doc 12,
+	// D16): on each loop the engine drains the signal transport for bundles routed
+	// to this partition and applies them to the frontier, which blends the imported
+	// host_score and PageRank into priority. The outbound side is ImportSignal,
+	// which a partition that reads an import file calls to route a full bundle to
+	// every owner. Nil leaves a partition on its locally accumulated signals.
+	Signals *distribute.SignalRouter
 	// UntilEmpty stops Run when the frontier drains and no inbound work remains,
 	// the mode the gate and a bounded batch crawl use. False runs until the context
 	// is cancelled, the mode a live fleet partition uses, waiting on new
@@ -61,6 +68,7 @@ type Engine struct {
 	bf         *BatchFetcher
 	clk        Clock
 	router     *distribute.Router
+	signals    *distribute.SignalRouter
 	untilEmpty bool
 
 	dispatched atomic.Int64
@@ -86,9 +94,15 @@ func New(fr *frontier.Frontier, cfg Config) *Engine {
 		bf:         NewBatchFetcher(cfg.Fetcher, workers),
 		clk:        clk,
 		router:     cfg.Router,
+		signals:    cfg.Signals,
 		untilEmpty: cfg.UntilEmpty,
 	}
 }
+
+// frontierSink is the frontier as a distribute.SignalSink: ImportURLSignal and
+// ImportHostSignal land an imported bundle's owned entries on the frontier the
+// engine drives. The assertion keeps the two method sets in step.
+var _ distribute.SignalSink = (*frontier.Frontier)(nil)
 
 // Stats is a snapshot of what the engine has moved: URLs dispatched to the pool,
 // outcomes folded back, and fetches that errored without a usable outcome.
@@ -212,6 +226,9 @@ func (e *Engine) fold(res Result, inflight *int) {
 // knows whether to re-dispatch instead of waiting. A single-partition engine has
 // no router and intake is a no-op.
 func (e *Engine) intake(now uint32) bool {
+	if e.signals != nil {
+		e.signals.Apply(e.fr) // blend any inbound tsumugi import before scoring
+	}
 	if e.router == nil {
 		return false
 	}
@@ -222,6 +239,25 @@ func (e *Engine) intake(now uint32) bool {
 		}
 	}
 	return added
+}
+
+// ImportSignal routes a full tsumugi import bundle to every partition that owns
+// part of it and applies this partition's own slice to the frontier (doc 12,
+// D16). It is the producer-side entry: the partition that reads an import file
+// calls it once, the signal router splits the bundle by owner, ships each remote
+// slice over the signal transport, and the owners drain it on their next loop. A
+// transport error is returned so the caller can retry; the bundle is never
+// depended on, so a dropped import only delays the signal refresh.
+func (e *Engine) ImportSignal(bundle meguri.Signal) error {
+	if e.signals == nil {
+		return nil
+	}
+	local, err := e.signals.RouteSignal(bundle)
+	if err != nil {
+		return err
+	}
+	e.signals.ApplyLocal(local, e.fr)
+	return nil
 }
 
 // blockForInbound waits for the next inbound discovery to arrive when a live

@@ -34,6 +34,10 @@ func (f *Frontier) newHost(hk, ref uint64, hostName string, crawlDelay uint16) *
 		effective:  f.pol.Default,
 		crawlFloor: deciToDur(crawlDelay),
 	}
+	if score, ok := f.importedHostScore[hk]; ok {
+		h.rec.HostScore = score
+		delete(f.importedHostScore, hk)
+	}
 	if f.resolver != nil && hostName != "" {
 		f.resolver.Prefetch(hostName)
 	}

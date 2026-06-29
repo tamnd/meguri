@@ -58,7 +58,13 @@ type Outcome struct {
 	RedirectTarget string // resolved redirect URL, empty if none
 
 	Retryable        bool   // transient failure, retry warranted
+	RetryAfter       uint16 // deciseconds from a Retry-After header, 0 if none
 	RobotsCrawlDelay uint16 // deciseconds, fresh Crawl-delay if robots re-read
+
+	// RobotsBody is the raw robots.txt bytes, populated only for a robots fetch
+	// (fetch.Request.Robots). Parsing is policy and stays in meguri (doc 07): the
+	// fetcher hands back the bytes, the frontier turns them into rules.
+	RobotsBody []byte
 
 	Links []Discovery // extracted out-links, canonicalized and ready to route
 }

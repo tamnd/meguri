@@ -32,6 +32,11 @@ type Request struct {
 	// zero when the fetcher must resolve. Passing it lets the engine pin a
 	// connection to the IP the per-IP politeness bucket accounted for.
 	ResolvedIP [16]byte
+
+	// Robots is set when this request is the host's robots.txt, fetched before
+	// any of its content URLs (doc 07). CanonicalURL is the robots.txt URL; the
+	// fetcher returns the raw body in Outcome.RobotsBody for meguri to parse.
+	Robots bool
 }
 
 // Fetcher retrieves one Request and returns its typed Outcome. An error is for

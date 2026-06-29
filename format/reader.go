@@ -183,6 +183,98 @@ func (r *Reader) DueKeys(now uint32) ([]m.URLKey, error) {
 	return out, nil
 }
 
+// HostRangeURLKeys returns the URLKeys of every row whose host key falls in
+// [lo, hi], the host range read of doc 10 section 9 sharpened to the page level.
+// When the hostkey column is split across pages (Partition.MaxPageRows opted in),
+// it consults the per-page skip list and decodes only the pages whose zone
+// overlaps [lo, hi], pruning the rest without decompressing them; the pathkey
+// column splits on the same boundaries, so the same page indices line up. A
+// single-page column falls back to a whole-column projection and filter, and a
+// range disjoint from the partition's header bounds returns nil without touching
+// the body. The rows stay in stored order, which is host-key ascending.
+func (r *Reader) HostRangeURLKeys(lo, hi uint64) ([]m.URLKey, error) {
+	if lo > hi || hi < r.header.HostKeyLo || lo > r.header.HostKeyHi {
+		return nil, nil
+	}
+	var hkDir, pkDir columnDir
+	var okHK, okPK bool
+	for _, d := range r.footer.urlDir {
+		switch d.columnID {
+		case colURLHostKey:
+			hkDir, okHK = d, true
+		case colURLPathKey:
+			pkDir, okPK = d, true
+		}
+	}
+	if !okHK || !okPK {
+		return nil, ErrCorrupt
+	}
+
+	// Single-page column: no skip list to prune with, so read the keys whole and
+	// filter. This is the unchanged behavior for a partition that did not opt into
+	// page splitting.
+	if hkDir.numPages <= 1 || len(hkDir.pages) == 0 {
+		keys, err := r.URLKeys()
+		if err != nil {
+			return nil, err
+		}
+		var out []m.URLKey
+		for _, k := range keys {
+			if k.HostKey >= lo && k.HostKey <= hi {
+				out = append(out, k)
+			}
+		}
+		return out, nil
+	}
+
+	var out []m.URLKey
+	for pi := range hkDir.pages {
+		pe := hkDir.pages[pi]
+		if pe.hasZone && (pe.zoneMax < lo || pe.zoneMin > hi) {
+			continue // this page's host keys are entirely outside the range
+		}
+		hk, err := decodeColumnPage(r.file, hkDir, pi)
+		if err != nil {
+			return nil, err
+		}
+		pk, err := decodeColumnPage(r.file, pkDir, pi)
+		if err != nil {
+			return nil, err
+		}
+		nv := int(pe.numValues)
+		if len(hk) < nv*8 || len(pk) < nv*8 {
+			return nil, ErrCorrupt
+		}
+		for i := range nv {
+			v := getU64(hk, i)
+			if v >= lo && v <= hi {
+				out = append(out, m.URLKey{HostKey: v, PathKey: getU64(pk, i)})
+			}
+		}
+	}
+	return out, nil
+}
+
+// HostRangePageScan reports how many of the hostkey column's pages a host-range
+// read for [lo, hi] would decode versus the column's total page count, the
+// observable proof that the per-page skip list pruned pages. total is 0 for a
+// single-page column, which carries no skip list to prune.
+func (r *Reader) HostRangePageScan(lo, hi uint64) (scanned, total int) {
+	for _, d := range r.footer.urlDir {
+		if d.columnID != colURLHostKey {
+			continue
+		}
+		total = len(d.pages)
+		for _, pe := range d.pages {
+			if !pe.hasZone || (pe.zoneMax >= lo && pe.zoneMin <= hi) {
+				scanned++
+			}
+		}
+		return scanned, total
+	}
+	return 0, 0
+}
+
 // HasSchedule reports whether the file carries a schedule index region, the
 // durable timing wheel a scheduler can read instead of scanning the next_due
 // column.

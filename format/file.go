@@ -24,11 +24,11 @@ func Encode(p *Partition) ([]byte, error) {
 	// column directories can address pages from the start of the file.
 	pos := uint64(HeaderSize)
 
-	urlRegion, urlDir := encodeColumnRegion(urlColumns(p.URLs, codec), pos)
+	urlRegion, urlDir := encodeColumnRegion(urlColumns(p.URLs, codec), pos, p.MaxPageRows)
 	urlOff := pos
 	pos += uint64(len(urlRegion))
 
-	hostRegion, hostDir := encodeColumnRegion(hostColumns(p.Hosts, codec), pos)
+	hostRegion, hostDir := encodeColumnRegion(hostColumns(p.Hosts, codec), pos, p.MaxPageRows)
 	hostOff := pos
 	pos += uint64(len(hostRegion))
 

@@ -30,6 +30,14 @@ type Partition struct {
 	// the dedup package owns their layout, the format frames them with a CRC.
 	SeenFilter []byte
 
+	// BuildSchedule asks Encode to derive and write the schedule index region (doc
+	// 10 section 7, the bucketed timing wheel) from the URL rows' next_due. It is
+	// off by default so a partition that does not want the wheel stays byte-for-byte
+	// the same; a checkpoint that wants a scheduler to find due work without
+	// scanning the next_due column sets it. The region is omitted anyway when no row
+	// is scheduled.
+	BuildSchedule bool
+
 	Meta map[string]string // optional string metadata, keys sorted on write
 }
 

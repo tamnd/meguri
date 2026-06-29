@@ -32,9 +32,19 @@ func Encode(p *Partition) ([]byte, error) {
 	hostOff := pos
 	pos += uint64(len(hostRegion))
 
-	// The seen-set filter region sits between the host table and the string blob
-	// (doc 10 section 2, the region order). It is present only when the caller
-	// carried a serialized filter into the partition.
+	// The schedule index region sits after the host table (doc 10 section 2, the
+	// region order: url, host, schedule, seenset, blob). It is present only when the
+	// caller asked for the wheel and at least one row is scheduled.
+	var schedRegion []byte
+	if p.BuildSchedule {
+		schedRegion = encodeScheduleRegion(p.URLs, codec)
+	}
+	schedOff := pos
+	pos += uint64(len(schedRegion))
+
+	// The seen-set filter region sits between the schedule index and the string
+	// blob. It is present only when the caller carried a serialized filter into the
+	// partition.
 	seenRegion := encodeSeensetRegion(p.SeenFilter, uint64(len(p.URLs)), codec)
 	seenOff := pos
 	pos += uint64(len(seenRegion))
@@ -48,6 +58,11 @@ func Encode(p *Partition) ([]byte, error) {
 	regions := []regionDesc{
 		{id: RegionURLTable, offset: urlOff, length: uint64(len(urlRegion)), crc: crc32c(urlRegion)},
 		{id: RegionHostTable, offset: hostOff, length: uint64(len(hostRegion)), crc: crc32c(hostRegion)},
+	}
+	if len(schedRegion) > 0 {
+		regions = append(regions, regionDesc{
+			id: RegionSchedule, offset: schedOff, length: uint64(len(schedRegion)), crc: crc32c(schedRegion),
+		})
 	}
 	if len(seenRegion) > 0 {
 		regions = append(regions, regionDesc{
@@ -88,6 +103,9 @@ func Encode(p *Partition) ([]byte, error) {
 	footerBytes := encodeFooter(footer)
 
 	flags := FlagSorted
+	if len(schedRegion) > 0 {
+		flags |= FlagHasSchedule
+	}
 	if len(seenRegion) > 0 {
 		flags |= FlagHasSeenset
 	}
@@ -113,6 +131,7 @@ func Encode(p *Partition) ([]byte, error) {
 	out = append(out, h.Encode()...)
 	out = append(out, urlRegion...)
 	out = append(out, hostRegion...)
+	out = append(out, schedRegion...)
 	out = append(out, seenRegion...)
 	out = append(out, blobRegion...)
 	out = append(out, footerBytes...)
@@ -187,6 +206,12 @@ func Decode(b []byte) (*Partition, error) {
 		URLs:         urls,
 		Hosts:        hosts,
 		Meta:         metaMap(f.meta),
+	}
+	if _, ok := findRegion(f.regions, RegionSchedule); ok {
+		// The wheel is derived from next_due, so a decode does not rebuild it into
+		// the partition; recording that it was present lets a re-encode reproduce it
+		// byte for byte.
+		p.BuildSchedule = true
 	}
 	if reg, ok := findRegion(f.regions, RegionSeenset); ok {
 		blob, err := decodeSeensetRegion(b[reg.offset : reg.offset+reg.length])

@@ -22,11 +22,15 @@ package frontier
 import (
 	"context"
 	"sort"
+	"time"
 
 	"github.com/tamnd/meguri"
 	"github.com/tamnd/meguri/dedup"
+	"github.com/tamnd/meguri/dns"
 	"github.com/tamnd/meguri/fetch"
 	"github.com/tamnd/meguri/format"
+	"github.com/tamnd/meguri/politeness"
+	"github.com/tamnd/meguri/robots"
 )
 
 // defaultTarget is the active-host cap when none is set. It is effectively
@@ -42,15 +46,30 @@ const defaultTarget = 1 << 30
 // run.
 const recrawlGapHours = 168
 
+// robots fetch state of a host: never fetched, fetch in flight, or rules ready.
+const (
+	robotsNone uint8 = iota
+	robotsPending
+	robotsReady
+)
+
 // hostEntry is the resident state of one host: its durable record, its back
 // queue of URLs waiting to dispatch (FIFO, fed in priority order so the head is
-// the host's best URL), and the live politeness and pool bookkeeping.
+// the host's best URL), and the live politeness, robots, and pool bookkeeping.
 type hostEntry struct {
 	rec      meguri.HostRecord
 	back     []meguri.URLKey // FIFO; head is the next URL to dispatch for this host
-	eligible uint32          // epoch-seconds, mirror of rec.HostNextEligible
 	inFlight bool            // a URL of this host is dispatched, awaiting an outcome
 	active   bool            // holds a back queue, counts against target
+
+	// M3 politeness and robots state. The durable copy of the politeness window
+	// lives in rec (HostNextEligible, IPNextEligible, CrawlDelay); these are the
+	// in-memory control signals that drive it.
+	effective   time.Duration // adaptive crawl interval, AIMD-controlled
+	crawlFloor  time.Duration // configured/robots floor, never crawl faster
+	robots      *robots.Rules // parsed rules, nil means allow-all
+	robotsState uint8         // robotsNone | robotsPending | robotsReady
+	ceilStreak  uint8         // consecutive ceiling-pinned error fetches
 }
 
 // Frontier is the single-partition resident scheduler.
@@ -71,6 +90,13 @@ type Frontier struct {
 
 	target int // active-host cap (distributor)
 	active int // hosts currently holding a back queue
+
+	// M3 politeness, DNS, and robots policy.
+	pol      politeness.Config
+	ips      *politeness.IPTable
+	resolver *dns.Cache // nil disables DNS prefetch and per-IP dial pinning
+	robotsOn bool       // fetch and enforce robots.txt before content
+	agent    string     // product token robots groups are matched against
 }
 
 // Option configures a Frontier at construction.
@@ -83,6 +109,39 @@ func WithTarget(n int) Option {
 	return func(f *Frontier) {
 		if n > 0 {
 			f.target = n
+		}
+	}
+}
+
+// WithPoliteness sets the politeness policy (interval band and AIMD constants)
+// and rebuilds the per-IP table around its IP floor. The default is
+// politeness.DefaultConfig (doc 07).
+func WithPoliteness(c politeness.Config) Option {
+	return func(f *Frontier) {
+		f.pol = c
+		f.ips = politeness.NewIPTable(c.IPFloor)
+	}
+}
+
+// WithResolver turns on DNS: hosts are prefetched off the dispatch path, their
+// resolved IP rides on each fetch.Request so ami can pin the connection, and the
+// per-IP politeness bucket is keyed on the address many vhosts may share. Without
+// it the frontier crawls host-only, with no per-IP throttle.
+func WithResolver(r dns.Resolver) Option {
+	return func(f *Frontier) {
+		f.resolver = dns.NewCache(r, nil)
+	}
+}
+
+// WithRobots turns on robots.txt: a host fetches and parses robots before any of
+// its content URLs dispatch, disallowed URLs are excluded, and a robots
+// Crawl-delay raises the host's politeness floor. agent is the product token its
+// groups are matched against. Without it the frontier does not consult robots.
+func WithRobots(agent string) Option {
+	return func(f *Frontier) {
+		f.robotsOn = true
+		if agent != "" {
+			f.agent = agent
 		}
 	}
 }
@@ -100,7 +159,10 @@ func New(id, created uint32, opts ...Option) *Frontier {
 		seen:    dedup.NewSeenSet(),
 		soft:    dedup.NewSoftDetector(),
 		target:  defaultTarget,
+		pol:     politeness.DefaultConfig(),
+		agent:   "meguri",
 	}
+	f.ips = politeness.NewIPTable(f.pol.IPFloor)
 	for _, o := range opts {
 		o(f)
 	}
@@ -148,14 +210,7 @@ func (f *Frontier) Seed(url, host string, priority float32, firstSeen, nextDue u
 
 	h := f.hosts[hk]
 	if h == nil {
-		ref := f.arena.intern(host)
-		h = &hostEntry{rec: meguri.HostRecord{
-			HostKey:        hk,
-			HostRef:        ref,
-			Grouping:       meguri.GroupRegistrableDomain,
-			RegistrableRef: ref,
-			CrawlDelay:     crawlDelay,
-		}}
+		h = f.newHost(hk, f.arena.intern(host), host, crawlDelay)
 		f.hosts[hk] = h
 	}
 	h.rec.URLCount++
@@ -184,14 +239,8 @@ func (f *Frontier) Discover(d meguri.Discovery, now uint32) bool {
 	hk := d.URLKey.HostKey
 	h := f.hosts[hk]
 	if h == nil {
-		ref := f.arena.intern(hostFromCanonical(d.CanonicalURL))
-		h = &hostEntry{rec: meguri.HostRecord{
-			HostKey:        hk,
-			HostRef:        ref,
-			Grouping:       meguri.GroupRegistrableDomain,
-			RegistrableRef: ref,
-			CrawlDelay:     10,
-		}}
+		host := hostFromCanonical(d.CanonicalURL)
+		h = f.newHost(hk, f.arena.intern(host), host, 10)
 		f.hosts[hk] = h
 	}
 
@@ -224,17 +273,41 @@ func (f *Frontier) Discover(d meguri.Discovery, now uint32) bool {
 func (f *Frontier) Dispatch(now uint32) (fetch.Request, bool) {
 	f.promote(now)
 	f.distribute(now)
-	hk, ok := f.readyHosts.pop()
-	if !ok {
-		return fetch.Request{}, false
+
+	// Pop the best ready host, but resolve its address and re-check the live
+	// window first: a sibling host sharing the same IP may have advanced the
+	// per-IP bucket since this host was marked ready. If the IP now gates it,
+	// re-park it and try the next ready host (doc 07, both buckets must permit).
+	var h *hostEntry
+	for {
+		hk, ok := f.readyHosts.pop()
+		if !ok {
+			return fetch.Request{}, false
+		}
+		h = f.hosts[hk]
+		f.resolveHost(h, now)
+		if e := f.eligibleNow(h); e > now {
+			f.wait.push(hk, e)
+			continue
+		}
+		break
 	}
-	h := f.hosts[hk]
+
+	// Robots first: a host with content work but no fresh robots rules fetches
+	// robots.txt before any of its content URLs (doc 07). The robots fetch spends
+	// politeness like any other request to the host.
+	if f.robotsOn && f.needsRobots(h, now) {
+		h.robotsState = robotsPending
+		h.inFlight = true
+		f.spend(h, now)
+		return f.robotsRequest(h), true
+	}
+
 	key := h.back[0]
 	rec := f.records[key]
 	rec.Status = meguri.StatusInFlight
 	h.inFlight = true
-	h.eligible = now + delaySeconds(h.rec.CrawlDelay)
-	h.rec.HostNextEligible = h.eligible
+	f.spend(h, now)
 	return fetch.Request{
 		URLKey:       rec.URLKey,
 		HostKey:      rec.HostKey,
@@ -262,6 +335,16 @@ func (f *Frontier) NextEligible() (uint32, bool) {
 // the wait heap behind its fresh politeness window if it still has work, or out
 // of the active set if its back queue drained.
 func (f *Frontier) Report(o meguri.Outcome, now uint32) {
+	// A robots.txt outcome has no URL record: it carries the host's robots key
+	// and the raw body. Parse it, cache the rules, and let the host proceed to
+	// its content URLs (doc 07).
+	if f.robotsOn {
+		if h := f.hosts[o.URLKey.HostKey]; h != nil && h.robotsState == robotsPending && o.URLKey == robotsKey(h.rec.HostKey) {
+			f.applyRobots(h, o, now)
+			return
+		}
+	}
+
 	rec := f.records[o.URLKey]
 	if rec == nil {
 		return
@@ -299,9 +382,23 @@ func (f *Frontier) Report(o meguri.Outcome, now uint32) {
 		rec.ContentFP = o.ContentFP
 		rec.Simhash = o.Simhash
 	}
+	// A 304 is a no-change observation: the conditional GET saved the body and
+	// the freshness model reads the streak (doc 06).
+	if o.NotModified {
+		rec.NoChangeStreak++
+	}
+	// Store fresh validators so the next fetch can go conditional.
+	if o.ETag != "" {
+		rec.ETagRef = f.arena.intern(o.ETag)
+	}
+	if o.LastModified != 0 {
+		rec.LastModified = o.LastModified
+	}
 	if h == nil {
 		return
 	}
+	// Fold the outcome into the host's adaptive rate before re-placing it (doc 07).
+	f.adapt(h, o)
 	h.inFlight = false
 	if len(h.back) == 0 {
 		h.active = false
@@ -324,6 +421,14 @@ func (f *Frontier) promote(now uint32) {
 		if h == nil || len(h.back) == 0 {
 			continue
 		}
+		// Re-check the live window: another host on the same IP may have advanced
+		// the per-IP bucket after this host was parked, so the heap key can be
+		// stale. If it is, re-park behind the fresh instant rather than dispatch
+		// early.
+		if e := f.eligibleNow(h); e > now {
+			f.wait.push(it.hostKey, e)
+			continue
+		}
 		f.readyHosts.push(it.hostKey, f.records[h.back[0]].Priority)
 	}
 }
@@ -344,6 +449,13 @@ func (f *Frontier) distribute(now uint32) {
 			return
 		}
 		f.urlFront.pop()
+		// A host whose robots rules are already known excludes a disallowed URL at
+		// bind time rather than queueing it (doc 07). A host still awaiting robots
+		// queues the URL and filters it when the rules land.
+		if h.robotsState == robotsReady && !f.allowed(h, key) {
+			f.records[key].Status = meguri.StatusExcludedRobots
+			continue
+		}
 		wasActive := h.active
 		h.back = append(h.back, key)
 		if !wasActive {
@@ -361,11 +473,12 @@ func (f *Frontier) place(h *hostEntry, now uint32) {
 	if len(h.back) == 0 || h.inFlight {
 		return
 	}
-	if h.eligible <= now {
+	e := f.eligibleNow(h)
+	if e <= now {
 		f.readyHosts.push(h.rec.HostKey, f.records[h.back[0]].Priority)
 		return
 	}
-	f.wait.push(h.rec.HostKey, h.eligible)
+	f.wait.push(h.rec.HostKey, e)
 }
 
 // Drain dispatches every schedulable URL, advancing a logical clock from start
@@ -405,8 +518,8 @@ type Dispatched struct {
 
 // Checkpoint serializes the live frontier into a .meguri partition (D1, D12):
 // every URL record sorted by URLKey, every host record sorted by HostKey with
-// its live politeness time folded back in, and the string arena. Recover rebuilds
-// an identical scheduler from it.
+// its live politeness window (already maintained in the record), and the string
+// arena. Recover rebuilds an identical scheduler from it.
 func (f *Frontier) Checkpoint() *format.Partition {
 	urls := make([]meguri.URLRecord, 0, len(f.records))
 	for _, r := range f.records {
@@ -416,7 +529,6 @@ func (f *Frontier) Checkpoint() *format.Partition {
 
 	hosts := make([]meguri.HostRecord, 0, len(f.hosts))
 	for _, h := range f.hosts {
-		h.rec.HostNextEligible = h.eligible
 		hosts = append(hosts, h.rec)
 	}
 	sort.Slice(hosts, func(i, j int) bool { return hosts[i].HostKey < hosts[j].HostKey })
@@ -455,7 +567,14 @@ func Recover(p *format.Partition, opts ...Option) *Frontier {
 
 	for i := range p.Hosts {
 		h := p.Hosts[i]
-		f.hosts[h.HostKey] = &hostEntry{rec: h, eligible: h.HostNextEligible}
+		// The adaptive interval is a transient control signal: it resets to the
+		// baseline and re-converges, while the durable floor (CrawlDelay) and the
+		// politeness window (HostNextEligible) come straight back from the record.
+		f.hosts[h.HostKey] = &hostEntry{
+			rec:        h,
+			effective:  f.pol.Default,
+			crawlFloor: deciToDur(h.CrawlDelay),
+		}
 	}
 	for i := range p.URLs {
 		rec := p.URLs[i]
@@ -471,10 +590,8 @@ func Recover(p *format.Partition, opts ...Option) *Frontier {
 		switch r.Status {
 		case meguri.StatusScheduled, meguri.StatusReady, meguri.StatusDueRecrawl:
 			if f.hosts[r.HostKey] == nil {
-				ref := f.arena.intern(HostOf(f.arena.str(r.URLRef)))
-				f.hosts[r.HostKey] = &hostEntry{rec: meguri.HostRecord{
-					HostKey: r.HostKey, HostRef: ref, RegistrableRef: ref, CrawlDelay: 10,
-				}}
+				host := HostOf(f.arena.str(r.URLRef))
+				f.hosts[r.HostKey] = f.newHost(r.HostKey, f.arena.intern(host), host, 10)
 			}
 			f.urlFront.push(r.URLKey, r.Priority)
 		}

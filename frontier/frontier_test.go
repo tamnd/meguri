@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -279,6 +280,7 @@ type seed struct {
 	url, host string
 	priority  float32
 	delay     uint16
+	status    uint16 // real HTTP status from the corpus capture, 0 outside the corpus
 }
 
 func seedAll(f *Frontier, seeds []seed) *Frontier {
@@ -321,8 +323,9 @@ func loadCorpusSeeds(tb testing.TB, path string) []seed {
 	defer f.Close()
 
 	type cdx struct {
-		URL  string `json:"url"`
-		Host string `json:"host"`
+		URL    string `json:"url"`
+		Host   string `json:"host"`
+		Status string `json:"status"`
 	}
 	var out []seed
 	sc := bufio.NewScanner(f)
@@ -343,7 +346,11 @@ func loadCorpusSeeds(tb testing.TB, path string) []seed {
 		if host == "" {
 			continue
 		}
-		out = append(out, seed{url: rec.URL, host: host, priority: corpusPrio(rec.URL), delay: 10})
+		st := uint16(200) // a capture with no parseable status reads as a plain 200
+		if n, err := strconv.Atoi(rec.Status); err == nil && n > 0 && n < 600 {
+			st = uint16(n)
+		}
+		out = append(out, seed{url: rec.URL, host: host, priority: corpusPrio(rec.URL), delay: 10, status: st})
 	}
 	if err := sc.Err(); err != nil {
 		tb.Fatalf("scan corpus: %v", err)

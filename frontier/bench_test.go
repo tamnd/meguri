@@ -5,6 +5,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/tamnd/meguri"
 	"github.com/tamnd/meguri/format"
 )
 
@@ -83,6 +84,34 @@ func BenchmarkCorpusDrain(b *testing.B) {
 		f := seedAll(New(1, 0), seeds)
 		b.StartTimer()
 		if _, err := f.Drain(context.Background(), 0, stubFetcher{}); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkCorpusDrainPolite runs the full M3 hot path over the real slice: DNS
+// resolution off the dispatch path, the per-host and shared per-IP politeness
+// buckets, and AIMD folding each replayed status. It is the cost the scheduler
+// pays per fetch once politeness is on, the number that has to hold at 100B
+// pages. It skips when no corpus is configured.
+func BenchmarkCorpusDrainPolite(b *testing.B) {
+	path := os.Getenv("MEGURI_CORPUS")
+	if path == "" {
+		b.Skip("set MEGURI_CORPUS to a ccrawl jsonl slice (see scripts/fetch-corpus.sh)")
+	}
+	seeds := loadCorpusSeeds(b, path)
+	b.ReportAllocs()
+	for b.Loop() {
+		b.StopTimer()
+		f := New(1, 0, WithResolver(poolResolver{pool: 8}))
+		status := map[meguri.URLKey]uint16{}
+		for _, s := range seeds {
+			f.Seed(s.url, s.host, s.priority, 0, 0, s.delay)
+			status[meguri.MakeURLKey(s.host, PathOf(s.url))] = s.status
+		}
+		f.resolver.Wait()
+		b.StartTimer()
+		if _, err := f.Drain(context.Background(), 0, &scriptFetcher{status: status}); err != nil {
 			b.Fatal(err)
 		}
 	}

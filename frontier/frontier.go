@@ -149,6 +149,13 @@ type Frontier struct {
 	// across its out-links, so the front bank orders by online importance.
 	prio *prioritize.Prioritizer
 
+	// importedHostScore holds tsumugi host_score imports for hosts this partition
+	// owns (doc 09, D16). A score for a resident host is written straight onto its
+	// record; a score for a host not yet seen is parked here and stamped onto the
+	// record when newHost first builds it, so an import that arrives before the
+	// host does is not lost. nil until the first ImportHostSignal.
+	importedHostScore map[uint64]float32
+
 	// linkSink, when set, splits a crawl's out-links into local and remote as the
 	// cash spreads (doc 04, doc 12, section 6). It receives every out-link after
 	// the OPIC cash split has stamped each one's LinkWeight, ships the remote ones
@@ -340,6 +347,33 @@ func New(id, created uint32, opts ...Option) *Frontier {
 		o(f)
 	}
 	return f
+}
+
+// ImportURLSignal applies one imported per-page PageRank, the sparse URL half of
+// a tsumugi import the signal router delivered for a host this partition owns
+// (doc 09, D16). It overwrites any prior rank for the URL, because a newer
+// computation supersedes an older one, and is a no-op when prioritization is off
+// since there is nothing to blend the rank into.
+func (f *Frontier) ImportURLSignal(u meguri.URLSignal) {
+	if f.prio != nil {
+		f.prio.ImportPageRank(u.URLKey, u.PageRank)
+	}
+}
+
+// ImportHostSignal applies one imported host_score, the dense host half of a
+// tsumugi import (doc 09, D16). A resident host takes the score on its record at
+// once; a host not yet seen has the score parked so newHost stamps it when the
+// host first appears. The blend reads HostRecord.HostScore, so an imported score
+// flows into priority through the existing host-quality term with no other wiring.
+func (f *Frontier) ImportHostSignal(h meguri.HostSignal) {
+	if he := f.hosts[h.HostKey]; he != nil {
+		he.rec.HostScore = h.HostScore
+		return
+	}
+	if f.importedHostScore == nil {
+		f.importedHostScore = make(map[uint64]float32)
+	}
+	f.importedHostScore[h.HostKey] = h.HostScore
 }
 
 // Len reports the number of URLs the frontier holds, crawled or not.

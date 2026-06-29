@@ -3,7 +3,9 @@ package dedup
 import (
 	"bufio"
 	"encoding/json"
+	"hash/fnv"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -93,6 +95,77 @@ func loadCorpusURLs(tb testing.TB, path string) []string {
 		tb.Fatalf("scan corpus: %v", err)
 	}
 	return urls
+}
+
+// The pinned identity of the frozen CC-MAIN-2026-25 slice, computed through the real
+// registrable-domain canonicalization the frontier wires in New (doc 14, audit 272).
+// These are not round figures: they are the exact output of the discovery path over
+// the frozen slice, so any drift in the corpus file or the canonicalization changes
+// one of them and fails the pin. The host-key set is the range pin the methodology
+// names: the slice resolves to a fixed set of registrable-domain host keys, and the
+// digest fixes their identity, not just their count.
+const (
+	pinStreamRecords = 145664               // CanonicalKey-admitted records in stream order
+	pinDistinctURLs  = 142232               // distinct 128-bit URL keys
+	pinHostGroups    = 4                    // distinct registrable-domain host keys
+	pinHostMinKey    = 5725451210214531035  // lowest host key in the set
+	pinHostMaxKey    = 13655472743543740801 // highest host key in the set
+	pinHostDigest    = 0x30ba47a5fb9c8ca3   // fnv-1a/64 over the sorted host-key set
+)
+
+// TestCorpusPinnedInputs fixes the slice as a reproducible input (audit 272). It runs
+// the frozen ccrawl slice through the same CanonicalKey path every other gate uses and
+// asserts the stream length, the distinct-URL count, and the registrable-domain
+// host-key set (count, range, and an order-independent digest of its members) all
+// match the pinned constants. A gate that runs on a drifting input proves nothing, so
+// this is the guard that the corpus every other corpus test reads is the exact frozen
+// slice the numbers were measured on. If the slice is intentionally re-pinned, these
+// constants move with it in one place.
+func TestCorpusPinnedInputs(t *testing.T) {
+	path := corpusPath()
+	if path == "" {
+		t.Skip("set MEGURI_CORPUS to a ccrawl jsonl slice (see scripts/fetch-corpus.sh)")
+	}
+	keys := loadCorpusKeys(t, path)
+	if len(keys) != pinStreamRecords {
+		t.Fatalf("stream length %d, pinned %d: the slice is not the frozen CC-MAIN-2026-25 input", len(keys), pinStreamRecords)
+	}
+
+	urlSet := make(map[meguri.URLKey]struct{}, len(keys))
+	hostSet := map[uint64]struct{}{}
+	for _, k := range keys {
+		urlSet[k] = struct{}{}
+		hostSet[k.HostKey] = struct{}{}
+	}
+	if len(urlSet) != pinDistinctURLs {
+		t.Fatalf("distinct urls %d, pinned %d", len(urlSet), pinDistinctURLs)
+	}
+	if len(hostSet) != pinHostGroups {
+		t.Fatalf("registrable-domain host groups %d, pinned %d", len(hostSet), pinHostGroups)
+	}
+
+	hosts := make([]uint64, 0, len(hostSet))
+	for h := range hostSet {
+		hosts = append(hosts, h)
+	}
+	slices.Sort(hosts)
+	if hosts[0] != uint64(pinHostMinKey) || hosts[len(hosts)-1] != uint64(pinHostMaxKey) {
+		t.Fatalf("host-key range [%d,%d], pinned [%d,%d]", hosts[0], hosts[len(hosts)-1], uint64(pinHostMinKey), uint64(pinHostMaxKey))
+	}
+
+	dig := fnv.New64a()
+	var b [8]byte
+	for _, h := range hosts {
+		for i := range b {
+			b[i] = byte(h >> (i * 8))
+		}
+		dig.Write(b[:])
+	}
+	if dig.Sum64() != uint64(pinHostDigest) {
+		t.Fatalf("host-key set digest %#x, pinned %#x: the host set changed", dig.Sum64(), uint64(pinHostDigest))
+	}
+	t.Logf("pinned input verified: %d records, %d distinct urls, %d registrable-domain host groups, host-key digest %#x",
+		len(keys), len(urlSet), len(hosts), dig.Sum64())
 }
 
 // TestCorpusSeenSetZeroFalseNegatives is the M2 gate on real data: feed every

@@ -27,6 +27,7 @@ func main() {
 	root.AddCommand(newInspectCmd())
 	root.AddCommand(newMapCmd())
 	root.AddCommand(newRunCmd())
+	root.AddCommand(newScheduleCmd())
 	root.AddCommand(newSeedCmd())
 	root.AddCommand(newServeCmd())
 	root.AddCommand(newStatsCmd())

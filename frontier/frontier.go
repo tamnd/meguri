@@ -435,6 +435,49 @@ func (f *Frontier) Pending() int {
 	return n
 }
 
+// DueURL is one entry of the due-time schedule: a URL whose next_due has come
+// around, with its canonical string and the hour it is due, the row a `meguri
+// schedule` line prints.
+type DueURL struct {
+	Key     meguri.URLKey
+	URL     string
+	NextDue uint32
+}
+
+// DueURLs lists the URLs due at or before before, sorted by due time, the live
+// form of the schedule command's "what is due to be crawled" question (doc 13).
+// host filters to a single host group when nonzero; limit caps the result when
+// positive (0 returns all). A URL counts when its status still wants a fetch and
+// its next_due has come around, the same eligibility the dispatcher reads. The
+// walk is O(urls); the resident frontier already holds the strings, so this is the
+// rich, human-readable side the cold reader's key-only pushdown cannot give.
+func (f *Frontier) DueURLs(before uint32, host uint64, limit int) []DueURL {
+	var out []DueURL
+	for key, r := range f.records {
+		if host != 0 && r.HostKey != host {
+			continue
+		}
+		switch r.Status {
+		case meguri.StatusGone, meguri.StatusExcludedRobots, meguri.StatusTrapped, meguri.StatusInFlight:
+			continue
+		}
+		if r.NextDue > before {
+			continue
+		}
+		out = append(out, DueURL{Key: key, URL: f.arena.str(r.URLRef), NextDue: r.NextDue})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].NextDue != out[j].NextDue {
+			return out[i].NextDue < out[j].NextDue
+		}
+		return out[i].Key.Less(out[j].Key)
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
 // Stats is a point-in-time snapshot of a frontier's counters: the totals, the
 // pending dispatch count, the per-status URL distribution, the count due at or
 // before now, and the seen-set occupancy with its modeled false-positive rate.
@@ -1029,6 +1072,14 @@ func (f *Frontier) Checkpoint() *format.Partition {
 		URLs:         urls,
 		Hosts:        hosts,
 		Strings:      append([]byte(nil), f.arena.buf...),
+		// With the resident schedule wheel on (WithScheduleIndex), the checkpoint
+		// also writes the durable timing-wheel region (decision D13): the wheel moves
+		// into the store so a cold reader finds due work by reading the near buckets
+		// rather than scanning the whole next_due column. Recover still rebuilds the
+		// resident wheel from the URL table, so the region is a read-path accelerator,
+		// not a correctness dependency. A wheel-off frontier leaves it false, so its
+		// file stays byte-for-byte the default and the size pins do not move.
+		BuildSchedule: f.wheelOn,
 	}
 }
 

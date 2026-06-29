@@ -36,11 +36,10 @@ func loadCorpus(tb testing.TB, path string) *Partition {
 	}
 	defer f.Close()
 
-	var arena []byte
+	arena := newArena()
 	intern := func(s string) uint64 {
-		off := uint64(len(arena))
-		arena = append(arena, byte(min(len(s), 255)))
-		arena = append(arena, s...)
+		var off uint64
+		arena, off = arenaIntern(arena, []byte(s))
 		return off
 	}
 

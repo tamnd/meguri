@@ -32,8 +32,9 @@ func Encode(p *Partition) ([]byte, error) {
 	hostOff := pos
 	pos += uint64(len(hostRegion))
 
+	blobRegion := encodeBlobRegion(p.Strings, codec)
 	strOff := pos
-	pos += uint64(len(p.Strings))
+	pos += uint64(len(blobRegion))
 
 	footerOff := pos
 
@@ -41,9 +42,9 @@ func Encode(p *Partition) ([]byte, error) {
 		{id: RegionURLTable, offset: urlOff, length: uint64(len(urlRegion)), crc: crc32c(urlRegion)},
 		{id: RegionHostTable, offset: hostOff, length: uint64(len(hostRegion)), crc: crc32c(hostRegion)},
 	}
-	if len(p.Strings) > 0 {
+	if len(blobRegion) > 0 {
 		regions = append(regions, regionDesc{
-			id: RegionStringBlob, offset: strOff, length: uint64(len(p.Strings)), crc: crc32c(p.Strings),
+			id: RegionStringBlob, offset: strOff, length: uint64(len(blobRegion)), crc: crc32c(blobRegion),
 		})
 	}
 
@@ -97,7 +98,7 @@ func Encode(p *Partition) ([]byte, error) {
 	out = append(out, h.Encode()...)
 	out = append(out, urlRegion...)
 	out = append(out, hostRegion...)
-	out = append(out, p.Strings...)
+	out = append(out, blobRegion...)
 	out = append(out, footerBytes...)
 
 	var tail wbuf
@@ -172,7 +173,11 @@ func Decode(b []byte) (*Partition, error) {
 		Meta:         metaMap(f.meta),
 	}
 	if reg, ok := findRegion(f.regions, RegionStringBlob); ok {
-		p.Strings = append([]byte(nil), b[reg.offset:reg.offset+reg.length]...)
+		arena, err := decodeBlobRegion(b[reg.offset : reg.offset+reg.length])
+		if err != nil {
+			return nil, err
+		}
+		p.Strings = arena
 	}
 	if !sortedURLs(p.URLs) {
 		return nil, ErrNotSorted

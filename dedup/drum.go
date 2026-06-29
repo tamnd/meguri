@@ -73,6 +73,17 @@ func (s *exactSet) bucketOf(key meguri.URLKey) int {
 	return int(key.HostKey >> s.shift)
 }
 
+// keys returns every key in the set, concatenating the per-bucket sorted runs.
+// It is the source a ribbon snapshot freezes from; the order does not matter to
+// the ribbon build.
+func (s *exactSet) keys() []meguri.URLKey {
+	out := make([]meguri.URLKey, 0, s.size)
+	for _, b := range s.buckets {
+		out = append(out, b...)
+	}
+	return out
+}
+
 // contains reports whether the key is present, by binary search of its sorted
 // bucket. This is the confirm a filter hit triggers; doc 11 makes it a row-group
 // scan against the .meguri urlkey column.

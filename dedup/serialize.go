@@ -64,30 +64,56 @@ func (f *filter) marshal() []byte {
 	return out
 }
 
+// residentMembership is the one-sided membership probe both filter forms answer:
+// the mutable blocked-Bloom filter and the static ribbon snapshot. A reconstructed
+// ResidentFilter holds whichever form the blob carried behind this interface, so
+// the caller's MaybeContains is the same either way.
+type residentMembership interface {
+	maybeContains(key meguri.URLKey) bool
+	bitsPerURL() float64
+	length() uint64
+}
+
 // ResidentFilter is a reconstructed read-only seen-set filter: it answers the
 // one-sided membership probe a discovery path uses to short-circuit "definitely
 // not seen", and reports its resident cost, but it does not insert. A recovery
 // loads it from the .meguri seen-set region and pairs it with the exact set
-// rebuilt from the urlkey column.
+// rebuilt from the urlkey column. The blocked-Bloom and ribbon forms ride behind
+// the same membership contract.
 type ResidentFilter struct {
-	f *filter
+	mem residentMembership
 }
 
-// UnmarshalFilter reconstructs a resident filter from the blob MarshalFilter
-// wrote. The reconstructed filter answers MaybeContains identically to the
-// original for every key, the property the format round-trip gate asserts.
+// UnmarshalFilter reconstructs a resident filter from a filter blob, dispatching
+// on the kind byte: the blocked-Bloom form MarshalFilter wrote, or the ribbon
+// snapshot BuildRibbonFilter wrote. The reconstructed filter answers MaybeContains
+// identically to the original for every key, the property the round-trip gate
+// asserts.
 func UnmarshalFilter(b []byte) (*ResidentFilter, error) {
-	if len(b) < filterBlobHeaderSize+24 {
-		return nil, errBadFilterBlob
-	}
-	if b[0] != filterBlobVersion {
+	if len(b) < 2 || b[0] != filterBlobVersion {
 		return nil, errBadFilterBlob
 	}
 	switch b[1] {
 	case filterKindBlockedBloom:
+		f, err := unmarshalBloom(b)
+		if err != nil {
+			return nil, err
+		}
+		return &ResidentFilter{mem: f}, nil
 	case filterKindRibbon:
-		return nil, errors.New("dedup: ribbon seen-set filter not yet supported")
+		rb, err := unmarshalRibbon(b)
+		if err != nil {
+			return nil, err
+		}
+		return &ResidentFilter{mem: rb}, nil
 	default:
+		return nil, errBadFilterBlob
+	}
+}
+
+// unmarshalBloom reconstructs the blocked-Bloom filter from its kind-0 blob.
+func unmarshalBloom(b []byte) (*filter, error) {
+	if len(b) < filterBlobHeaderSize+24 {
 		return nil, errBadFilterBlob
 	}
 	k := int(b[2])
@@ -104,22 +130,16 @@ func UnmarshalFilter(b []byte) (*ResidentFilter, error) {
 	for i := range blocks {
 		blocks[i] = binary.LittleEndian.Uint64(body[i*8:])
 	}
-	return &ResidentFilter{f: &filter{
-		blocks: blocks,
-		nBlock: nBlock,
-		k:      k,
-		n:      n,
-		cap:    cap,
-	}}, nil
+	return &filter{blocks: blocks, nBlock: nBlock, k: k, n: n, cap: cap}, nil
 }
 
 // MaybeContains is the one-sided probe: false is authoritative (the key was
 // never added), true is the filter's "probably", confirmed against the exact set
 // by the caller.
-func (r *ResidentFilter) MaybeContains(key meguri.URLKey) bool { return r.f.maybeSeen(key) }
+func (r *ResidentFilter) MaybeContains(key meguri.URLKey) bool { return r.mem.maybeContains(key) }
 
 // BitsPerURL reports the reconstructed filter's resident cost per held key.
-func (r *ResidentFilter) BitsPerURL() float64 { return r.f.bitsPerKey() }
+func (r *ResidentFilter) BitsPerURL() float64 { return r.mem.bitsPerURL() }
 
 // Len reports the number of keys the filter was built over.
-func (r *ResidentFilter) Len() uint64 { return r.f.n }
+func (r *ResidentFilter) Len() uint64 { return r.mem.length() }

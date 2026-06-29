@@ -48,6 +48,26 @@ const defaultTarget = 1 << 30
 // run.
 const recrawlGapHours = 168
 
+// backQueuesPerThread is the k in doc 05's "keep at least k*threads back queues"
+// rule: a bounded active-host set must hold enough back queues that no dispatch
+// thread ever idles for want of a ready host. With one in flight per host, fewer
+// than k*threads active hosts starves the fetcher pool, so WithDispatchThreads
+// floors the effective active-host target at k*threads regardless of a tighter
+// memory cap.
+const backQueuesPerThread = 3
+
+// frontRefillBatch is the cadence of the anti-starvation sweep: every this many
+// dispatches a bounded frontier promotes the URLs that have waited too long in
+// the front bank, the batch granularity doc 05 names for the front-bank refill.
+const frontRefillBatch = 32
+
+// frontAgePromoteHours is the starvation threshold: a front-bank URL that has
+// waited longer than this without binding to a host queue is promoted to the top
+// priority bucket so the next free active-host slot takes it ahead of fresher,
+// higher-scored work. It only bites when the active-host set is bounded; an
+// unbounded frontier activates every host with work, so nothing starves.
+const frontAgePromoteHours = 168
+
 // robots fetch state of a host: never fetched, fetch in flight, or rules ready.
 const (
 	robotsNone uint8 = iota
@@ -93,6 +113,19 @@ type Frontier struct {
 
 	target int // active-host cap (distributor)
 	active int // hosts currently holding a back queue
+
+	// Anti-starvation tier (doc 05). minActive is the k*threads back-queue floor:
+	// the effective active-host target never drops below it, so a bounded frontier
+	// still keeps every dispatch thread fed. bounded records that the active set is
+	// capped (a target was set or a thread floor was set), which is the only case a
+	// front-bank URL can starve; when it is false the frontier activates every host
+	// with work and the aging sweep stays off so the earlier milestones' dispatch
+	// order is byte-for-byte unchanged. frontAge is the FIFO of front-bank waits the
+	// sweep reads, and sinceSweep counts dispatches toward the next sweep.
+	minActive  int
+	bounded    bool
+	frontAge   []frontWait
+	sinceSweep int
 
 	// M3 politeness, DNS, and robots policy.
 	pol      politeness.Config
@@ -143,13 +176,42 @@ const tauTickEvery = 4096
 // Option configures a Frontier at construction.
 type Option func(*Frontier)
 
+// frontWait records when a URL entered the front bank, so the anti-starvation
+// sweep can promote one that has waited past frontAgePromoteHours. enqueued is
+// epoch-hours, the data-model clock. The FIFO is approximately insertion-ordered
+// (seeds carry their first-seen hour, discoveries the dispatch hour), which the
+// sweep relies on only as a heuristic: the head is the oldest, so it stops at the
+// first entry that has not aged out and never scans the whole bank.
+type frontWait struct {
+	key      meguri.URLKey
+	enqueued uint32
+}
+
 // WithTarget caps the number of hosts that hold a back queue at once, bounding
 // resident memory. A value <= 0 is ignored. The default is effectively
-// unbounded.
+// unbounded. A bounded target can starve a low-priority host whose URLs never win
+// a slot, so pair it with WithDispatchThreads, which both floors the active set at
+// k*threads and turns on the front-bank age-promotion sweep.
 func WithTarget(n int) Option {
 	return func(f *Frontier) {
 		if n > 0 {
 			f.target = n
+			f.bounded = true
+		}
+	}
+}
+
+// WithDispatchThreads tells the frontier how many dispatch threads its engine
+// runs, so it can hold doc 05's invariant that the active-host set never drops
+// below k*threads back queues (k = backQueuesPerThread). It floors the effective
+// target at k*threads even under a tighter WithTarget memory cap, and it turns on
+// the anti-starvation sweep that promotes front-bank URLs aged past
+// frontAgePromoteHours. A value <= 0 is ignored.
+func WithDispatchThreads(threads int) Option {
+	return func(f *Frontier) {
+		if threads > 0 {
+			f.minActive = backQueuesPerThread * threads
+			f.bounded = true
 		}
 	}
 }
@@ -317,7 +379,7 @@ func (f *Frontier) Seed(url, host string, priority float32, firstSeen, nextDue u
 		f.prio.SeedCash(key, priority)
 		rec.Priority = f.prio.Priority(rec, &h.rec)
 	}
-	f.urlFront.push(key, rec.Priority)
+	f.frontPush(key, rec.Priority, firstSeen)
 }
 
 // Discover is the idempotent intake of a routed out-link (doc 08, section 9.3,
@@ -403,7 +465,7 @@ func (f *Frontier) Discover(d meguri.Discovery, now uint32) bool {
 	if status != meguri.StatusScheduled {
 		return false // parked in Trapped: recorded, dedups, not queued
 	}
-	f.urlFront.push(d.URLKey, rec.Priority)
+	f.frontPush(d.URLKey, rec.Priority, now/3600)
 	return true
 }
 
@@ -580,19 +642,76 @@ func (f *Frontier) promote(now uint32) {
 	}
 }
 
+// effectiveTarget is the active-host cap actually enforced: the configured target
+// raised to the k*threads back-queue floor when a dispatch-thread count is set, so
+// a bounded frontier never runs fewer back queues than its fetcher pool needs to
+// stay busy (doc 05).
+func (f *Frontier) effectiveTarget() int {
+	if f.minActive > f.target {
+		return f.minActive
+	}
+	return f.target
+}
+
+// frontPush enters a URL into the front bank and, for a bounded frontier, records
+// its wait so the age-promotion sweep can rescue it from starvation. enqueued is
+// epoch-hours. An unbounded frontier skips the bookkeeping: it activates every
+// host with work, so no front-bank URL ever waits behind a full active set.
+func (f *Frontier) frontPush(key meguri.URLKey, priority float32, enqueued uint32) {
+	f.urlFront.push(key, priority)
+	if f.bounded {
+		f.frontAge = append(f.frontAge, frontWait{key: key, enqueued: enqueued})
+	}
+}
+
+// promoteAged is the anti-starvation sweep (doc 05): it promotes front-bank URLs
+// that have waited past frontAgePromoteHours to the top priority bucket, so the
+// next free active-host slot takes a long-starved host ahead of fresher,
+// higher-scored work. It reads the wait FIFO from the head, the oldest first, and
+// stops at the first entry that has not aged out, so it never scans the whole
+// bank. A wait whose URL has already left the front bank (bound, crawled, or
+// re-priced past the top) is a cheap miss in rebucket and is dropped. nowHours is
+// the data-model clock.
+func (f *Frontier) promoteAged(nowHours uint32) {
+	for len(f.frontAge) > 0 {
+		w := f.frontAge[0]
+		if nowHours < w.enqueued || nowHours-w.enqueued < frontAgePromoteHours {
+			return
+		}
+		f.frontAge = f.frontAge[1:]
+		rec := f.records[w.key]
+		if rec == nil || rec.Status != meguri.StatusScheduled {
+			continue
+		}
+		if f.urlFront.rebucket(w.key, rec.Priority, 1.0) {
+			rec.Priority = 1.0
+		}
+	}
+}
+
 // distribute binds front-bank URLs to host back queues, activating new hosts up
 // to the target. It pulls the highest-priority URL whose host can take it: an
 // already-active host always can, an idle host only when there is room for
 // another active host. Pulling stops at the first URL that cannot be placed, so
-// the highest-priority work is always bound first.
+// the highest-priority work is always bound first. A bounded frontier first runs
+// the age-promotion sweep on a frontRefillBatch cadence, so a host starved by the
+// active-host cap eventually reaches the top of the bank.
 func (f *Frontier) distribute(now uint32) {
+	if f.bounded {
+		f.sinceSweep++
+		if f.sinceSweep >= frontRefillBatch {
+			f.sinceSweep = 0
+			f.promoteAged(now / 3600)
+		}
+	}
+	target := f.effectiveTarget()
 	for {
 		key, ok := f.urlFront.peek()
 		if !ok {
 			return
 		}
 		h := f.hosts[key.HostKey]
-		if !h.active && f.active >= f.target {
+		if !h.active && f.active >= target {
 			return
 		}
 		f.urlFront.pop()
@@ -740,7 +859,10 @@ func Recover(p *format.Partition, opts ...Option) *Frontier {
 				host := HostOf(f.arena.str(r.URLRef))
 				f.hosts[r.HostKey] = f.newHost(r.HostKey, f.arena.intern(host), host, 10)
 			}
-			f.urlFront.push(r.URLKey, r.Priority)
+			// Preserve the accumulated front-bank wait across recovery: a URL seeds
+			// the sweep at its first-seen hour, so a host already starving before the
+			// checkpoint keeps its claim to promotion after it.
+			f.frontPush(r.URLKey, r.Priority, r.FirstSeen)
 		}
 	}
 	return f

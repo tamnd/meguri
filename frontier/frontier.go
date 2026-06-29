@@ -656,6 +656,7 @@ func (f *Frontier) DispatchShard(now uint32, shard int) (fetch.Request, bool) {
 		ETag:         f.arena.str(rec.ETagRef),
 		LastModified: rec.LastModified,
 		ResolvedIP:   h.rec.ResolvedIP,
+		Depth:        rec.Depth,
 	}, true
 }
 

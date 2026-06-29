@@ -160,9 +160,12 @@ func (e *Engine) Run(ctx context.Context) error {
 			continue
 		}
 
-		// Idle: nothing in flight and nothing to dispatch now. A late inbound
-		// discovery may still have arrived, so check the intake once more before
-		// committing to a wait.
+		// Idle: nothing in flight and nothing to dispatch now. Ship any
+		// cross-partition discovery batches the busy path coalesced but left below
+		// the per-destination fill size, so a partial never waits past the point the
+		// partition quiesces. A late inbound discovery may still have arrived, so
+		// check the intake once more before committing to a wait.
+		e.flushRouter()
 		if e.intake(e.clk.Now()) {
 			continue
 		}
@@ -239,6 +242,20 @@ func (e *Engine) intake(now uint32) bool {
 		}
 	}
 	return added
+}
+
+// flushRouter ships the cross-partition discovery batches the router coalesced
+// across outcomes but left below the per-destination fill size. The router holds
+// a partial batch while the engine has work to dispatch, so links from many
+// outcomes to one owner ride one message; this bounds how long a partial waits by
+// shipping it the moment the engine would otherwise idle. A send error is dropped
+// on purpose, the same at-least-once contract RouteSink keeps: the discovery is
+// rediscoverable, and the receiver's seen-set dedups any redelivery.
+func (e *Engine) flushRouter() {
+	if e.router == nil {
+		return
+	}
+	_ = e.router.Flush()
 }
 
 // ImportSignal routes a full tsumugi import bundle to every partition that owns

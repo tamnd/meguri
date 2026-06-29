@@ -58,6 +58,9 @@ func TestRouterRoutesToOwner(t *testing.T) {
 	if _, err := r.RouteLinks(links); err != nil {
 		t.Fatalf("route: %v", err)
 	}
+	if err := r.Flush(); err != nil { // ship the partials the fill size left behind
+		t.Fatalf("flush: %v", err)
+	}
 	got := 0
 	for pid := PartitionID(1); pid < 5; pid++ {
 		recv := NewRouter(pid, mp, tr, 4)
@@ -74,12 +77,12 @@ func TestRouterRoutesToOwner(t *testing.T) {
 }
 
 // TestRouterBatchesByDestination checks the router ships one message per
-// destination per call, not one per link, the volume reduction that makes the
-// transport tractable at fleet scale. A counting transport records the messages.
+// destination, not one per link, the volume reduction that makes the transport
+// tractable at fleet scale. A counting transport records the messages.
 func TestRouterBatchesByDestination(t *testing.T) {
 	mp := &Map{Epoch: 1, NumPartitions: 6}
 	ct := &countTransport{}
-	r := NewRouter(0, mp, ct, 1<<30) // huge batch size, so only flushAll sends
+	r := NewRouter(0, mp, ct, 1<<30) // huge batch size, so only Flush sends
 
 	var links []m.Discovery
 	dests := map[PartitionID]bool{}
@@ -92,8 +95,47 @@ func TestRouterBatchesByDestination(t *testing.T) {
 	if _, err := r.RouteLinks(links); err != nil {
 		t.Fatalf("route: %v", err)
 	}
+	if err := r.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
 	if ct.messages != len(dests) {
 		t.Fatalf("sent %d messages for %d destinations, want one per destination", ct.messages, len(dests))
+	}
+}
+
+// TestRouterCoalescesAcrossOutcomes checks the persistent batcher merges links
+// from many RouteLinks calls to one destination into a single message: with a
+// fill size above the total link count, N outcomes routing to the same owner
+// ship one message at Flush, not one per outcome. This is the across-outcome
+// batching audit 251 names, the win over a per-call flush.
+func TestRouterCoalescesAcrossOutcomes(t *testing.T) {
+	mp := &Map{Epoch: 1, NumPartitions: 6}
+	ct := &countTransport{}
+	r := NewRouter(0, mp, ct, 1<<30) // never fills, so only Flush sends
+
+	// Pick one host this partition does not own and route links to it across many
+	// separate outcomes; without across-outcome batching each call would ship one.
+	var remote uint64
+	for hk := range uint64(1000) {
+		if mp.Owner(hk) != 0 {
+			remote = hk
+			break
+		}
+	}
+	const outcomes = 20
+	for i := range outcomes {
+		if _, err := r.RouteLinks([]m.Discovery{disc(remote, uint64(i))}); err != nil {
+			t.Fatalf("route %d: %v", i, err)
+		}
+	}
+	if ct.messages != 0 {
+		t.Fatalf("sent %d messages before flush, want 0: the batch should hold across outcomes", ct.messages)
+	}
+	if err := r.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if ct.messages != 1 {
+		t.Fatalf("sent %d messages for %d outcomes to one destination, want 1 coalesced", ct.messages, outcomes)
 	}
 }
 

@@ -368,6 +368,33 @@ func TestNaiveFrontierBaseline(t *testing.T) {
 	if !(bl.NaiveFleetBytes > bl.MeguriFleetBytes) {
 		t.Errorf("naive fleet %.0f not larger than meguri %.0f", bl.NaiveFleetBytes, bl.MeguriFleetBytes)
 	}
+	// With no measured FP rate the bloom arm is undefined and must stay zero rather
+	// than sizing a degenerate filter.
+	if bl.BloomBitsPerURL != 0 {
+		t.Errorf("bloom arm computed without an fp rate: %.4f bits/url", bl.BloomBitsPerURL)
+	}
+}
+
+// TestBloomBaselineArm checks the approximate-membership model arm: a plain bloom
+// sized for the measured FP rate at the optimal -ln(p)/(ln2)^2 bits/url, and the
+// premium meguri pays over it. At 1% fp the optimum is the textbook 9.585 bits/url,
+// so a measured 11 bits/url leaves a ~1.4 bit premium for the exact tier.
+func TestBloomBaselineArm(t *testing.T) {
+	bl := NaiveFrontierBaseline(Measured{BitsPerURL: 11, FPRate: 0.01}, 100e9)
+	wantBloom := -math.Log(0.01) / 0.4804530139182014 // -ln(0.01) / (ln 2)^2, ~9.585
+	if math.Abs(bl.BloomBitsPerURL-wantBloom) > 1e-9 {
+		t.Errorf("bloom bits/url = %.6f, want %.6f", bl.BloomBitsPerURL, wantBloom)
+	}
+	if bl.BloomFPRate != 0.01 {
+		t.Errorf("bloom fp = %.4f, want 0.01", bl.BloomFPRate)
+	}
+	if math.Abs(bl.MeguriPremiumBits-(11-wantBloom)) > 1e-4 {
+		t.Errorf("premium = %.6f, want %.6f", bl.MeguriPremiumBits, 11-wantBloom)
+	}
+	wantFleet := wantBloom * 100e9 / 8
+	if math.Abs(bl.BloomFleetBytes-wantFleet) > 1 {
+		t.Errorf("bloom fleet = %.0f, want %.0f", bl.BloomFleetBytes, wantFleet)
+	}
 }
 
 // TestCorpusNaiveBaseline pins the baseline ratio on the real slice: meguri's
@@ -390,7 +417,25 @@ func TestCorpusNaiveBaseline(t *testing.T) {
 	if !(bl.MemoryRatio > 1) {
 		t.Fatalf("tiered filter not smaller than the naive key set: ratio %.2f", bl.MemoryRatio)
 	}
-	t.Logf("baseline: meguri %.2f bits/url vs naive 128 bits/url = %.1fx smaller; %s", meas.BitsPerURL, bl.MemoryRatio, bl.Calc)
+	// The approximate-membership model arm: a plain bloom at meguri's own measured
+	// FP must be a sane positive size, and meguri must sit a small premium above it,
+	// not below (it carries an exact tier the bloom does not). A premium far larger
+	// than a couple of bits would mean the tiered filter is paying too much for
+	// exactness; below zero would mean it is unfairly compared.
+	if meas.FPRate > 0 {
+		if !(bl.BloomBitsPerURL > 0) {
+			t.Fatalf("bloom model arm not computed at fp %.4f", meas.FPRate)
+		}
+		if !(bl.MeguriPremiumBits > 0) {
+			t.Fatalf("meguri undercuts an exact-accuracy bloom (%.2f vs %.2f bits/url): the comparison is not apples to apples",
+				bl.MeguriBitsPerURL, bl.BloomBitsPerURL)
+		}
+		if bl.MeguriPremiumBits > 6 {
+			t.Fatalf("meguri premium over the bloom optimum is %.2f bits/url, too high for the exact tier", bl.MeguriPremiumBits)
+		}
+	}
+	t.Logf("baseline: meguri %.2f bits/url vs naive 128 bits/url = %.1fx smaller; plain bloom at %.2f%% fp = %.2f bits/url (premium %+.2f); %s",
+		meas.BitsPerURL, bl.MemoryRatio, bl.BloomFPRate*100, bl.BloomBitsPerURL, bl.MeguriPremiumBits, bl.Calc)
 }
 
 // TestBytesPerURLBudget is the section-8 per-commit budget guard: the .meguri

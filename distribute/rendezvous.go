@@ -9,10 +9,13 @@ type MachineID uint32
 
 // Machine is a fleet member and its capacity weight. Weight biases the
 // rendezvous placement so a machine with twice the capacity wins the primary
-// slot for about twice as many partitions.
+// slot for about twice as many partitions. Address is where the machine accepts
+// a partition's Discovery messages, carried so a promoted replica can publish the
+// new owner's address into the map (doc 12, section 5).
 type Machine struct {
-	ID     MachineID
-	Weight float64
+	ID      MachineID
+	Weight  float64
+	Address string
 }
 
 // hashCombine mixes a partition id and a machine id into a rendezvous weight. It

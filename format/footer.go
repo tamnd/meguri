@@ -149,9 +149,34 @@ func encodeColumnDir(dir []columnDir) []byte {
 		s.u8(flags)
 		s.u64(d.zoneMin)
 		s.u64(d.zoneMax)
-		s.u64(0) // page_index_offset, unused in M0 (single page per column)
+		if d.numPages > 1 {
+			// Multi-page column: the page_index_offset slot carries the inline per-page
+			// skip list rather than a placeholder. A single-page column keeps the M0
+			// u64(0), so a partition that did not opt into splitting is byte-identical.
+			encodePageSkipList(&s, d.pages)
+		} else {
+			s.u64(0) // page_index_offset, unused for a single-page column
+		}
 	}
 	return s.b
+}
+
+// encodePageSkipList serializes a multi-page column's per-page skip list. The
+// count is implied by the directory's numPages, so it is not repeated here.
+func encodePageSkipList(s *wbuf, pages []pageEntry) {
+	for _, pe := range pages {
+		s.u64(pe.firstRow)
+		s.u64(pe.numValues)
+		s.u64(pe.byteLen)
+		s.u8(pe.encoding)
+		var pf uint8
+		if pe.hasZone {
+			pf = 1
+		}
+		s.u8(pf)
+		s.u64(pe.zoneMin)
+		s.u64(pe.zoneMax)
+	}
 }
 
 // decodeFooter parses a footer sections block. Unknown section tags are skipped.
@@ -226,8 +251,31 @@ func decodeColumnDir(b []byte) []columnDir {
 		d.hasZone = flags&dirFlagHasZone != 0
 		d.zoneMin = r.u64()
 		d.zoneMax = r.u64()
-		_ = r.u64() // page_index_offset
+		if d.numPages > 1 {
+			d.pages = decodePageSkipList(r, int(d.numPages))
+		} else {
+			_ = r.u64() // page_index_offset
+		}
 		out = append(out, d)
+	}
+	return out
+}
+
+// decodePageSkipList reads a multi-page column's per-page skip list, n entries,
+// written by encodePageSkipList in place of the single-page page_index_offset.
+func decodePageSkipList(r *rbuf, n int) []pageEntry {
+	out := make([]pageEntry, 0, n)
+	for range n {
+		pe := pageEntry{
+			firstRow:  r.u64(),
+			numValues: r.u64(),
+			byteLen:   r.u64(),
+			encoding:  r.u8(),
+		}
+		pe.hasZone = r.u8()&1 != 0
+		pe.zoneMin = r.u64()
+		pe.zoneMax = r.u64()
+		out = append(out, pe)
 	}
 	return out
 }

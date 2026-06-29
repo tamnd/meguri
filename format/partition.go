@@ -38,6 +38,17 @@ type Partition struct {
 	// is scheduled.
 	BuildSchedule bool
 
+	// MaxPageRows caps how many rows one column page holds. Zero (the default) keeps
+	// the M0 behavior of one page per column, so a partition that does not opt in
+	// stays byte-for-byte the same and the pinned size baselines do not move. A
+	// positive value spills a column past that many rows into successive pages and
+	// builds a per-page skip list (doc 10 section 4, the page_index_offset and inline
+	// page min/max): each page carries its own zone min/max so a reader prunes at the
+	// page level, decompressing only the pages whose range overlaps a predicate
+	// rather than the whole column. doc 14 sets the production page size; this is the
+	// mechanism it turns on.
+	MaxPageRows int
+
 	Meta map[string]string // optional string metadata, keys sorted on write
 }
 

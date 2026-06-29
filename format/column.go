@@ -65,62 +65,164 @@ type columnDir struct {
 	zoneMin           uint64
 	zoneMax           uint64
 	hasZone           bool
+
+	// pages is the per-page skip list (doc 10 section 4, the page_index_offset). It
+	// is populated only for a multi-page column (numPages > 1); a single-page column
+	// leaves it nil and the footer keeps the legacy page_index_offset placeholder, so
+	// a partition that does not split stays byte-for-byte the same. Each entry carries
+	// the page's first row, value count, on-disk byte length (so a reader strides to
+	// the page without scanning), and its own zone min/max, which is what lets a range
+	// read decode only the pages whose [zoneMin,zoneMax] overlaps the predicate.
+	pages []pageEntry
 }
 
-// encodeColumnRegion lays the columns out as one data page each and returns the
-// region bytes plus the directory. regionStart is the region's absolute offset
-// from the start of the file, so the directory's firstPageOffset is absolute,
-// matching the spec. Each column is built by buildColumnPage, which picks the
-// smaller of its nominal cascade encoding and a plain RAW page, so a column is
-// never larger than the M0 RAW baseline and the directory records the encoding
-// actually chosen. A column with zero rows still gets a page so the directory
-// entry and the decode path stay uniform.
-func encodeColumnRegion(cols []column, regionStart uint64) ([]byte, []columnDir) {
+// pageEntry is one page's row in a column's skip list: where its rows start, how
+// many it holds, how many bytes it occupies on disk, the encoding it chose, and
+// its zone min/max for page-level pruning. byteLen lets a reader jump straight to
+// a later page by summing the lengths ahead of it rather than parsing each header.
+type pageEntry struct {
+	firstRow  uint64
+	numValues uint64
+	byteLen   uint64
+	encoding  uint8
+	zoneMin   uint64
+	zoneMax   uint64
+	hasZone   bool
+}
+
+// encodeColumnRegion lays the columns out and returns the region bytes plus the
+// directory. regionStart is the region's absolute offset from the start of the
+// file, so the directory's firstPageOffset is absolute, matching the spec. Each
+// column is built by buildColumnPage, which picks the smaller of its nominal
+// cascade encoding and a plain RAW page, so a column is never larger than the M0
+// RAW baseline and the directory records the encoding actually chosen. A column
+// with zero rows still gets a page so the directory entry and the decode path
+// stay uniform.
+//
+// maxRows is the opt-in page-split cap (Partition.MaxPageRows). Zero or any value
+// at least the column's row count keeps the M0 single-page layout, byte-for-byte;
+// a smaller positive value spills the column across pages of maxRows each, each
+// page cascade-encoded on its own and summarized in the directory's per-page skip
+// list so a reader can prune at the page level.
+func encodeColumnRegion(cols []column, regionStart uint64, maxRows int) ([]byte, []columnDir) {
 	var region []byte
 	dir := make([]columnDir, 0, len(cols))
 	for _, c := range cols {
-		pageOff := regionStart + uint64(len(region))
-		page, encUsed := buildColumnPage(c)
-		region = append(region, page...)
+		firstPageOff := regionStart + uint64(len(region))
+		spanStart := len(region)
+		subs := splitColumn(c, maxRows)
+
+		var (
+			colComp  uint64
+			pages    []pageEntry
+			firstRow int
+			firstEnc uint8
+		)
+		for i, sc := range subs {
+			page, encUsed := buildColumnPage(sc, uint32(firstRow))
+			if i == 0 {
+				firstEnc = encUsed
+			}
+			region = append(region, page...)
+			zmin, zmax, hasZone := zoneMap(sc)
+			colComp += uint64(len(page) - PageHeaderSize)
+			pages = append(pages, pageEntry{
+				firstRow:  uint64(firstRow),
+				numValues: uint64(sc.numValues()),
+				byteLen:   uint64(len(page)),
+				encoding:  encUsed,
+				zoneMin:   zmin,
+				zoneMax:   zmax,
+				hasZone:   hasZone,
+			})
+			firstRow += sc.numValues()
+		}
+
 		zmin, zmax, hasZone := zoneMap(c)
-		dir = append(dir, columnDir{
+		d := columnDir{
 			columnID:          c.id,
-			firstPageOffset:   pageOff,
-			totalCompressed:   uint64(len(page) - PageHeaderSize),
+			firstPageOffset:   firstPageOff,
+			totalCompressed:   colComp,
 			totalUncompressed: uint64(len(c.data)),
 			numValues:         uint64(c.numValues()),
-			numPages:          1,
+			numPages:          uint64(len(subs)),
 			width:             uint8(c.width),
-			encoding:          encUsed,
+			encoding:          firstEnc,
 			codec:             c.codec,
-			columnCRC32C:      crc32c(page),
+			columnCRC32C:      crc32c(region[spanStart:]),
 			zoneMin:           zmin,
 			zoneMax:           zmax,
 			hasZone:           hasZone,
-		})
+		}
+		if len(subs) > 1 {
+			d.pages = pages
+		}
+		dir = append(dir, d)
 	}
 	return region, dir
 }
 
-// buildColumnPage frames one column as a single data page. It builds the RAW
-// candidate always and, when the column is encodable and has a non-RAW nominal
-// encoding, the cascade candidate, and returns whichever page is smaller on
-// disk. The comparison is on the final compressed page, so an encoding is
-// adopted only when it beats RAW after the block codec, which is what makes the
-// bytes-per-url gate monotone against the M0 baseline.
-func buildColumnPage(c column) ([]byte, uint8) {
+// splitColumn cuts a column into sub-columns of at most maxRows values each,
+// sharing the parent's schema and slicing its column-major data. maxRows <= 0 or
+// a column that already fits returns the column unsplit, which is what keeps the
+// default (no opt-in) layout one page per column and byte-identical to M0. A
+// zero-row column also returns unsplit so the empty-page path stays uniform.
+func splitColumn(c column, maxRows int) []column {
+	n := c.numValues()
+	if maxRows <= 0 || n <= maxRows {
+		return []column{c}
+	}
+	out := make([]column, 0, (n+maxRows-1)/maxRows)
+	for start := 0; start < n; start += maxRows {
+		end := min(start+maxRows, n)
+		sub := c
+		sub.data = c.data[start*c.width : end*c.width]
+		out = append(out, sub)
+	}
+	return out
+}
+
+// buildColumnPage frames one column (or one page's worth of a split column) as a
+// single data page, stamping firstRow as the page's first row index so a page is
+// self-describing. It builds the RAW candidate always and, when the column is
+// encodable and has a non-RAW nominal encoding, the cascade candidate, and
+// returns whichever page is smaller on disk. The comparison is on the final
+// compressed page, so an encoding is adopted only when it beats RAW after the
+// block codec, which is what makes the bytes-per-url gate monotone against the M0
+// baseline.
+func buildColumnPage(c column, firstRow uint32) ([]byte, uint8) {
 	n := uint32(c.numValues())
-	raw := writePage(PageData, EncRaw, c.codec, n, 0, 0, c.data)
+	raw := writePage(PageData, EncRaw, c.codec, n, firstRow, 0, c.data)
 	if c.enc == EncRaw || !c.encodable() {
 		return raw, EncRaw
 	}
 	vals := readValues(c.data, c.width)
 	payload, base := encodeValues(c.enc, vals, c.width)
-	enc := writePage(PageData, c.enc, c.codec, n, 0, base, payload)
+	enc := writePage(PageData, c.enc, c.codec, n, firstRow, base, payload)
 	if len(enc) < len(raw) {
 		return enc, c.enc
 	}
 	return raw, EncRaw
+}
+
+// decodeColumnPage decodes a single page of a multi-page column, striding to it
+// by summing the byte lengths of the pages ahead of it in the skip list. It is
+// the primitive a page-pruned read uses to decode only the candidate pages a zone
+// check kept, rather than the whole column. The caller passes a directory entry
+// whose pages slice is populated (numPages > 1).
+func decodeColumnPage(file []byte, d columnDir, pi int) ([]byte, error) {
+	off := int(d.firstPageOffset)
+	for k := range pi {
+		off += int(d.pages[k].byteLen)
+	}
+	if off < 0 || off > len(file) {
+		return nil, ErrCorrupt
+	}
+	h, payload, _, err := readPage(file[off:])
+	if err != nil {
+		return nil, err
+	}
+	return decodePagePayload(h, payload, int(d.width))
 }
 
 // decodeColumnRegion reads the columns a directory locates out of the file

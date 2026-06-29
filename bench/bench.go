@@ -269,6 +269,113 @@ func insertionSort(a []uint16) {
 	}
 }
 
+// PolitenessPoint is one point on the polite-dispatch ceiling curve: when the
+// ActiveHosts fastest hosts of a partition are simultaneously dispatchable, the
+// partition can be fetched at most CeilingFPS fetches per second without breaking
+// any host's crawl delay.
+type PolitenessPoint struct {
+	ActiveHosts int
+	CeilingFPS  float64
+}
+
+// PolitenessCurve returns the polite-dispatch ceiling at each active-host count
+// in ks, the curve doc 14 section 5.3 plots throughput against. It sorts the
+// partition's hosts by their per-host fetch rate (fastest first) and prefix-sums,
+// so the ceiling at k active hosts is the most a crawler could politely fetch if
+// it kept the k fastest hosts busy. The shape is the central scaling fact of a
+// polite crawler: throughput rises with the number of active hosts and with
+// nothing else, which is why a frontier that holds millions of hosts resident is
+// the lever, not a faster scheduler (IRLbot section 4, BUbiNG section 3). A k
+// past the host count is clamped to the whole partition.
+func PolitenessCurve(part *format.Partition, ks []int) []PolitenessPoint {
+	rates := make([]float64, 0, len(part.Hosts))
+	for _, h := range part.Hosts {
+		if h.CrawlDelay == 0 {
+			continue
+		}
+		rates = append(rates, 10.0/float64(h.CrawlDelay)) // deciseconds -> fetches/s
+	}
+	// Fastest hosts first, so the prefix sum is the best a crawler could do with k
+	// active hosts. Insertion sort over the small per-partition host count.
+	for i := 1; i < len(rates); i++ {
+		for j := i; j > 0 && rates[j] > rates[j-1]; j-- {
+			rates[j], rates[j-1] = rates[j-1], rates[j]
+		}
+	}
+	out := make([]PolitenessPoint, 0, len(ks))
+	for _, k := range ks {
+		if k > len(rates) {
+			k = len(rates)
+		}
+		if k <= 0 {
+			out = append(out, PolitenessPoint{ActiveHosts: 0})
+			continue
+		}
+		var sum float64
+		for i := range k {
+			sum += rates[i]
+		}
+		out = append(out, PolitenessPoint{ActiveHosts: k, CeilingFPS: sum})
+	}
+	return out
+}
+
+// Throughput is the doc 14 section 5.3 throughput analysis: the scheduler's own
+// selection rate measured against the politeness ceiling the same partition
+// imposes, so the gap between them is named, never hidden. The scheduler rate is
+// the measured selections-per-second the operator passes in from
+// BenchmarkCorpusDispatchSelections (this byte-and-curve pass does not time a
+// loop); everything else is computed from the partition's real crawl delays.
+type Throughput struct {
+	SchedulerFPS     float64           // measured scheduler selections/s, the operator's benchstat figure
+	PoliteCeilingFPS float64           // sum over all hosts of 1/crawl_delay, the partition's polite ceiling
+	MedianHostFPS    float64           // 1/crawl_delay at the median host, the per-host floor
+	ActiveHosts      int               // hosts with a crawl delay, the ceiling's host count
+	FetcherBoundGap  float64           // SchedulerFPS / PoliteCeilingFPS, how many times the scheduler outruns this host set
+	HostsToSaturate  float64           // active hosts (at the median delay) needed before the scheduler stops being the slack
+	Curve            []PolitenessPoint // the ceiling at a few active-host counts
+}
+
+// Analyze builds the throughput analysis for a partition given the measured
+// scheduler selection rate. The fetcher-bound gap is the scheduler rate over the
+// polite ceiling: a gap far above one means the crawler is fetcher-bound, that
+// the scheduler finishes its selection long before politeness lets the next fetch
+// go, the regime every polite web crawler sits in. The hosts-to-saturate count is
+// the scheduler rate divided by the median single-host rate, the number of active
+// hosts a partition would need before the scheduler itself became the bottleneck.
+func Analyze(part *format.Partition, schedulerFPS float64) Throughput {
+	median, summed, hosts := politeness(part)
+	t := Throughput{
+		SchedulerFPS:     schedulerFPS,
+		PoliteCeilingFPS: summed,
+		MedianHostFPS:    median,
+		ActiveHosts:      hosts,
+		Curve:            PolitenessCurve(part, curveLadder(hosts)),
+	}
+	if summed > 0 {
+		t.FetcherBoundGap = schedulerFPS / summed
+	}
+	if median > 0 {
+		t.HostsToSaturate = schedulerFPS / median
+	}
+	return t
+}
+
+// curveLadder builds the active-host counts the politeness curve is sampled at:
+// the powers of ten strictly below the partition's host count, then the host
+// count itself, so the curve always ends at the whole partition and never repeats
+// a clamped point. A single-host partition yields just {1}.
+func curveLadder(hosts int) []int {
+	if hosts <= 1 {
+		return []int{max(hosts, 0)}
+	}
+	var ks []int
+	for k := 1; k < hosts; k *= 10 {
+		ks = append(ks, k)
+	}
+	return append(ks, hosts)
+}
+
 // sci renders a large count in the 1eN form the projection states its
 // assumptions in, so 100 billion reads as 1.00e11 and lines up with the spec.
 func sci(v float64) string {

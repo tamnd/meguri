@@ -117,6 +117,36 @@ func BenchmarkCorpusDrainPolite(b *testing.B) {
 	}
 }
 
+// BenchmarkCorpusDispatchSelections isolates the scheduler's own selection rate
+// on the real slice and reports it as selections/s, the doc 14 section 5.3
+// headline. Drain advances its simulated clock over every politeness wait for
+// free, so the wall-clock time it takes is the cost of the selection machinery
+// alone (pop the best ready host, resolve, re-check the live window, pick the
+// head URL, fold the outcome), not of any politeness delay. The reported sel/s is
+// the rate a single dispatch loop sustains before any fetcher or politeness floor
+// enters, the number the throughput analysis measures the politeness ceiling
+// against. It skips when no corpus is configured.
+func BenchmarkCorpusDispatchSelections(b *testing.B) {
+	path := os.Getenv("MEGURI_CORPUS")
+	if path == "" {
+		b.Skip("set MEGURI_CORPUS to a ccrawl jsonl slice (see scripts/fetch-corpus.sh)")
+	}
+	seeds := loadCorpusSeeds(b, path)
+	var total int
+	b.ReportAllocs()
+	for b.Loop() {
+		b.StopTimer()
+		f := seedAll(New(1, 0), seeds)
+		b.StartTimer()
+		d, err := f.Drain(context.Background(), 0, stubFetcher{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		total += len(d)
+	}
+	b.ReportMetric(float64(total)/b.Elapsed().Seconds(), "sel/s")
+}
+
 // BenchmarkCorpusCheckpoint measures a checkpoint of the full corpus frontier.
 func BenchmarkCorpusCheckpoint(b *testing.B) {
 	path := os.Getenv("MEGURI_CORPUS")

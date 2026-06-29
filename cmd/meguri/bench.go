@@ -28,6 +28,7 @@ func newBenchCmd() *cobra.Command {
 		perPart    float64
 		priority   float64
 		crawlDelay uint16
+		selRate    float64
 	)
 	cmd := &cobra.Command{
 		Use:   "bench",
@@ -94,7 +95,11 @@ func newBenchCmd() *cobra.Command {
 			proj := bench.Project(meas, totalURLs, perPart)
 			walls := bench.Walls(part)
 
-			_, err = fmt.Fprint(cmd.OutOrStdout(), bench.Report(meas, proj, walls))
+			if _, err = fmt.Fprint(cmd.OutOrStdout(), bench.Report(meas, proj, walls)); err != nil {
+				return err
+			}
+			thr := bench.Analyze(part, selRate)
+			_, err = fmt.Fprint(cmd.OutOrStdout(), "\n"+bench.ThroughputReport(thr))
 			return err
 		},
 	}
@@ -103,5 +108,6 @@ func newBenchCmd() *cobra.Command {
 	cmd.Flags().Float64Var(&perPart, "urls-per-partition", 30e6, "per-partition capacity, the projection lever")
 	cmd.Flags().Float64Var(&priority, "priority", 0.5, "initial priority for every seeded URL")
 	cmd.Flags().Uint16Var(&crawlDelay, "crawl-delay", 10, "default per-host crawl delay in deciseconds")
+	cmd.Flags().Float64Var(&selRate, "scheduler-sel-rate", 1e6, "measured scheduler selections/s (from BenchmarkCorpusDispatchSelections) to report the politeness ceiling against")
 	return cmd
 }

@@ -24,6 +24,7 @@ import (
 	"sort"
 
 	"github.com/tamnd/meguri"
+	"github.com/tamnd/meguri/dedup"
 	"github.com/tamnd/meguri/fetch"
 	"github.com/tamnd/meguri/format"
 )
@@ -61,6 +62,8 @@ type Frontier struct {
 	records map[meguri.URLKey]*meguri.URLRecord
 	hosts   map[uint64]*hostEntry
 	arena   arena
+	seen    *dedup.SeenSet // M2 dedup authority, idempotent intake (doc 08, D5)
+	soft    *dedup.SoftDetector
 
 	urlFront   prioRing[meguri.URLKey] // URLs not yet bound to a host back queue
 	readyHosts prioRing[uint64]        // hosts eligible now, keyed by best URL priority
@@ -94,6 +97,8 @@ func New(id, created uint32, opts ...Option) *Frontier {
 		records: make(map[meguri.URLKey]*meguri.URLRecord),
 		hosts:   make(map[uint64]*hostEntry),
 		arena:   newArena(),
+		seen:    dedup.NewSeenSet(),
+		soft:    dedup.NewSoftDetector(),
 		target:  defaultTarget,
 	}
 	for _, o := range opts {
@@ -124,7 +129,9 @@ func (f *Frontier) Pending() int {
 func (f *Frontier) Seed(url, host string, priority float32, firstSeen, nextDue uint32, crawlDelay uint16) {
 	hk := meguri.HostKeyOf(host)
 	key := meguri.URLKey{HostKey: hk, PathKey: meguri.PathKeyOf(PathOf(url))}
-	if _, dup := f.records[key]; dup {
+	// The seen-set is the dedup authority (doc 08, D5): a key already seen is a
+	// rediscovery and seeding it again is a no-op, so seeding is idempotent.
+	if f.seen.Seen(key) {
 		return
 	}
 	rec := &meguri.URLRecord{
@@ -153,6 +160,60 @@ func (f *Frontier) Seed(url, host string, priority float32, firstSeen, nextDue u
 	}
 	h.rec.URLCount++
 	f.urlFront.push(key, priority)
+}
+
+// Discover is the idempotent intake of a routed out-link (doc 08, section 9.3,
+// onDiscovery). It is the M2 closed-loop entry the link extractor feeds: a
+// Discovery carries a canonical URLKey, its depth from the seed, and the OPIC
+// cash the source link grants. Discover deduplicates the key against the seen-set
+// and, for a genuinely new URL, applies the blunt trap defense (doc 08, section
+// 8.2): a discovery too deep or over the host's budget is parked in Trapped
+// rather than scheduled, so the row exists and dedups rediscoveries but does not
+// consume crawl budget. It returns true when a new schedulable URL entered the
+// frontier.
+//
+// Delivering the same discovery twice creates at most one record, which is what
+// lets the discovery transport be at-least-once (D16).
+func (f *Frontier) Discover(d meguri.Discovery, now uint32) bool {
+	if f.seen.Seen(d.URLKey) {
+		// Rediscovery: the row already exists. The OPIC cash this link would
+		// credit is the prioritizer's job (M5); M2 only guarantees the dedup.
+		return false
+	}
+
+	hk := d.URLKey.HostKey
+	h := f.hosts[hk]
+	if h == nil {
+		ref := f.arena.intern(hostFromCanonical(d.CanonicalURL))
+		h = &hostEntry{rec: meguri.HostRecord{
+			HostKey:        hk,
+			HostRef:        ref,
+			Grouping:       meguri.GroupRegistrableDomain,
+			RegistrableRef: ref,
+			CrawlDelay:     10,
+		}}
+		f.hosts[hk] = h
+	}
+
+	status := dedup.Admit(d.Depth, &h.rec, true)
+	rec := &meguri.URLRecord{
+		URLKey:          d.URLKey,
+		HostKey:         hk,
+		Status:          status,
+		Priority:        d.LinkWeight,
+		Depth:           d.Depth,
+		URLRef:          f.arena.intern(d.CanonicalURL),
+		FirstSeen:       d.ObservedAt,
+		DiscoverySource: d.DiscoverySource,
+	}
+	f.records[d.URLKey] = rec
+	h.rec.URLCount++
+
+	if status != meguri.StatusScheduled {
+		return false // parked in Trapped: recorded, dedups, not queued
+	}
+	f.urlFront.push(d.URLKey, d.LinkWeight)
+	return true
 }
 
 // Dispatch returns the next URL to fetch at clock time now (epoch-seconds), or
@@ -214,10 +275,28 @@ func (f *Frontier) Report(o meguri.Outcome, now uint32) {
 	rec.LastCrawled = o.FetchedAt
 	rec.CrawlCount++
 	rec.NextDue = o.FetchedAt + recrawlGapHours
-	if o.ContentFP != 0 {
+
+	// Classify the change against the stored signals (doc 08, section 7.4). A
+	// soft-404 template is recorded as Gone, restoring the stop signal the 200
+	// tried to defeat (doc 08, section 8.6). A meaningful change increments the
+	// change count and stamps last-changed, the signal doc 06's rate estimator
+	// reads; a cosmetic change (simhash within Hamming 3) does not, so a rotating
+	// ad never poisons lambda.
+	if !o.NotModified && o.ContentFP != 0 {
+		if f.soft.Observe(rec.HostKey, o.ContentFP, o.URLKey) {
+			rec.Status = meguri.StatusGone
+		}
+		if rec.ContentFP != 0 { // a prior fetch left a signal to compare against
+			switch dedup.ClassifyChange(rec.ContentFP, o.ContentFP, rec.Simhash, o.Simhash) {
+			case dedup.NoChange, dedup.CosmeticChange:
+				rec.NoChangeStreak++
+			case dedup.RealChange:
+				rec.ChangeCount++
+				rec.NoChangeStreak = 0
+				rec.LastChanged = o.FetchedAt
+			}
+		}
 		rec.ContentFP = o.ContentFP
-	}
-	if o.Simhash != 0 {
 		rec.Simhash = o.Simhash
 	}
 	if h == nil {
@@ -385,6 +464,10 @@ func Recover(p *format.Partition, opts ...Option) *Frontier {
 		}
 		r := rec
 		f.records[r.URLKey] = &r
+		// Rebuild the seen-set from the durable key column (doc 08, section 5.3:
+		// the live ribbon is rebuilt from the urlkey column on reload), so a
+		// post-recovery discovery dedups against everything the partition holds.
+		f.seen.Insert(r.URLKey)
 		switch r.Status {
 		case meguri.StatusScheduled, meguri.StatusReady, meguri.StatusDueRecrawl:
 			if f.hosts[r.HostKey] == nil {
@@ -397,6 +480,18 @@ func Recover(p *format.Partition, opts ...Option) *Frontier {
 		}
 	}
 	return f
+}
+
+// hostFromCanonical returns the registrable-domain group key for a canonical URL,
+// the string the host record's HostRef points at. It falls back to the raw host
+// split when the URL is not parseable as canonical, so a malformed discovery
+// still names a host.
+func hostFromCanonical(canon string) string {
+	host := HostOf(canon)
+	if rd := dedup.RegistrableDomain(host); rd != "" {
+		return rd
+	}
+	return host
 }
 
 // delaySeconds converts a host's crawl delay in deciseconds to a whole-second

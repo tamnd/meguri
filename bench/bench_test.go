@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	m "github.com/tamnd/meguri"
+	"github.com/tamnd/meguri/distribute"
 	"github.com/tamnd/meguri/format"
 	"github.com/tamnd/meguri/frontier"
 )
@@ -194,6 +195,65 @@ func TestBenchOnCorpus(t *testing.T) {
 	t.Logf("corpus: %d urls / %d hosts, %.2f bytes/url, %.2f bits/url @ fp %.4f, 0 false negatives",
 		meas.URLs, meas.Hosts, meas.BytesPerURL, meas.BitsPerURL, meas.FPRate)
 	t.Logf("projection: seen-set %s, .meguri %s", proj.SeenSetFleetCalc, proj.MeguriFleetCalc)
+}
+
+// TestCorpusHostKeyRangePin pins the benchmark corpus as a host-key range, audit
+// 288's M10 methodology piece. It recomputes the host-key range from the frozen
+// slice and requires it to still match the pinned bounds, so a corpus that drifts
+// off the pin fails loudly instead of silently re-baselining a measurement. It then
+// ties the range to the fleet's jump-hash ownership: a partition whose .meguri
+// header range is the pinned interval owns every corpus host, and at the 100B-scale
+// partition count the corpus hosts each land on their own partition, so the slice
+// exercises a known set of the fleet's partitions rather than a domain list.
+func TestCorpusHostKeyRangePin(t *testing.T) {
+	path := corpusPath()
+	if path == "" {
+		t.Skip("set MEGURI_CORPUS to a ccrawl jsonl slice (see scripts/fetch-corpus.sh)")
+	}
+	part := loadCorpusPartition(t, path)
+	if len(part.Hosts) < 2 {
+		t.Skipf("corpus has %d hosts, need at least 2 for a range", len(part.Hosts))
+	}
+
+	keys := make([]uint64, len(part.Hosts))
+	for i, h := range part.Hosts {
+		keys[i] = h.HostKey
+	}
+	got := CorpusHostKeyRange(keys)
+
+	if got.Lo != PinnedCorpusHostKeyLo || got.Hi != PinnedCorpusHostKeyHi {
+		t.Fatalf("corpus host-key range [0x%016x, 0x%016x] drifted off the pin [0x%016x, 0x%016x]",
+			got.Lo, got.Hi, PinnedCorpusHostKeyLo, PinnedCorpusHostKeyHi)
+	}
+	if got.Hosts != PinnedCorpusHosts {
+		t.Fatalf("corpus spans %d hosts, pinned at %d", got.Hosts, PinnedCorpusHosts)
+	}
+
+	// The pinned range is the benchmark partition's header interval: every corpus
+	// host-key falls inside it, the ownership test a fleet partition runs.
+	pin := PinnedRange()
+	for _, k := range keys {
+		if !pin.Contains(k) {
+			t.Fatalf("corpus host-key 0x%016x falls outside the pinned range", k)
+		}
+	}
+
+	// At the 100B-scale partition count (100B pages / 100M per partition = 1000),
+	// the corpus hosts scatter across the jump hash onto distinct partitions, so the
+	// slice exercises a known set of the fleet's owners. Pin that count.
+	const fleetPartitions = 1000
+	fmap := &distribute.Map{NumPartitions: fleetPartitions}
+	owners := map[distribute.PartitionID]bool{}
+	for _, k := range keys {
+		owners[fmap.Owner(k)] = true
+	}
+	if len(owners) != PinnedCorpusHosts {
+		t.Fatalf("corpus hosts own %d distinct partitions at %d-partition scale, want %d (each host its own)",
+			len(owners), fleetPartitions, PinnedCorpusHosts)
+	}
+
+	t.Logf("%s", HostKeyRangeReport(got))
+	t.Logf("range pin: %d hosts own %d distinct partitions at %d-partition fleet scale", got.Hosts, len(owners), fleetPartitions)
 }
 
 // TestPolitenessCurveOrders checks the curve machinery without a corpus: over a

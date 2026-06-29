@@ -103,7 +103,18 @@ func newBenchCmd() *cobra.Command {
 				return err
 			}
 			bl := bench.NaiveFrontierBaseline(meas, totalURLs)
-			_, err = fmt.Fprint(cmd.OutOrStdout(), "\n"+bench.BaselineReport(bl))
+			if _, err = fmt.Fprint(cmd.OutOrStdout(), "\n"+bench.BaselineReport(bl)); err != nil {
+				return err
+			}
+
+			// The host-key range the input covers, the range-pinned form of the
+			// benchmark slice: the interval a fleet partition would carry in its
+			// .meguri header, not a domain list (doc 14, audit 288).
+			keys := make([]uint64, len(part.Hosts))
+			for i, h := range part.Hosts {
+				keys[i] = h.HostKey
+			}
+			_, err = fmt.Fprint(cmd.OutOrStdout(), "\n"+bench.HostKeyRangeReport(bench.CorpusHostKeyRange(keys))+"\n")
 			return err
 		},
 	}

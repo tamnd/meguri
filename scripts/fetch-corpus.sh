@@ -55,3 +55,9 @@ LINES=$(wc -l <"$URLS" | tr -d ' ')
 echo "Wrote $LINES records to $URLS"
 echo "Run the corpus benchmark with:"
 echo "  MEGURI_CORPUS=$URLS go test -run Corpus -bench Corpus ./format"
+echo
+echo "The benchmark slice is also pinned as a host-key range (bench/corpus.go), the"
+echo "interval a fleet partition carries in its .meguri header rather than a domain"
+echo "list. Print it and check it against the pin with:"
+echo "  MEGURI_CORPUS=$URLS go test -run CorpusHostKeyRangePin ./bench"
+echo "  meguri bench -i $URLS   # prints the host-key range line"

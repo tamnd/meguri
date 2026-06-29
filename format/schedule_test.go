@@ -16,7 +16,7 @@ func TestScheduleBucketMath(t *testing.T) {
 	}{
 		{0, 0}, {1, 1}, {167, 167}, // near, one bucket per hour
 		{168, 168}, {191, 168}, {192, 169}, // mid, one bucket per day
-		{2327, 257}, // last mid hour
+		{2327, 257},                           // last mid hour
 		{2328, 258}, {3047, 258}, {3048, 259}, // far, one bucket per 30 days
 		{19607, 281},                 // last far hour
 		{19608, 282}, {1 << 30, 282}, // overflow

@@ -29,6 +29,7 @@ import (
 	"github.com/tamnd/meguri/dns"
 	"github.com/tamnd/meguri/fetch"
 	"github.com/tamnd/meguri/format"
+	"github.com/tamnd/meguri/freshness"
 	"github.com/tamnd/meguri/politeness"
 	"github.com/tamnd/meguri/robots"
 )
@@ -97,7 +98,20 @@ type Frontier struct {
 	resolver *dns.Cache // nil disables DNS prefetch and per-IP dial pinning
 	robotsOn bool       // fetch and enforce robots.txt before content
 	agent    string     // product token robots groups are matched against
+
+	// M4 freshness rescheduler (doc 06). nil leaves the M1 placeholder next-due in
+	// place so the earlier milestones' dispatch sequences are byte-for-byte
+	// unchanged. When set, a crawled URL's lambda and next_due come from the
+	// Poisson change-rate model and the water-filling allocation.
+	fresh    *freshness.Params
+	tau      *freshness.TauController // global water level, slowly retuned to the budget
+	reschedN int                      // reschedules since the last tau tick
 }
+
+// tauTickEvery is how many reschedules pass between background re-estimates of
+// the water level. tau moves slowly (doc 06, section 8), so a re-tune every few
+// thousand crawls tracks the drift without putting an O(N) sweep on the hot path.
+const tauTickEvery = 4096
 
 // Option configures a Frontier at construction.
 type Option func(*Frontier)
@@ -143,6 +157,21 @@ func WithRobots(agent string) Option {
 		if agent != "" {
 			f.agent = agent
 		}
+	}
+}
+
+// WithFreshness turns on the Poisson rescheduler (doc 06): a crawled URL's change
+// rate is estimated from its history, its recrawl interval is set by the
+// water-filling allocation against a global water level retuned toward
+// budgetPerHour refresh crawls per hour, and its next_due is spaced
+// deterministically. Without it a crawled URL parks a flat week out, the M1
+// placeholder. A budgetPerHour <= 0 disables the budget pressure, leaving every
+// URL funded to its own optimal rate under the per-host politeness cap.
+func WithFreshness(p freshness.Params, budgetPerHour float64) Option {
+	return func(f *Frontier) {
+		pp := p
+		f.fresh = &pp
+		f.tau = freshness.NewTauController(budgetPerHour)
 	}
 }
 
@@ -355,6 +384,9 @@ func (f *Frontier) Report(o meguri.Outcome, now uint32) {
 	}
 	rec.Status = meguri.StatusCrawled
 	rec.HTTPStatus = o.HTTPStatus
+	if rec.FirstSeen == 0 {
+		rec.FirstSeen = o.FetchedAt // anchor the history clock on the first crawl
+	}
 	rec.LastCrawled = o.FetchedAt
 	rec.CrawlCount++
 	rec.NextDue = o.FetchedAt + recrawlGapHours
@@ -393,6 +425,12 @@ func (f *Frontier) Report(o meguri.Outcome, now uint32) {
 	}
 	if o.LastModified != 0 {
 		rec.LastModified = o.LastModified
+	}
+	// Freshness rescheduling (doc 06): with the rescheduler on, the change counters
+	// updated just above feed the Poisson estimate, and the URL's next_due and
+	// status come from the allocation rather than the flat M1 placeholder.
+	if f.fresh != nil {
+		f.reschedule(rec, h, now)
 	}
 	if h == nil {
 		return

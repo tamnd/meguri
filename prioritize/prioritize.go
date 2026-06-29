@@ -69,6 +69,14 @@ func (pr *Prioritizer) CrossHostInDegree(hostKey uint64) uint32 {
 	return pr.indeg.Count(hostKey)
 }
 
+// Score returns a URL's current OPIC importance estimate, the held cash and
+// discounted history blended into a stable range (doc 09). It reads the
+// accumulated signal without the import or penalty blend Priority applies, so a
+// caller can confirm a routed link's cash actually landed on its target.
+func (pr *Prioritizer) Score(key meguri.URLKey) float32 {
+	return pr.opic.Score(key)
+}
+
 // Priority computes the final importance for a URL: the OPIC estimate, blended
 // with any imported per-page PageRank and per-host quality, then scaled down by
 // the trap-suspect and depth penalties (doc 09). It reads the record and its

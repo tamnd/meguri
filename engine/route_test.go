@@ -105,3 +105,62 @@ func TestEngineRoutesCrossPartitionLinks(t *testing.T) {
 		t.Fatalf("partition 1 dispatched %x, want the routed link %x", rf.seq[0].key, target.URLKey)
 	}
 }
+
+// TestEngineAccumulatesCrossPartitionLinkSignal proves the doc-12 D16 claim that a
+// link routed to another partition lands its OPIC cash and its cross-host in-degree
+// on the owning partition, not just the URL. Partition 0 crawls a seed on host h0
+// whose out-link belongs to host h1 on partition 1. After the fold and the route,
+// partition 1's prioritizer must show the target carrying credited cash and its
+// host counting one distinct cross-host source, the source being h0. The frontier
+// stamps the source host on the out-link, so the signal survives the transport and
+// is attributed to the page that emitted it.
+func TestEngineAccumulatesCrossPartitionLinkSignal(t *testing.T) {
+	mp := &distribute.Map{Epoch: 1, NumPartitions: 2}
+	h0, h1 := twoHostsAcrossPartitions(mp)
+	if h0 == "" || h1 == "" {
+		t.Fatal("could not find hosts on both partitions")
+	}
+	tr := distribute.NewChannelTransport(64)
+	r0 := distribute.NewRouter(0, mp, tr, 16)
+	r1 := distribute.NewRouter(1, mp, tr, 16)
+
+	h1Key := meguri.HostKeyOf(h1)
+	target := meguri.Discovery{
+		URLKey:          meguri.URLKey{HostKey: h1Key, PathKey: meguri.PathKeyOf("/landing")},
+		CanonicalURL:    "https://" + h1 + "/landing",
+		Depth:           1,
+		DiscoverySource: meguri.SourceLink,
+		// SrcHostKey left unset on purpose: the frontier must stamp it from the source
+		// page being folded, the same way it would for a real extracted link.
+	}
+
+	fr0 := frontier.New(0, 0,
+		frontier.WithPrioritizer(prioritize.DefaultParams()),
+		frontier.WithLinkRouter(RouteSink(r0)),
+	)
+	fr0.Seed("https://"+h0+"/", h0, 0.9, 0, 0, 10)
+
+	clk := NewLogicalClock(1000)
+	eng0 := New(fr0, Config{Fetcher: &linkFetcher{target: target}, Workers: 2, Clock: clk, Router: r0, UntilEmpty: true})
+	if err := eng0.Run(context.Background()); err != nil {
+		t.Fatalf("run p0: %v", err)
+	}
+
+	fr1 := frontier.New(1, 0, frontier.WithPrioritizer(prioritize.DefaultParams()))
+	rf := &recFetcher{clk: NewLogicalClock(2000)}
+	eng1 := New(fr1, Config{Fetcher: rf, Workers: 2, Clock: rf.clk, Router: r1, UntilEmpty: true})
+	if err := eng1.Run(context.Background()); err != nil {
+		t.Fatalf("run p1: %v", err)
+	}
+
+	pr := fr1.Prioritizer()
+	if pr == nil {
+		t.Fatal("partition 1 has no prioritizer")
+	}
+	if deg := pr.CrossHostInDegree(h1Key); deg != 1 {
+		t.Fatalf("partition 1 cross-host in-degree for h1 = %d, want 1 (the source host h0)", deg)
+	}
+	if s := pr.Score(target.URLKey); s <= 0 {
+		t.Fatalf("partition 1 OPIC score for the routed target = %v, want the credited cash > 0", s)
+	}
+}

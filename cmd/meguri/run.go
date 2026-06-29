@@ -128,7 +128,7 @@ func buildFrontier(input, seed string, priority float32, delay uint16) (*frontie
 		if err != nil {
 			return nil, fmt.Errorf("decode %s: %w", input, err)
 		}
-		return frontier.Recover(part), nil
+		return frontier.Recover(part, frontier.WithStateMachine()), nil
 	}
 
 	f, err := os.Open(seed)
@@ -136,7 +136,7 @@ func buildFrontier(input, seed string, priority float32, delay uint16) (*frontie
 		return nil, err
 	}
 	defer func() { _ = f.Close() }()
-	fr := frontier.New(1, 0)
+	fr := frontier.New(1, 0, frontier.WithStateMachine())
 	sc := bufio.NewScanner(bufio.NewReader(f))
 	sc.Buffer(make([]byte, 0, 1<<20), 1<<24)
 	for sc.Scan() {

@@ -183,6 +183,68 @@ func (r *Reader) DueKeys(now uint32) ([]m.URLKey, error) {
 	return out, nil
 }
 
+// HasSchedule reports whether the file carries a schedule index region, the
+// durable timing wheel a scheduler can read instead of scanning the next_due
+// column.
+func (r *Reader) HasSchedule() bool {
+	_, ok := findRegion(r.footer.regions, RegionSchedule)
+	return ok
+}
+
+// Schedule decodes the schedule index region into a wheel a scheduler queries
+// with DueBuckets, or returns nil when the file carries no schedule region. It
+// verifies the page CRC. This is the pushdown read for due work: the wheel
+// narrows the scan to the buckets whose window has opened, the next_due column
+// confirms the survivors.
+func (r *Reader) Schedule() (*ScheduleIndex, error) {
+	reg, ok := findRegion(r.footer.regions, RegionSchedule)
+	if !ok {
+		return nil, nil
+	}
+	return decodeScheduleRegion(r.file[reg.offset : reg.offset+reg.length])
+}
+
+// DueByWheel returns the URLKeys of every row due at or before now, using the
+// schedule wheel to prune the scan: it reads the wheel's due buckets, then
+// projects the urlkey and next_due columns only for those candidate rows and
+// confirms each against next_due. It falls back to the column-scan DueKeys when
+// the file carries no wheel. This is the schedule-index read path of doc 10
+// section 7.
+func (r *Reader) DueByWheel(now uint32) ([]m.URLKey, error) {
+	idx, err := r.Schedule()
+	if err != nil {
+		return nil, err
+	}
+	if idx == nil {
+		return r.DueKeys(now)
+	}
+	cand := idx.DueBuckets(now)
+	if len(cand) == 0 {
+		return nil, nil
+	}
+	cols, err := r.projectURL(colURLHostKey, colURLPathKey, colURLNextDue)
+	if err != nil {
+		return nil, err
+	}
+	n := r.URLCount()
+	hk, pk, nd := cols[colURLHostKey], cols[colURLPathKey], cols[colURLNextDue]
+	if len(hk) < n*8 || len(pk) < n*8 || len(nd) < n*4 {
+		return nil, ErrCorrupt
+	}
+	var out []m.URLKey
+	for _, i := range cand {
+		ri := int(i)
+		if ri < 0 || ri >= n {
+			return nil, ErrCorrupt
+		}
+		due := getU32(nd, ri)
+		if due != 0 && due <= now {
+			out = append(out, m.URLKey{HostKey: getU64(hk, ri), PathKey: getU64(pk, ri)})
+		}
+	}
+	return out, nil
+}
+
 // Exported URL column ids, the stable schema positions a projection names. They
 // match the on-disk column directory and never change once shipped (doc 10
 // section 4, the URL table columns).

@@ -23,6 +23,7 @@ func main() {
 		Version:       meguri.Version,
 	}
 	root.SetVersionTemplate("meguri {{.Version}} (" + meguri.Commit + ")\n")
+	root.AddCommand(newBenchCmd())
 	root.AddCommand(newInspectCmd())
 	root.AddCommand(newSeedCmd())
 

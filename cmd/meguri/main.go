@@ -24,8 +24,10 @@ func main() {
 	}
 	root.SetVersionTemplate("meguri {{.Version}} (" + meguri.Commit + ")\n")
 	root.AddCommand(newBenchCmd())
+	root.AddCommand(newCompactCmd())
 	root.AddCommand(newInspectCmd())
 	root.AddCommand(newMapCmd())
+	root.AddCommand(newPackCmd())
 	root.AddCommand(newRunCmd())
 	root.AddCommand(newScheduleCmd())
 	root.AddCommand(newSeedCmd())

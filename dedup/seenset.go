@@ -102,6 +102,16 @@ func (s *SeenSet) Contains(key meguri.URLKey) bool {
 	return s.exact.contains(key)
 }
 
+// MaybeContains reports the filter's verdict alone, with no exact confirm. A
+// false is authoritative (the one-sided filter never drops a key it has seen),
+// a true is the filter's "probably", which on a key the set never held is a
+// false positive. It is the probe the benchmark uses to measure the achieved
+// filter false-positive rate at the resident bits-per-URL (doc 14, section 3.7);
+// the discovery path uses Seen and Contains, which confirm against the exact set.
+func (s *SeenSet) MaybeContains(key meguri.URLKey) bool {
+	return s.filter.maybeSeen(key)
+}
+
 // Merge classifies a whole batch of discovered keys at once through the DRUM
 // path, the scale form of Seen: it routes the keys to buckets by HostKey prefix
 // and merges each bucket in one sequential pass, returning a Unique verdict per

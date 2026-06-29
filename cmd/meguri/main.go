@@ -25,9 +25,11 @@ func main() {
 	root.SetVersionTemplate("meguri {{.Version}} (" + meguri.Commit + ")\n")
 	root.AddCommand(newBenchCmd())
 	root.AddCommand(newInspectCmd())
+	root.AddCommand(newMapCmd())
 	root.AddCommand(newRunCmd())
 	root.AddCommand(newSeedCmd())
 	root.AddCommand(newServeCmd())
+	root.AddCommand(newStatsCmd())
 
 	if err := fang.Execute(context.Background(), root); err != nil {
 		os.Exit(1)

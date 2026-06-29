@@ -435,6 +435,53 @@ func (f *Frontier) Pending() int {
 	return n
 }
 
+// Stats is a point-in-time snapshot of a frontier's counters: the totals, the
+// pending dispatch count, the per-status URL distribution, the count due at or
+// before now, and the seen-set occupancy with its modeled false-positive rate.
+// It is what `meguri stats` reads off a live partition (doc 13, the stats
+// command): the numbers that say whether the frontier is growing or maintaining.
+type Stats struct {
+	URLs           int
+	Hosts          int
+	Pending        int
+	Due            int
+	ByStatus       map[meguri.URLStatus]int
+	SeenKeys       int
+	SeenBitsPerURL float64
+	NextDueHours   uint32 // earliest scheduled crawl, 0 when nothing is scheduled
+}
+
+// Stats walks the resident records once and folds the counters. now is the
+// epoch-hour the due count is measured against; a URL counts as due when its
+// next_due has come around and its status still wants a fetch. The walk is O(urls)
+// and allocates only the small per-status map, so it is cheap to call between
+// crawl passes.
+func (f *Frontier) Stats(now uint32) Stats {
+	s := Stats{
+		URLs:     len(f.records),
+		Hosts:    len(f.hosts),
+		Pending:  f.Pending(),
+		ByStatus: make(map[meguri.URLStatus]int, 9),
+	}
+	for _, r := range f.records {
+		s.ByStatus[r.Status]++
+		switch r.Status {
+		case meguri.StatusGone, meguri.StatusExcludedRobots, meguri.StatusTrapped, meguri.StatusInFlight:
+			// not schedulable, never counts as due
+		default:
+			if r.NextDue <= now {
+				s.Due++
+			}
+		}
+	}
+	if next, ok := f.NextEligible(); ok {
+		s.NextDueHours = next
+	}
+	s.SeenKeys = f.seen.Len()
+	s.SeenBitsPerURL = f.seen.BitsPerURL()
+	return s
+}
+
 // Seed inserts a first-crawl candidate. url is the canonical URL, host its
 // grouping string, priority its initial importance, firstSeen and nextDue
 // epoch-hours, and crawlDelay the host's politeness interval in deciseconds. A

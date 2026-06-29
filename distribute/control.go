@@ -14,6 +14,7 @@ type Control struct {
 	m             *Map
 	machines      []Machine           // the fleet, for rendezvous replica placement
 	misses        map[PartitionID]int // consecutive missed heartbeats per partition
+	backlog       map[PartitionID]int // latest pending depth each partition reported on its beat
 	failThreshold int                 // missed heartbeats before a partition is Failed
 }
 
@@ -33,6 +34,7 @@ func NewControl() *Control {
 			Partitions:    []PartitionMeta{{ID: 0, Health: Alive}},
 		},
 		misses:        map[PartitionID]int{},
+		backlog:       map[PartitionID]int{},
 		failThreshold: DefaultFailThreshold,
 	}
 }
@@ -59,6 +61,27 @@ func (c *Control) NumPartitions() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.m.NumPartitions
+}
+
+// Backlog reports the latest per-partition pending depth the partitions sent on
+// their heartbeats, indexed by PartitionID for the current partition count, so the
+// control plane itself satisfies BacklogSource and the elasticity loop scales on
+// the live fleet signal rather than a hand-fed slice (doc 12, section 7: the
+// backlog rides the heartbeat the control plane already pulls). A partition that
+// has not beat yet reads as zero, the safe default that never triggers a scale-up.
+// A stale report for an id beyond the current count (a partition since removed) is
+// dropped, so the slice length always matches NumPartitions, which is what the loop
+// divides by.
+func (c *Control) Backlog() []int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]int, c.m.NumPartitions)
+	for id, n := range c.backlog {
+		if int(id) < len(out) {
+			out[id] = n
+		}
+	}
+	return out
 }
 
 // SetReplicas sets the fleet-wide replication factor and recomputes every
@@ -106,6 +129,7 @@ func (c *Control) RemovePartition() (PartitionID, bool) {
 	id := PartitionID(c.m.NumPartitions - 1)
 	c.m.NumPartitions--
 	c.m.Partitions = c.m.Partitions[:len(c.m.Partitions)-1]
+	delete(c.backlog, id) // drop the removed partition's stale backlog report
 	c.bump()
 	c.replace()
 	return id, true

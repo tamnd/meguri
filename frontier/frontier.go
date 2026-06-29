@@ -108,11 +108,12 @@ type Frontier struct {
 	traps   *dedup.TrapDetector // calendar/faceted/session-id pattern detector (doc 08, 8.4)
 
 	urlFront   prioRing[meguri.URLKey] // URLs not yet bound to a host back queue
-	readyHosts prioRing[uint64]        // hosts eligible now, keyed by best URL priority
+	readyHosts readyBank               // hosts eligible now, keyed by best URL priority; sharded for the threaded engine
 	wait       waitHeap                // hosts parked until their politeness window opens
 
 	target int // active-host cap (distributor)
 	active int // hosts currently holding a back queue
+	shards int // dispatch-thread count the ready bank is sharded for; 0/1 is the single loop
 
 	// Anti-starvation tier (doc 05). minActive is the k*threads back-queue floor:
 	// the effective active-host target never drops below it, so a bounded frontier
@@ -228,6 +229,23 @@ func WithDispatchThreads(threads int) Option {
 		if threads > 0 {
 			f.minActive = backQueuesPerThread * threads
 			f.bounded = true
+		}
+	}
+}
+
+// WithDispatchShards shards the ready-host bank into w shards, one per dispatch
+// thread of the threaded engine (audit 140, doc 05 [M1+]). Each thread draws work
+// from its own shard with DispatchShard and steals the best-headed sibling shard
+// when its own drains, so W threads share the frontier without one idling behind a
+// host bound to another thread's shard. Off by default (w <= 1), so the single
+// dispatch loop runs one shard and every earlier milestone's dispatch sequence is
+// byte-for-byte unchanged. Sharding is orthogonal to WithDispatchThreads, which
+// sizes the active-host floor; pair them so the bank has a shard per thread and
+// the floor keeps every shard fed.
+func WithDispatchShards(w int) Option {
+	return func(f *Frontier) {
+		if w > 1 {
+			f.shards = w
 		}
 	}
 }
@@ -370,6 +388,7 @@ func New(id, created uint32, opts ...Option) *Frontier {
 	for _, o := range opts {
 		o(f)
 	}
+	f.readyHosts = newReadyBank(f.shards)
 	if f.wheelOn {
 		f.wheel = newDueWheel(f.created)
 	}
@@ -580,17 +599,29 @@ func (f *Frontier) Warm(key meguri.URLKey, etag string, lastModified uint32, pre
 // would open a host. The caller fetches the returned Request and feeds the
 // outcome back through Report.
 func (f *Frontier) Dispatch(now uint32) (fetch.Request, bool) {
+	return f.DispatchShard(now, 0)
+}
+
+// DispatchShard is Dispatch for dispatch thread `shard` of the threaded engine
+// (audit 140): it draws the next polite host from that thread's shard of the ready
+// bank, stealing the best-headed sibling shard when its own has drained, so W
+// threads share the frontier without one idling while another shard still holds
+// ready hosts. The frontier stays single-writer: the engine serializes the W
+// threads' calls, so the sharding only steers where each thread looks for work.
+// Plain Dispatch is thread 0, which on a one-shard bank is the single dispatch
+// loop unchanged.
+func (f *Frontier) DispatchShard(now uint32, shard int) (fetch.Request, bool) {
 	f.promoteDue(now) // fire any recrawl whose hour has arrived back into the schedule
 	f.promote(now)
 	f.distribute(now)
 
-	// Pop the best ready host, but resolve its address and re-check the live
-	// window first: a sibling host sharing the same IP may have advanced the
-	// per-IP bucket since this host was marked ready. If the IP now gates it,
+	// Pop the best ready host for this shard, but resolve its address and re-check
+	// the live window first: a sibling host sharing the same IP may have advanced
+	// the per-IP bucket since this host was marked ready. If the IP now gates it,
 	// re-park it and try the next ready host (doc 07, both buckets must permit).
 	var h *hostEntry
 	for {
-		hk, ok := f.readyHosts.pop()
+		hk, ok := f.readyHosts.popShard(shard)
 		if !ok {
 			return fetch.Request{}, false
 		}

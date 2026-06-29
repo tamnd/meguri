@@ -27,6 +27,7 @@ func main() {
 	root.AddCommand(newInspectCmd())
 	root.AddCommand(newRunCmd())
 	root.AddCommand(newSeedCmd())
+	root.AddCommand(newServeCmd())
 
 	if err := fang.Execute(context.Background(), root); err != nil {
 		os.Exit(1)

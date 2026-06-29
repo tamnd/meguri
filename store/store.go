@@ -445,12 +445,39 @@ func (s *Store) Close() error {
 // store writes to a fresh log, so the next recovery loads this snapshot and
 // replays only the updates that follow it.
 func (s *Store) Checkpoint() error {
+	return s.commit(s.snapshotPartition())
+}
+
+// Snapshot streams the live store into a sorted format.Partition without writing
+// anything, the read-only half of a checkpoint. The top-level partition lifecycle
+// (engine.OpenPartition) calls it to recover a resident frontier from a store it
+// just opened, then advances that frontier and folds it back through
+// CheckpointFrom.
+func (s *Store) Snapshot() *format.Partition {
+	return s.snapshotPartition()
+}
+
+// CheckpointFrom commits an externally built partition snapshot as the store's
+// durable checkpoint, the path the top-level lifecycle uses to persist a frontier
+// it recovered from this store and then advanced. It writes the snapshot, rotates
+// the log, and commits the superblock exactly as Checkpoint does, but takes the
+// partition from the caller (the resident frontier's serialized form) rather than
+// the store's own index. The caller's frontier is the live truth for the rest of
+// the session; the store's in-memory index is not re-synced here because nothing
+// reads it again before the next process reopens from the committed snapshot.
+func (s *Store) CheckpointFrom(part *format.Partition) error {
+	return s.commit(part)
+}
+
+// commit writes part as the next durable checkpoint and rotates the log. It is the
+// shared body of Checkpoint (snapshot sourced from the store's own index) and
+// CheckpointFrom (snapshot sourced from a caller's frontier).
+func (s *Store) commit(part *format.Partition) error {
 	// The consistent cut: the frontier LSN the snapshot is consistent as of is the
 	// store's next LSN, captured before the rotation. The simplest correct cut for
 	// a frontier that can briefly pause its own dispatch is to checkpoint between
 	// updates; concurrent writers see the snapshot at this LSN (doc 11 section 4.2).
 	frontier := s.log.peekLSN()
-	part := s.snapshotPartition()
 
 	nextGen := s.gen + 1
 	snapName := fmt.Sprintf("snap-%d.meguri", nextGen)

@@ -1,6 +1,7 @@
 // Command meguri is the CLI front door to the frontier engine and its .meguri
-// files. In M0 it carries the file tools: inspect a checkpoint, print the
-// version. The crawl-loop subcommands land with the engine in later milestones.
+// files. It carries the file tools: seed a frontier from a URL list, inspect a
+// checkpoint, print the version. The crawl-loop subcommands that drive ami land
+// with the distributed engine in later milestones.
 package main
 
 import (
@@ -23,6 +24,7 @@ func main() {
 	}
 	root.SetVersionTemplate("meguri {{.Version}} (" + meguri.Commit + ")\n")
 	root.AddCommand(newInspectCmd())
+	root.AddCommand(newSeedCmd())
 
 	if err := fang.Execute(context.Background(), root); err != nil {
 		os.Exit(1)

@@ -23,10 +23,10 @@ const wheelSpan = 1024
 // serialized. That is the durable form of the index doc 11 names: the store holds
 // the URL and host tables the wheel is computed from.
 type dueWheel struct {
-	cursor    uint32                      // epoch-hour the wheel has advanced through; due <= cursor has fired
-	ring      [wheelSpan][]meguri.URLKey  // hour buckets; a key due at hour h lives in ring[h%wheelSpan]
-	over      overHeap                    // due >= cursor+wheelSpan, by due hour, pulled in as the cursor nears
-	ringCount int                         // keys resident in the ring, so an empty ring is an O(1) check
+	cursor    uint32                     // epoch-hour the wheel has advanced through; due <= cursor has fired
+	ring      [wheelSpan][]meguri.URLKey // hour buckets; a key due at hour h lives in ring[h%wheelSpan]
+	over      overHeap                   // due >= cursor+wheelSpan, by due hour, pulled in as the cursor nears
+	ringCount int                        // keys resident in the ring, so an empty ring is an O(1) check
 }
 
 // newDueWheel starts a wheel whose cursor sits at base epoch-hours, so a due time

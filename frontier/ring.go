@@ -44,7 +44,7 @@ func frontBucket(priority float32) int {
 // It is generic so the same structure serves both fronts the engine keeps: a
 // ring of URLKeys for URLs not yet bound to a host queue, and a ring of host
 // keys for hosts that are eligible now, ordered by their best URL's priority.
-type prioRing[T any] struct {
+type prioRing[T comparable] struct {
 	buckets [priorityLevels][]T
 	occ     uint64
 	n       int
@@ -77,6 +77,36 @@ func (r *prioRing[T]) peek() (T, bool) {
 		return zero, false
 	}
 	return r.buckets[b][0], true
+}
+
+// rebucket moves item from the bucket for oldPriority to the bucket for
+// newPriority when a cash credit has changed its level, and reports whether the
+// item was found and moved. It is the front-bank side of doc 09's rate-limited
+// re-bucketing: a credit that does not cross a level falls in the same bucket and
+// the ring is left untouched, so only a level-crossing pays the linear scan of
+// the old bucket. The item keeps no ordering guarantee against its old
+// bucket-mates after a move, which is correct: its priority changed, so its place
+// in the order changed with it.
+func (r *prioRing[T]) rebucket(item T, oldPriority, newPriority float32) bool {
+	ob := frontBucket(oldPriority)
+	nb := frontBucket(newPriority)
+	if ob == nb {
+		return false
+	}
+	bucket := r.buckets[ob]
+	for i, it := range bucket {
+		if it != item {
+			continue
+		}
+		r.buckets[ob] = append(bucket[:i], bucket[i+1:]...)
+		if len(r.buckets[ob]) == 0 {
+			r.occ &^= 1 << uint(ob)
+		}
+		r.n--
+		r.push(item, newPriority)
+		return true
+	}
+	return false
 }
 
 // pop removes and returns the front of the highest non-empty bucket.

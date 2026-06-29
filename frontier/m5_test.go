@@ -134,7 +134,7 @@ func TestSTARBudgetDefersSpamFarm(t *testing.T) {
 		f.Discover(d, 0)
 	}
 	goodBudget := f.hosts[goodHost].rec.URLBudget
-	if !(goodBudget > spamBudget) {
+	if goodBudget <= spamBudget {
 		t.Fatalf("reputation did not earn budget: good=%d spam=%d", goodBudget, spamBudget)
 	}
 }

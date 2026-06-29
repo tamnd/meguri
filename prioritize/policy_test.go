@@ -60,7 +60,7 @@ func TestUpdateHostBudgetTracksInDegree(t *testing.T) {
 	if none.URLBudget < p.MinBudget {
 		t.Errorf("a host with no in-links fell below the floor: %d < %d", none.URLBudget, p.MinBudget)
 	}
-	if !(some.URLBudget > none.URLBudget) {
+	if some.URLBudget <= none.URLBudget {
 		t.Errorf("more in-degree did not raise the budget: none=%d some=%d", none.URLBudget, some.URLBudget)
 	}
 	if many.URLBudget != p.MaxBudget {

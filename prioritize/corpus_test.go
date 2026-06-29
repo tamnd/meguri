@@ -217,7 +217,7 @@ func TestCorpusSTARBudgetTracksCrossHostInDegree(t *testing.T) {
 	top := rows[len(rows)-1]
 	bottom := rows[0]
 	t.Logf("STAR gate: %d hosts, %d with cross-host reputation; top=%s indeg=%d budget=%d, floor host=%s indeg=%d budget=%d", len(rows), withRep, top.host, top.indeg, top.budget, bottom.host, bottom.indeg, bottom.budget)
-	if !(top.budget > bottom.budget) {
+	if top.budget <= bottom.budget {
 		t.Fatalf("reputation did not earn budget: top=%d floor=%d", top.budget, bottom.budget)
 	}
 	if bottom.budget < p.MinBudget {

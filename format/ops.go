@@ -1,6 +1,7 @@
 package format
 
 import (
+	"maps"
 	"sort"
 
 	m "github.com/tamnd/meguri"
@@ -134,33 +135,35 @@ func Merge(a, b *Partition) (*Partition, error) {
 		DefaultCodec: a.DefaultCodec,
 		Meta:         cloneMeta(a.Meta),
 	}
-	// Re-base both source arenas into one. Each source has its own offset cache,
-	// because an offset in a's arena and the same offset in b's name different
-	// spans, so the caches must not be shared.
-	arena := newArena()
-	ca := newRebaser(a.Strings)
-	cb := newRebaser(b.Strings)
+	// Re-base both source arenas into one shared dictionary. Each source keeps its
+	// own offset cache, because an offset in a's arena and the same offset in b's
+	// name different spans, so the offset caches must not be shared; the dictionary
+	// is shared and keyed by content, so a span both partitions hold is interned
+	// once across the two.
+	dict := newDict()
+	ca := newRebaser(a.Strings, dict)
+	cb := newRebaser(b.Strings, dict)
 	for i := range a.URLs {
 		r := a.URLs[i]
-		arena = ca.copyURL(&r, arena)
+		ca.copyURL(&r)
 		out.URLs = append(out.URLs, r)
 	}
 	for i := range b.URLs {
 		r := b.URLs[i]
-		arena = cb.copyURL(&r, arena)
+		cb.copyURL(&r)
 		out.URLs = append(out.URLs, r)
 	}
 	for i := range a.Hosts {
 		r := a.Hosts[i]
-		arena = ca.copyHost(&r, arena)
+		ca.copyHost(&r)
 		out.Hosts = append(out.Hosts, r)
 	}
 	for i := range b.Hosts {
 		r := b.Hosts[i]
-		arena = cb.copyHost(&r, arena)
+		cb.copyHost(&r)
 		out.Hosts = append(out.Hosts, r)
 	}
-	out.Strings = arena
+	out.Strings = dict.arena
 	return out, nil
 }
 
@@ -169,60 +172,62 @@ func Merge(a, b *Partition) (*Partition, error) {
 // destination free of the duplicates a shared string would otherwise create.
 type rebaser struct {
 	src   []byte
+	dict  *arenaDict
 	cache map[uint64]uint64
 }
 
-func newRebaser(src []byte) *rebaser {
-	return &rebaser{src: src, cache: map[uint64]uint64{}}
+func newRebaser(src []byte, dict *arenaDict) *rebaser {
+	return &rebaser{src: src, dict: dict, cache: map[uint64]uint64{}}
 }
 
-// intern copies the span at off in the source to the end of arena and returns
-// the grown arena and the span's new offset. A zero or out-of-range offset is
-// the none sentinel and maps to 0.
-func (rb *rebaser) intern(off uint64, arena []byte) ([]byte, uint64) {
+// intern re-bases the span at off in the source into the shared dictionary and
+// returns its destination offset. A zero or out-of-range offset is the none
+// sentinel and maps to 0. The local cache short-circuits a source offset seen
+// before; the dictionary folds spans with the same content from any source down
+// to one copy, so a registrable domain repeated across hosts and partitions is
+// interned once.
+func (rb *rebaser) intern(off uint64) uint64 {
 	if off == 0 {
-		return arena, 0
+		return 0
 	}
 	if v, ok := rb.cache[off]; ok {
-		return arena, v
+		return v
 	}
 	span := arenaRead(rb.src, off)
 	if span == nil {
-		return arena, 0
+		return 0
 	}
-	arena, newOff := arenaIntern(arena, span)
+	newOff := rb.dict.intern(span)
 	rb.cache[off] = newOff
-	return arena, newOff
+	return newOff
 }
 
-// copyURL re-bases a URL row's string references into arena, returning the grown
-// arena. A zero ref stays zero, the none sentinel.
-func (rb *rebaser) copyURL(r *m.URLRecord, arena []byte) []byte {
-	arena, r.URLRef = rb.intern(r.URLRef, arena)
-	arena, r.ETagRef = rb.intern(r.ETagRef, arena)
-	arena, r.RedirectRef = rb.intern(r.RedirectRef, arena)
-	return arena
+// copyURL re-bases a URL row's string references into the shared dictionary. A
+// zero ref stays zero, the none sentinel.
+func (rb *rebaser) copyURL(r *m.URLRecord) {
+	r.URLRef = rb.intern(r.URLRef)
+	r.ETagRef = rb.intern(r.ETagRef)
+	r.RedirectRef = rb.intern(r.RedirectRef)
 }
 
-func (rb *rebaser) copyHost(r *m.HostRecord, arena []byte) []byte {
-	arena, r.HostRef = rb.intern(r.HostRef, arena)
-	arena, r.RegistrableRef = rb.intern(r.RegistrableRef, arena)
-	arena, r.RobotsRef = rb.intern(r.RobotsRef, arena)
-	return arena
+func (rb *rebaser) copyHost(r *m.HostRecord) {
+	r.HostRef = rb.intern(r.HostRef)
+	r.RegistrableRef = rb.intern(r.RegistrableRef)
+	r.RobotsRef = rb.intern(r.RobotsRef)
 }
 
 // rebaseArena rebuilds dst.Strings from src to hold only the spans dst's rows
-// reference, rewriting every *Ref in place.
+// reference, each distinct span once, rewriting every *Ref in place.
 func rebaseArena(dst *Partition, src []byte) {
-	arena := newArena()
-	rb := newRebaser(src)
+	dict := newDict()
+	rb := newRebaser(src, dict)
 	for i := range dst.URLs {
-		arena = rb.copyURL(&dst.URLs[i], arena)
+		rb.copyURL(&dst.URLs[i])
 	}
 	for i := range dst.Hosts {
-		arena = rb.copyHost(&dst.Hosts[i], arena)
+		rb.copyHost(&dst.Hosts[i])
 	}
-	dst.Strings = arena
+	dst.Strings = dict.arena
 }
 
 func cloneMeta(meta map[string]string) map[string]string {
@@ -230,9 +235,7 @@ func cloneMeta(meta map[string]string) map[string]string {
 		return nil
 	}
 	out := make(map[string]string, len(meta))
-	for k, v := range meta {
-		out[k] = v
-	}
+	maps.Copy(out, meta)
 	return out
 }
 

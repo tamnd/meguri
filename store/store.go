@@ -188,6 +188,51 @@ func (s *Store) Str(off uint64) string {
 	return readArena(s.arena, off)
 }
 
+// InternRobots packs a robots blob through the doc 10 section 7 robots modes and
+// interns the packed bytes, returning the reference a HostRecord's RobotsRef
+// carries. The packing picks the smallest of the allow-all sentinel, raw, or
+// codec-compressed, so a host serving an allow-all policy never grows the arena:
+// an empty blob is the allow-all case and returns 0, the none sentinel, which a
+// nil-Rules reader already treats as allow-all (robots.Rules). A non-empty blob
+// is stored once, deduped by the checkpoint's content dictionary when a partition
+// is split or merged.
+func (s *Store) InternRobots(blob []byte) (uint64, error) {
+	if len(blob) == 0 {
+		return 0, nil
+	}
+	packed := format.PackRobots(blob, s.codec)
+	s.arenaMu.Lock()
+	off := uint64(len(s.arena))
+	entry := appendUvarint(nil, uint64(len(packed)))
+	entry = append(entry, packed...)
+	s.arena = append(s.arena, entry...)
+	s.arenaMu.Unlock()
+	if _, _, err := s.log.append(kindIntern, 0, nil, entry); err != nil {
+		return 0, err
+	}
+	return off, nil
+}
+
+// Robots reads back and unpacks the robots blob at off, the inverse of
+// InternRobots. A zero or out-of-range reference, the allow-all sentinel, or a
+// blob that does not unpack returns nil, which a nil-Rules reader treats as
+// allow-all, so a stale or corrupt reference degrades to the permissive default
+// rather than panicking.
+func (s *Store) Robots(off uint64) []byte {
+	s.arenaMu.Lock()
+	packed := readArenaBytes(s.arena, off)
+	codec := s.codec
+	s.arenaMu.Unlock()
+	if len(packed) == 0 {
+		return nil
+	}
+	blob, ok := format.UnpackRobots(packed, codec, format.RobotsSizeHint)
+	if !ok {
+		return nil
+	}
+	return blob
+}
+
 // PutURL appends an updated URL record and repoints the index at it. This is the
 // dominant write, the point-update-on-crawl of doc 11 section 1.1: one append,
 // one index repoint, the old record left as garbage for a later compaction. It

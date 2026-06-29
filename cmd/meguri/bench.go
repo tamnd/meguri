@@ -99,7 +99,11 @@ func newBenchCmd() *cobra.Command {
 				return err
 			}
 			thr := bench.Analyze(part, selRate)
-			_, err = fmt.Fprint(cmd.OutOrStdout(), "\n"+bench.ThroughputReport(thr))
+			if _, err = fmt.Fprint(cmd.OutOrStdout(), "\n"+bench.ThroughputReport(thr)); err != nil {
+				return err
+			}
+			bl := bench.NaiveFrontierBaseline(meas, totalURLs)
+			_, err = fmt.Fprint(cmd.OutOrStdout(), "\n"+bench.BaselineReport(bl))
 			return err
 		},
 	}

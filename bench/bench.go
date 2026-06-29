@@ -269,6 +269,54 @@ func insertionSort(a []uint16) {
 	}
 }
 
+// naiveKeyBits is the exact-membership floor of a naive key-value frontier: one
+// 128-bit URLKey stored per seen URL, the smallest an exact "have I seen this"
+// set can be. A real naive frontier pays more on top (a RocksDB-backed set adds
+// the SST block index, a per-SST bloom filter, and write amplification; a Nutch
+// CrawlDb keeps the whole CrawlDatum per URL; Frontera's store keeps the URL
+// string), so this is the optimistic lower bound the externals sit above, not a
+// number that flatters meguri.
+const naiveKeyBits = 128
+
+// Baseline is the doc 14 section 7 paired comparison of meguri's seen-set against
+// a naive exact-key frontier. It is the deterministic, counts-not-timed arm of the
+// baseline comparison: the memory a naive frontier must spend to answer the same
+// dedup question, paired against meguri's measured cost, projected to the fleet.
+// The named external systems (Nutch, a RocksDB frontier, Frontera) are cited
+// separately because measuring their real overhead needs the systems themselves
+// on a fleet box; this arm fixes the floor they cannot beat.
+type Baseline struct {
+	NaiveBitsPerURL  float64 // 128, the exact-key floor of a naive frontier
+	MeguriBitsPerURL float64 // measured seen-set bits/url
+	MemoryRatio      float64 // naive / meguri, the paired ratio
+	NaiveFleetBytes  float64 // naive bits/url x TotalURLs / 8
+	MeguriFleetBytes float64 // meguri bits/url x TotalURLs / 8
+	Calc             string  // the paired multiplication, shown
+}
+
+// NaiveFrontierBaseline builds the seen-set baseline comparison: the naive
+// exact-key store at 128 bits/url against meguri's measured seen-set bits/url,
+// both projected to the stated fleet total. The ratio is the paired number doc 14
+// section 7 asks for, the factor by which the approximate tiered filter undercuts
+// an exact key set before any LSM or per-record overhead is added.
+func NaiveFrontierBaseline(meas Measured, totalURLs float64) Baseline {
+	naiveFleet := naiveKeyBits * totalURLs / 8
+	meguriFleet := meas.BitsPerURL * totalURLs / 8
+	ratio := math.NaN()
+	if meas.BitsPerURL > 0 {
+		ratio = naiveKeyBits / meas.BitsPerURL
+	}
+	return Baseline{
+		NaiveBitsPerURL:  naiveKeyBits,
+		MeguriBitsPerURL: meas.BitsPerURL,
+		MemoryRatio:      ratio,
+		NaiveFleetBytes:  naiveFleet,
+		MeguriFleetBytes: meguriFleet,
+		Calc: fmt.Sprintf("naive %d bits/url -> %s vs meguri %.2f bits/url -> %s (%.1fx)",
+			naiveKeyBits, humanBytes(naiveFleet), meas.BitsPerURL, humanBytes(meguriFleet), ratio),
+	}
+}
+
 // PolitenessPoint is one point on the polite-dispatch ceiling curve: when the
 // ActiveHosts fastest hosts of a partition are simultaneously dispatchable, the
 // partition can be fetched at most CeilingFPS fetches per second without breaking

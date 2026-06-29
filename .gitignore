@@ -1,0 +1,11 @@
+/bin/
+/dist/
+*.meguri
+*.test
+*.out
+.DS_Store
+/corpus/
+/.tago-src/
+docs/public/
+docs/public-pages/
+docs/public-cf/

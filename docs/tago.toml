@@ -1,0 +1,10 @@
+title       = "meguri"
+baseURL     = "https://meguri.tamnd.com/"
+description = "meguri (巡) is a distributed web-crawler frontier and rescheduler. It turns a stream of discovered links into a polite, freshness-aware crawl schedule for a frontier that scales to a hundred billion URLs across shared-nothing partitions, each one a compact single .meguri file."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/meguri"

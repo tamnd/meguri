@@ -236,6 +236,23 @@ func WithResolver(r dns.Resolver) Option {
 	}
 }
 
+// WithResolverCache points the frontier at a resolver cache it shares with the
+// other partitions on the same machine, instead of building its own (doc 11, the
+// machine-local shared resolver cache). A host resolved for any partition is then
+// hot for all of them, so a name the vhosts across many partitions share resolves
+// once per machine rather than once per partition, and the prefetch pool's
+// in-flight dedup keeps two partitions from resolving the same name at once. The
+// frontier does not own a shared cache: the machine harness that built it closes
+// it once every partition has stopped. Use WithResolver instead when a partition
+// runs alone and owns its cache. A nil cache is ignored.
+func WithResolverCache(c *dns.Cache) Option {
+	return func(f *Frontier) {
+		if c != nil {
+			f.resolver = c
+		}
+	}
+}
+
 // WithRobots turns on robots.txt: a host fetches and parses robots before any of
 // its content URLs dispatch, disallowed URLs are excluded, and a robots
 // Crawl-delay raises the host's politeness floor. agent is the product token its

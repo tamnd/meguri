@@ -31,6 +31,7 @@ import (
 	"github.com/tamnd/meguri/format"
 	"github.com/tamnd/meguri/freshness"
 	"github.com/tamnd/meguri/politeness"
+	"github.com/tamnd/meguri/prioritize"
 	"github.com/tamnd/meguri/robots"
 )
 
@@ -106,6 +107,13 @@ type Frontier struct {
 	fresh    *freshness.Params
 	tau      *freshness.TauController // global water level, slowly retuned to the budget
 	reschedN int                      // reschedules since the last tau tick
+
+	// M5 prioritization (doc 09). nil leaves the seed/link priority untouched so
+	// the earlier milestones' dispatch order is byte-for-byte unchanged. When set,
+	// a seed endows OPIC cash, a discovery credits cash and cross-host reputation
+	// and is admitted under the STAR budget, and a crawl distributes its cash
+	// across its out-links, so the front bank orders by online importance.
+	prio *prioritize.Prioritizer
 }
 
 // tauTickEvery is how many reschedules pass between background re-estimates of
@@ -172,6 +180,20 @@ func WithFreshness(p freshness.Params, budgetPerHour float64) Option {
 		pp := p
 		f.fresh = &pp
 		f.tau = freshness.NewTauController(budgetPerHour)
+	}
+}
+
+// WithPrioritizer turns on OPIC importance ordering (doc 09): a seed endows its
+// cash, every discovered out-link credits its OPIC cash and cross-host
+// reputation to its target, the target host's crawl budget tracks the distinct
+// other domains that link to it (STAR), and a crawl distributes the source's cash
+// across its out-links so the front bank orders by online importance refined as
+// the crawl runs. Imported PageRank or host quality from a prior tsumugi crawl is
+// blended in through the Prioritizer when present. Without it a URL keeps the
+// flat seed or link-weight priority of the earlier milestones.
+func WithPrioritizer(p prioritize.Params) Option {
+	return func(f *Frontier) {
+		f.prio = prioritize.New(p)
 	}
 }
 
@@ -243,7 +265,16 @@ func (f *Frontier) Seed(url, host string, priority float32, firstSeen, nextDue u
 		f.hosts[hk] = h
 	}
 	h.rec.URLCount++
-	f.urlFront.push(key, priority)
+
+	// With prioritization on, the seed's importance becomes its OPIC cash
+	// endowment, the starting cash the first crawl distributes, and the front-bank
+	// priority is the blended, penalized score (doc 09). Without it the seed keeps
+	// the caller's flat priority, the earlier-milestone behavior.
+	if f.prio != nil {
+		f.prio.SeedCash(key, priority)
+		rec.Priority = f.prio.Priority(rec, &h.rec)
+	}
+	f.urlFront.push(key, rec.Priority)
 }
 
 // Discover is the idempotent intake of a routed out-link (doc 08, section 9.3,
@@ -260,8 +291,15 @@ func (f *Frontier) Seed(url, host string, priority float32, firstSeen, nextDue u
 // lets the discovery transport be at-least-once (D16).
 func (f *Frontier) Discover(d meguri.Discovery, now uint32) bool {
 	if f.seen.Seen(d.URLKey) {
-		// Rediscovery: the row already exists. The OPIC cash this link would
-		// credit is the prioritizer's job (M5); M2 only guarantees the dedup.
+		// Rediscovery: the row already exists. With prioritization on, the link
+		// still carries OPIC cash and cross-host reputation, so credit it and
+		// reprice the target (doc 09); without it M2's contract holds and only the
+		// dedup matters.
+		if f.prio != nil {
+			if rec := f.records[d.URLKey]; rec != nil {
+				f.creditDiscovery(d, rec)
+			}
+		}
 		return false
 	}
 
@@ -273,16 +311,28 @@ func (f *Frontier) Discover(d meguri.Discovery, now uint32) bool {
 		f.hosts[hk] = h
 	}
 
+	// Credit the link's cash and reputation before admitting, so a host that just
+	// earned a distinct cross-host in-link is budgeted on its new reputation
+	// (doc 09, STAR) and the URL enters at its blended importance.
+	priority := d.LinkWeight
+	if f.prio != nil {
+		indeg := f.prio.Credit(d)
+		prioritize.UpdateHostBudget(&h.rec, indeg, f.prio.Params())
+	}
+
 	status := dedup.Admit(d.Depth, &h.rec, true)
 	rec := &meguri.URLRecord{
 		URLKey:          d.URLKey,
 		HostKey:         hk,
 		Status:          status,
-		Priority:        d.LinkWeight,
+		Priority:        priority,
 		Depth:           d.Depth,
 		URLRef:          f.arena.intern(d.CanonicalURL),
 		FirstSeen:       d.ObservedAt,
 		DiscoverySource: d.DiscoverySource,
+	}
+	if f.prio != nil {
+		rec.Priority = f.prio.Priority(rec, &h.rec)
 	}
 	f.records[d.URLKey] = rec
 	h.rec.URLCount++
@@ -290,7 +340,7 @@ func (f *Frontier) Discover(d meguri.Discovery, now uint32) bool {
 	if status != meguri.StatusScheduled {
 		return false // parked in Trapped: recorded, dedups, not queued
 	}
-	f.urlFront.push(d.URLKey, d.LinkWeight)
+	f.urlFront.push(d.URLKey, rec.Priority)
 	return true
 }
 
@@ -431,6 +481,13 @@ func (f *Frontier) Report(o meguri.Outcome, now uint32) {
 	// status come from the allocation rather than the flat M1 placeholder.
 	if f.fresh != nil {
 		f.reschedule(rec, h, now)
+	}
+	// Prioritization (doc 09): a crawled page distributes its accumulated OPIC cash
+	// across its extracted out-links and ingests them, so importance flows to what
+	// it links to and the front bank reorders as the crawl learns the graph. Off by
+	// default, so the earlier milestones never run it.
+	if f.prio != nil && len(o.Links) > 0 {
+		f.spreadCash(rec, h, o.Links, now)
 	}
 	if h == nil {
 		return

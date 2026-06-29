@@ -53,6 +53,14 @@ func (c *Control) Epoch() uint64 {
 	return c.m.Epoch
 }
 
+// NumPartitions returns the current partition count, the value the elasticity
+// loop reads to decide whether it may still grow or shrink the fleet.
+func (c *Control) NumPartitions() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.m.NumPartitions
+}
+
 // SetReplicas sets the fleet-wide replication factor and recomputes every
 // partition's replica set under the new N.
 func (c *Control) SetReplicas(n int) {

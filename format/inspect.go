@@ -35,6 +35,7 @@ type Inspect struct {
 	Regions     []RegionInfo
 	URLColumns  int
 	HostColumns int
+	Encodings   map[string]int // encoding name -> column count, the cascade made visible
 	Stats       Stats
 	Meta        map[string]string
 }
@@ -119,7 +120,35 @@ func InspectBytes(b []byte) (*Inspect, error) {
 			Length: reg.length,
 		})
 	}
+	ins.Encodings = map[string]int{}
+	for _, d := range f.urlDir {
+		ins.Encodings[encodingName(d.encoding)]++
+	}
+	for _, d := range f.hostDir {
+		ins.Encodings[encodingName(d.encoding)]++
+	}
 	return ins, nil
+}
+
+func encodingName(e uint8) string {
+	switch e {
+	case EncRaw:
+		return "raw"
+	case EncDict:
+		return "dict"
+	case EncDelta:
+		return "delta"
+	case EncFOR:
+		return "for"
+	case EncRLE:
+		return "rle"
+	case EncFSST:
+		return "fsst"
+	case EncDeltaFOR:
+		return "delta_for"
+	default:
+		return fmt.Sprintf("enc_%d", e)
+	}
 }
 
 func regionName(id uint8) string {
@@ -152,6 +181,12 @@ func (ins *Inspect) String() string {
 	b.WriteString("  regions:\n")
 	for _, reg := range ins.Regions {
 		fmt.Fprintf(&b, "    %-12s off=%-10d len=%d\n", reg.Name, reg.Offset, reg.Length)
+	}
+	if len(ins.Encodings) > 0 {
+		b.WriteString("  encodings:\n")
+		for _, k := range sortedCounts(ins.Encodings) {
+			fmt.Fprintf(&b, "    %-12s %d cols\n", k, ins.Encodings[k])
+		}
 	}
 	if len(ins.Meta) > 0 {
 		b.WriteString("  meta:\n")
@@ -212,6 +247,19 @@ func flagNames(flags uint16) string {
 		}
 	}
 	return strings.Join(on, "|")
+}
+
+func sortedCounts(m map[string]int) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	for i := 1; i < len(keys); i++ {
+		for j := i; j > 0 && keys[j] < keys[j-1]; j-- {
+			keys[j], keys[j-1] = keys[j-1], keys[j]
+		}
+	}
+	return keys
 }
 
 func sortedKeys(m map[string]string) []string {

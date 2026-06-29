@@ -112,30 +112,37 @@ func urlColumns(recs []m.URLRecord, codec uint8) []column {
 		errorCount = appU16(errorCount, r.ErrorCount)
 	}
 
+	// The nominal encoding per column follows doc 10 section 3: RLE for the
+	// constant urlkey_host and the sparse redirect_ref, DELTA_FOR for the
+	// ascending urlkey_path, DICTIONARY for the small enums and the quantized
+	// floats, DELTA for the clustered timestamps and the monotone url_ref, FOR
+	// for the small counters, RAW for the high-entropy fingerprints. The page
+	// builder still falls back to RAW per page when the encoding does not beat
+	// it, so these are intents, not commitments.
 	return []column{
-		{colURLHostKey, 8, kindUint, codec, hostKey},
-		{colURLPathKey, 8, kindUint, codec, pathKey},
-		{colURLStatus, 1, kindUint, codec, status},
-		{colURLPriority, 4, kindFloat, codec, priority},
-		{colURLDepth, 2, kindUint, codec, depth},
-		{colURLDiscSource, 1, kindUint, codec, discSrc},
-		{colURLRef, 8, kindUint, codec, urlRef},
-		{colURLFirstSeen, 4, kindUint, codec, firstSeen},
-		{colURLLastCrawled, 4, kindUint, codec, lastCrawled},
-		{colURLLastChanged, 4, kindUint, codec, lastChanged},
-		{colURLNextDue, 4, kindUint, codec, nextDue},
-		{colURLLambda, 4, kindFloat, codec, lambda},
-		{colURLCrawlCount, 4, kindUint, codec, crawlCount},
-		{colURLChangeCount, 4, kindUint, codec, changeCount},
-		{colURLNoChangeStk, 2, kindUint, codec, noChangeStk},
-		{colURLETagRef, 8, kindUint, codec, etagRef},
-		{colURLLastModified, 4, kindUint, codec, lastMod},
-		{colURLContentFP, 8, kindUint, codec, contentFP},
-		{colURLSimhash, 8, kindUint, codec, simhash},
-		{colURLHTTPStatus, 2, kindUint, codec, httpStatus},
-		{colURLRedirectRef, 8, kindUint, codec, redirectRef},
-		{colURLRetryCount, 1, kindUint, codec, retryCount},
-		{colURLErrorCount, 2, kindUint, codec, errorCount},
+		{colURLHostKey, 8, kindUint, EncRLE, codec, hostKey},
+		{colURLPathKey, 8, kindUint, EncDeltaFOR, codec, pathKey},
+		{colURLStatus, 1, kindUint, EncDict, codec, status},
+		{colURLPriority, 4, kindFloat, EncDict, codec, priority},
+		{colURLDepth, 2, kindUint, EncFOR, codec, depth},
+		{colURLDiscSource, 1, kindUint, EncDict, codec, discSrc},
+		{colURLRef, 8, kindUint, EncDelta, codec, urlRef},
+		{colURLFirstSeen, 4, kindUint, EncDelta, codec, firstSeen},
+		{colURLLastCrawled, 4, kindUint, EncDelta, codec, lastCrawled},
+		{colURLLastChanged, 4, kindUint, EncDelta, codec, lastChanged},
+		{colURLNextDue, 4, kindUint, EncDelta, codec, nextDue},
+		{colURLLambda, 4, kindFloat, EncDict, codec, lambda},
+		{colURLCrawlCount, 4, kindUint, EncFOR, codec, crawlCount},
+		{colURLChangeCount, 4, kindUint, EncFOR, codec, changeCount},
+		{colURLNoChangeStk, 2, kindUint, EncFOR, codec, noChangeStk},
+		{colURLETagRef, 8, kindUint, EncDelta, codec, etagRef},
+		{colURLLastModified, 4, kindUint, EncDelta, codec, lastMod},
+		{colURLContentFP, 8, kindUint, EncRaw, codec, contentFP},
+		{colURLSimhash, 8, kindUint, EncRaw, codec, simhash},
+		{colURLHTTPStatus, 2, kindUint, EncDict, codec, httpStatus},
+		{colURLRedirectRef, 8, kindUint, EncRLE, codec, redirectRef},
+		{colURLRetryCount, 1, kindUint, EncFOR, codec, retryCount},
+		{colURLErrorCount, 2, kindUint, EncFOR, codec, errorCount},
 	}
 }
 
@@ -225,27 +232,30 @@ func hostColumns(recs []m.HostRecord, codec uint8) []column {
 		flags = appU16(flags, r.Flags)
 	}
 
+	// Host columns per doc 10 section 4: DELTA_FOR for the ascending hostkey,
+	// DELTA for the offset and timestamp columns, DICTIONARY for the enums and
+	// the host score, FOR for the counters, RAW for the 16-byte resolved IP.
 	return []column{
-		{colHostKey, 8, kindUint, codec, hostKey},
-		{colHostRef, 8, kindUint, codec, hostRef},
-		{colHostGrouping, 1, kindUint, codec, grouping},
-		{colHostRegistRef, 8, kindUint, codec, registRef},
-		{colHostResolvedIP, 16, kindRaw, codec, resolvedIP},
-		{colHostIPExpiry, 4, kindUint, codec, ipExpiry},
-		{colHostRobotsFetch, 4, kindUint, codec, robotsFetch},
-		{colHostRobotsExpiry, 4, kindUint, codec, robotsExpiry},
-		{colHostRobotsRef, 8, kindUint, codec, robotsRef},
-		{colHostCrawlDelay, 2, kindUint, codec, crawlDelay},
-		{colHostNextElig, 4, kindUint, codec, nextElig},
-		{colHostIPNextElig, 4, kindUint, codec, ipNextElig},
-		{colHostURLBudget, 4, kindUint, codec, urlBudget},
-		{colHostURLCount, 4, kindUint, codec, urlCount},
-		{colHostDepthCap, 2, kindUint, codec, depthCap},
-		{colHostScore, 4, kindFloat, codec, score},
-		{colHostCrawlTotal, 4, kindUint, codec, crawlTotal},
-		{colHostErrorTotal, 4, kindUint, codec, errorTotal},
-		{colHostAvgLatency, 2, kindUint, codec, avgLatency},
-		{colHostFlags, 2, kindUint, codec, flags},
+		{colHostKey, 8, kindUint, EncDeltaFOR, codec, hostKey},
+		{colHostRef, 8, kindUint, EncDelta, codec, hostRef},
+		{colHostGrouping, 1, kindUint, EncDict, codec, grouping},
+		{colHostRegistRef, 8, kindUint, EncDelta, codec, registRef},
+		{colHostResolvedIP, 16, kindRaw, EncRaw, codec, resolvedIP},
+		{colHostIPExpiry, 4, kindUint, EncDelta, codec, ipExpiry},
+		{colHostRobotsFetch, 4, kindUint, EncDelta, codec, robotsFetch},
+		{colHostRobotsExpiry, 4, kindUint, EncDelta, codec, robotsExpiry},
+		{colHostRobotsRef, 8, kindUint, EncDelta, codec, robotsRef},
+		{colHostCrawlDelay, 2, kindUint, EncDict, codec, crawlDelay},
+		{colHostNextElig, 4, kindUint, EncDelta, codec, nextElig},
+		{colHostIPNextElig, 4, kindUint, EncDelta, codec, ipNextElig},
+		{colHostURLBudget, 4, kindUint, EncFOR, codec, urlBudget},
+		{colHostURLCount, 4, kindUint, EncFOR, codec, urlCount},
+		{colHostDepthCap, 2, kindUint, EncDict, codec, depthCap},
+		{colHostScore, 4, kindFloat, EncDict, codec, score},
+		{colHostCrawlTotal, 4, kindUint, EncFOR, codec, crawlTotal},
+		{colHostErrorTotal, 4, kindUint, EncFOR, codec, errorTotal},
+		{colHostAvgLatency, 2, kindUint, EncFOR, codec, avgLatency},
+		{colHostFlags, 2, kindUint, EncDict, codec, flags},
 	}
 }
 

@@ -137,6 +137,7 @@ func encodeColumnDir(dir []columnDir) []byte {
 		s.u64(d.totalUncompressed)
 		s.uvarint(d.numValues)
 		s.uvarint(d.numPages)
+		s.u8(d.width)
 		s.u8(d.encoding)
 		s.u8(d.codec)
 		s.u64(d.totalUncompressed) // uncompressed_size, logical column size
@@ -216,6 +217,7 @@ func decodeColumnDir(b []byte) []columnDir {
 		d.totalUncompressed = r.u64()
 		d.numValues = r.uvarint()
 		d.numPages = r.uvarint()
+		d.width = r.u8()
 		d.encoding = r.u8()
 		d.codec = r.u8()
 		_ = r.u64() // uncompressed_size mirror

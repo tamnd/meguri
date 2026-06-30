@@ -31,6 +31,9 @@ meguri scale -i corpus/urls.jsonl --profile 142k --seed-mode batch --out scale-r
 | 2026-06-30 | 10k | a62abe1+batch | laptop (smoke) | batch | 841.7k | 4025 B | 27 MiB | 1.39M | paired/batch/result.10k.a62abe1.json |
 | 2026-06-30 | 100k | a62abe1+batch | laptop (smoke) | batch | 847.9k | 2113 B | 136 MiB | 1.43M | paired/batch/result.100k.a62abe1.json |
 | 2026-06-30 | 142k | a62abe1+batch | laptop (smoke) | batch | 766.1k | 2017 B | 184 MiB | 1.23M | paired/batch/result.142k.a62abe1.json |
+| 2026-06-30 | 1m (wide) | 569a53a | laptop (smoke) | batch | 708.8k | 2101 B | 1.24 GiB | 592.7k | wide1m/result.1m.569a53a.json |
+
+The 1m (wide) row is the first run on the realistic multi-TLD corpus: `corpus/build/wide.dedup.jsonl`, 1,053,092 distinct URLs over 64,554 hosts (16.31 urls/host, Zipfian), pulled by `scripts/pull-corpus.sh` across six single-page-heavy TLDs (.dev/.app/.xyz/.page/.io/.me). Earlier rows used the narrow 11-host github-concentrated corpus. The shape and throughput numbers are laptop smoke (relative only); the deterministic size anchors (bytes/url, bits/url) are box-independent and reported under F2 and in doc 14.
 
 ## Findings
 
@@ -61,4 +64,18 @@ The numbers above are laptop smoke, good for the relative before/after; a box-of
 
 ```
 go tool pprof -top scale-results/paired/batch/pprof/cpu.seed.142k.pprof
+```
+
+### F2: the F1 batch fix holds flat to 1M, and resident bytes/url is stable across scale
+
+Two things to confirm at 1M on the realistic corpus. First, that the O(n log n) batch seed path from F1 does not collapse at 10x the largest profile it was tuned against. Second, that the resident-memory cost per URL, the number doc 12 extrapolates to the 100M uncapped falsifier, is stable as the URL count grows and not an artifact of the small profiles.
+
+Seed throughput at 1M (wide corpus) is 708.8k urls/cpu-s, essentially the 766.1k the batch path held at 142k. The loop path would have fallen below 50k here on its O(n^2) curve; the batch path stays in its flat band, so the F1 fix scales through 1M. Run/drain holds at 592.7k urls/cpu-s with 0 GC cycles, the same drain shape as the smaller profiles.
+
+Resident bytes per URL is the load-bearing number. Peak RSS at the end of seed is 1327972352 bytes over 1053092 distinct URLs, which is 1260.8 resident bytes/url. Doc 12 §3 derived 1358.7 bytes/url from the 142k seed (184 MiB / 142k) and used it for the 100M uncapped extrapolation of about 136 GB. The 1M measurement lands at 1260.8, within 7.5 percent of that derivation across a 7x jump in scale. The per-url resident cost is therefore stable, not a small-profile artifact, and the 136 GB uncapped-at-100M falsifier holds (1260.8 B/url x 100M is 117 GB, still far past any server2/server3 box, the same conclusion). This is the empirical backing for doc 12's claim that the residency model, not raw resident slices, is what a single box needs to clear 100M.
+
+The deterministic size anchors from the matching bench run on the same corpus (box-independent): 24.58 bytes/url on disk, 11.02 seen-set bits/url, 0.82 percent false-positive rate, 0 false negatives over 1,049,819 URLs / 64,554 hosts. These reproduce the per-partition numbers doc 14 carries and confirm the wider host mix shifts bytes/url only slightly (24.58 vs 25.05 on the narrow corpus), exactly the host-mix drift doc 01 predicted.
+
+```
+go tool pprof -top scale-results/wide1m/pprof/cpu.seed.1m.pprof
 ```

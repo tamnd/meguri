@@ -97,6 +97,23 @@ func (r *Reader) URLZone(col int) (min, max uint64, ok bool) {
 	return 0, 0, false
 }
 
+// Header returns the file's decoded header: partition id, build time, codec, key
+// range, and row counts. It is the cheap metadata a recovering store reads to
+// rebuild its shell without decoding a single body column.
+func (r *Reader) Header() Header { return *r.header }
+
+// Hosts decodes the whole host table into records. The host table is the small
+// region of the file, one row per host rather than per URL, so it is materialized
+// whole where the URL table streams. A recovering engine reads it to rebuild the
+// resident host map from the mapped file without decoding the URL body.
+func (r *Reader) Hosts() ([]m.HostRecord, error) {
+	cols, err := decodeColumnRegion(r.file, r.footer.hostDir)
+	if err != nil {
+		return nil, err
+	}
+	return hostRecordsFromColumns(cols, r.HostCount())
+}
+
 // projectURL decodes only the named URL columns, verifying each one's CRC. It is
 // the projection primitive: a caller that needs three columns pays to decode
 // three, not all twenty-three. An unknown column id is skipped, so the returned

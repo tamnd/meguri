@@ -481,11 +481,12 @@ func (s *Store) commit(part *format.Partition) error {
 
 	nextGen := s.gen + 1
 	snapName := fmt.Sprintf("snap-%d.meguri", nextGen)
-	img, err := format.Encode(part)
-	if err != nil {
-		return err
-	}
-	if err := writeFileSync(s.snapPath(snapName), img); err != nil {
+	// Stream the snapshot to disk one region at a time rather than materializing
+	// the whole image and writing it in a second pass: at 100M urls the doubled
+	// in-memory image is several GB of avoidable checkpoint transient on top of the
+	// record slice the snapshot already pays (scale doc 12, F4). EncodeToFile
+	// produces byte-identical output, pinned by TestEncodeToFileMatchesEncode.
+	if err := format.EncodeToFile(s.snapPath(snapName), part); err != nil {
 		return err
 	}
 

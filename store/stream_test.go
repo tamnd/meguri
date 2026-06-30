@@ -110,3 +110,41 @@ func TestCheckpointStreamingRecoverIdentity(t *testing.T) {
 		t.Fatalf("snapshot-only record lost: ok=%v url=%q", ok, r.Str(snapOnly.URLRef))
 	}
 }
+
+// TestCheckpointStreamingSpillArenaRecover is the gate for the 100M run config:
+// SpillArena on (strings live in arena.bin, s.arena is nil) AND the bounded
+// CheckpointStreaming path. The strings must survive the checkpoint and a reopen.
+// Without the fix, snapshotShell reads the nil resident arena, the snapshot carries
+// no string region, the log holding the intern frames is reclaimed on rotation, and
+// every URL string comes back empty.
+func TestCheckpointStreamingSpillArenaRecover(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir, Options{Durability: DurabilityNormal, SpillArena: true, ArenaBudget: 16 << 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 400
+	for i := range n {
+		s.PutURL(mkURL(t, s, fmt.Sprintf("h%d.test", i%10), fmt.Sprintf("/p%d", i), float32(i)))
+	}
+	if err := s.CheckpointStreaming(64); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	r, err := Open(dir, Options{Durability: DurabilityNormal, SpillArena: true, ArenaBudget: 16 << 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if r.URLCount() != n {
+		t.Fatalf("recovered %d URLs, want %d", r.URLCount(), n)
+	}
+	got, ok := r.GetURL(meguri.MakeURLKey("h3.test", "/p3"))
+	if !ok {
+		t.Fatalf("record h3.test/p3 missing after streamed spill checkpoint")
+	}
+	if u := r.Str(got.URLRef); u != "http://h3.test/p3" {
+		t.Fatalf("arena string lost across streamed spill checkpoint: got %q want %q", u, "http://h3.test/p3")
+	}
+}

@@ -49,7 +49,7 @@ func (s *Store) snapshotShell() *format.Partition {
 		lo, hi = hosts[0].HostKey, hosts[len(hosts)-1].HostKey
 	}
 	s.arenaMu.Lock()
-	strs := append([]byte(nil), s.arena...)
+	strs := s.readArenaRegion()
 	s.arenaMu.Unlock()
 	return &format.Partition{
 		ID:           s.id,

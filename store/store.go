@@ -254,6 +254,26 @@ func (s *Store) flushArena() error {
 	return nil
 }
 
+// readArenaRegion returns the whole string region as a flat buffer for the
+// checkpoint's snapshot string region, the durable home of the canonical URL
+// strings (spec 2072 doc 05 section 2b). The caller holds arenaMu. In spill mode
+// the resident s.arena is nil, so the region is read back from the spill file
+// (the pending tail flushed first so the file holds it all); this is a
+// checkpoint-time full read, not a steady-state cost, and the streaming
+// checkpoint explicitly materializes the arena in its shell. Without spill the
+// resident arena is copied directly.
+func (s *Store) readArenaRegion() []byte {
+	if s.spill == nil {
+		return append([]byte(nil), s.arena...)
+	}
+	_ = s.flushArena()
+	strs := make([]byte, s.arenaLen)
+	if _, err := s.spillFile.ReadAt(strs, 0); err != nil {
+		return strs[:0]
+	}
+	return strs
+}
+
 func (s *Store) superPath() string           { return filepath.Join(s.dir, "super") }
 func (s *Store) logPath(name string) string  { return filepath.Join(s.dir, name) }
 func (s *Store) snapPath(name string) string { return filepath.Join(s.dir, name) }
@@ -729,21 +749,7 @@ func (s *Store) snapshotPartition() *format.Partition {
 		lo, hi = hosts[0].HostKey, hosts[len(hosts)-1].HostKey
 	}
 	s.arenaMu.Lock()
-	var strs []byte
-	if s.spill != nil {
-		// Read the whole spill region back for the portable snapshot string region.
-		// This is a checkpoint-time full read, not a steady-state cost; the streaming
-		// checkpoint's arena handling (doc 2072 D9) is the follow-on that avoids even
-		// this materialization. Flush the pending tail first so the file holds the
-		// whole region before it is read back.
-		_ = s.flushArena()
-		strs = make([]byte, s.arenaLen)
-		if _, err := s.spillFile.ReadAt(strs, 0); err != nil {
-			strs = strs[:0]
-		}
-	} else {
-		strs = append([]byte(nil), s.arena...)
-	}
+	strs := s.readArenaRegion()
 	s.arenaMu.Unlock()
 	return &format.Partition{
 		ID:           s.id,

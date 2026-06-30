@@ -2,9 +2,11 @@ package main
 
 import (
 	"bufio"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -31,6 +33,7 @@ import (
 // host, path key from the canonical path).
 type corpusSource struct {
 	f   *os.File
+	gz  *gzip.Reader
 	sc  *bufio.Scanner
 	cnt int
 }
@@ -40,9 +43,22 @@ func newCorpusSource(path string) (*corpusSource, error) {
 	if err != nil {
 		return nil, err
 	}
-	sc := bufio.NewScanner(bufio.NewReader(f))
+	var r io.Reader = bufio.NewReaderSize(f, 1<<20)
+	var gz *gzip.Reader
+	// A gzipped corpus streams through the decompressor so the 100M run never has
+	// to spend the disk on an uncompressed copy; the box of record holds the corpus
+	// as a 1.6 GB .gz, not a 10 GB .jsonl.
+	if strings.HasSuffix(path, ".gz") {
+		gz, err = gzip.NewReader(r)
+		if err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		r = gz
+	}
+	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 1<<20), 1<<24)
-	return &corpusSource{f: f, sc: sc}, nil
+	return &corpusSource{f: f, gz: gz, sc: sc}, nil
 }
 
 func (s *corpusSource) Next() (live.Item, bool, error) {
@@ -78,7 +94,12 @@ func (s *corpusSource) Next() (live.Item, bool, error) {
 	return live.Item{}, false, nil
 }
 
-func (s *corpusSource) close() error { return s.f.Close() }
+func (s *corpusSource) close() error {
+	if s.gz != nil {
+		_ = s.gz.Close()
+	}
+	return s.f.Close()
+}
 
 // scaleDrainFetcher is the offline fetcher the scale runner binds so the run stage
 // measures the frontier, not the network: every dispatched URL is marked crawled

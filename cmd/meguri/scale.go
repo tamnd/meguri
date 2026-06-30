@@ -19,6 +19,7 @@ import (
 	"github.com/tamnd/meguri/format"
 	"github.com/tamnd/meguri/frontier"
 	"github.com/tamnd/meguri/scale"
+	"github.com/tamnd/meguri/store"
 )
 
 // scaleDrainFetcher is the offline fetcher the scale runner binds so the run stage
@@ -50,6 +51,8 @@ func newScaleCmd() *cobra.Command {
 		outDir    string
 		doRun     bool
 		doInspect bool
+		doIngest  bool
+		residentBudget int
 		seedMode  string
 	)
 	cmd := &cobra.Command{
@@ -221,6 +224,109 @@ func newScaleCmd() *cobra.Command {
 				result.Stages = append(result.Stages, runStage)
 			}
 
+			// Ingest stage: drive the durable store path with a resident budget so
+			// the resident heap is bounded while the corpus grows past it. This is the
+			// only path that bounds memory for a 100M single-box run: the seed and run
+			// stages above hold the whole frontier resident (the 10M ceiling), while
+			// this stage caps the resident records at --resident-budget and spills the
+			// cold bulk to the log, the larger-than-memory residency of doc 11 and the
+			// 100M efficiency ceiling of scale doc 12. It builds the same records the
+			// frontier seed path builds (StatusScheduled, SourceSeed, the host record
+			// per distinct host) but writes them straight to the store so a cold record
+			// never has to be resident. It measures held heap (which should flatten at
+			// the budget), resident count, on-disk bytes, and a durable checkpoint.
+			if doIngest {
+				storeDir := filepath.Join(outDir, fmt.Sprintf("%s.store", tag))
+				if err := os.RemoveAll(storeDir); err != nil {
+					return err
+				}
+				var (
+					ingestHeld    uint64
+					ingestResident int
+					ingestDisk    uint64
+					ingestSnap    uint64
+				)
+				ingestStage, err := profiledStage(pprofDir, "ingest", tag, func() (scale.StageResult, error) {
+					return scale.StageResultFromIngest(len(lines), func() (uint64, error) {
+						st, e := store.Open(storeDir, store.Options{
+							Durability:     store.DurabilityNormal,
+							ResidentBudget: residentBudget,
+						})
+						if e != nil {
+							return 0, e
+						}
+						seen := make(map[uint64]struct{}, 1<<16)
+						for _, ln := range lines {
+							hk := meguri.HostKeyOf(ln.host)
+							if _, ok := seen[hk]; !ok {
+								seen[hk] = struct{}{}
+								hostRef, he := st.Intern(ln.host)
+								if he != nil {
+									return 0, he
+								}
+								if _, he := st.PutHost(&meguri.HostRecord{
+									HostKey:    hk,
+									HostRef:    hostRef,
+									Grouping:   meguri.GroupFullHost,
+									CrawlDelay: 100,
+								}); he != nil {
+									return 0, he
+								}
+							}
+							urlRef, ue := st.Intern(ln.url)
+							if ue != nil {
+								return 0, ue
+							}
+							key := meguri.URLKey{HostKey: hk, PathKey: meguri.PathKeyOf(frontier.PathOf(ln.url))}
+							if _, pe := st.PutURL(&meguri.URLRecord{
+								URLKey:          key,
+								HostKey:         hk,
+								Status:          meguri.StatusScheduled,
+								Priority:        0.5,
+								URLRef:          urlRef,
+								DiscoverySource: meguri.SourceSeed,
+							}); pe != nil {
+								return 0, pe
+							}
+						}
+						// Held residency: the live heap the store holds with the budget
+						// in force, measured before the checkpoint so it is the capped
+						// resident footprint, not the checkpoint encode spike.
+						ingestHeld = scale.HeldHeap(st)
+						ingestResident = st.Resident()
+						// A zero budget never tracks the resident counter (every record
+						// stays resident), so the resident count is the full live set.
+						if residentBudget <= 0 {
+							ingestResident = st.URLCount()
+						}
+						ingestDisk = dirSize(storeDir)
+						if ce := st.Checkpoint(); ce != nil {
+							return 0, ce
+						}
+						ingestSnap = dirSize(storeDir)
+						if ce := st.Close(); ce != nil {
+							return 0, ce
+						}
+						return ingestDisk, nil
+					})
+				})
+				if err != nil {
+					return fmt.Errorf("ingest stage: %w", err)
+				}
+				ingestStage.Mem.HeldHeapInUse = ingestHeld
+				budgetNote := "unbounded"
+				if residentBudget > 0 {
+					budgetNote = fmt.Sprintf("budget %d", residentBudget)
+				}
+				ingestStage.Notes = fmt.Sprintf(
+					"%s: %d resident of %d urls, held heap %.1f B/url, log %.1f B/url, checkpoint total %.1f B/url",
+					budgetNote, ingestResident, ingestStage.URLs,
+					float64(ingestHeld)/float64(max(ingestResident, 1)),
+					float64(ingestDisk)/float64(max(ingestStage.URLs, 1)),
+					float64(ingestSnap)/float64(max(ingestStage.URLs, 1)))
+				result.Stages = append(result.Stages, ingestStage)
+			}
+
 			// Write the JSON ledger entry and the human summary.
 			jsonPath := filepath.Join(outDir, fmt.Sprintf("result.%s.%s.json", tag, shortCommit(commit)))
 			jf, err := os.Create(jsonPath)
@@ -245,6 +351,8 @@ func newScaleCmd() *cobra.Command {
 	cmd.Flags().StringVar(&outDir, "out", "", "directory for results and profiles (default scale-results)")
 	cmd.Flags().BoolVar(&doRun, "run", true, "drive the run stage (engine drain) in addition to seed")
 	cmd.Flags().BoolVar(&doInspect, "inspect", true, "drive the inspect stage (read the checkpoint back and decode it) after seed")
+	cmd.Flags().BoolVar(&doIngest, "ingest", false, "drive the ingest stage (durable store path with a resident budget, the bounded-memory 100M path)")
+	cmd.Flags().IntVar(&residentBudget, "resident-budget", 0, "max resident URL records during ingest, 0 = unbounded (the budget the held heap flattens at)")
 	cmd.Flags().StringVar(&seedMode, "seed-mode", "batch", "seed intake path: batch (DRUM merge, the default) or loop (per-key, the pre-fix baseline)")
 	return cmd
 }
@@ -325,6 +433,27 @@ func profiledStage(dir, stage, tag string, fn func() (scale.StageResult, error))
 	}
 	_ = hf.Close()
 	return res, nil
+}
+
+// dirSize sums the byte size of every regular file directly under dir, the
+// on-disk footprint of a store partition (its log, snapshot, and superblock). It
+// is the bytes-on-disk denominator the ingest stage reports, measured by walking
+// the directory rather than tracking writes so it counts exactly what landed.
+func dirSize(dir string) uint64 {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	var total uint64
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if info, err := e.Info(); err == nil {
+			total += uint64(info.Size())
+		}
+	}
+	return total
 }
 
 func shortCommit(c string) string {

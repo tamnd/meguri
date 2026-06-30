@@ -43,6 +43,14 @@ func StageResultFromRun(urls int, fn func() (written uint64, err error)) (StageR
 	return stageMetrics("run", urls, fn)
 }
 
+// StageResultFromIngest measures an ingest-type stage: fn drives the durable
+// store path with a resident budget, building and writing one record per URL so
+// the cold bulk spills to the log rather than staying resident. urls is the input
+// URL count, the denominator for ingest throughput and the bytes-on-disk ratio.
+func StageResultFromIngest(urls int, fn func() (written uint64, err error)) (StageResult, error) {
+	return stageMetrics("ingest", urls, fn)
+}
+
 // StageResultFromInspect measures an inspect-type stage: fn reads a .meguri
 // checkpoint off disk and decodes its columns, returning the bytes it read.
 // urls is the URL count the decode reconstructed, the denominator for the

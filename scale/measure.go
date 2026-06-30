@@ -43,6 +43,43 @@ func StageResultFromRun(urls int, fn func() (written uint64, err error)) (StageR
 	return stageMetrics("run", urls, fn)
 }
 
+// StageResultFromInspect measures an inspect-type stage: fn reads a .meguri
+// checkpoint off disk and decodes its columns, returning the bytes it read.
+// urls is the URL count the decode reconstructed, the denominator for the
+// decode throughput. The bytes are accounted as read, not written, so this is
+// the one stage that fills the disk read side of the ledger.
+func StageResultFromInspect(urls int, fn func() (read uint64, err error)) (StageResult, error) {
+	res, err := stageMetrics("inspect", urls, fn)
+	if err != nil {
+		return res, err
+	}
+	read := res.Disk.BytesWritten
+	res.Disk = DiskSummary{BytesRead: read}
+	return res, nil
+}
+
+// WithURLs restamps a stage's URL denominator and recomputes the per-URL and
+// throughput fields from it. It is for a stage that does not know its work count
+// until fn has run (an inspect decode learns the URL count only after decoding),
+// so it measures with urls=0 and restamps the real count here. Wall, CPU, and
+// allocation totals are unchanged; only the denominated ratios are recomputed.
+func WithURLs(res StageResult, urls int) StageResult {
+	res.URLs = urls
+	res.URLsPerSecond = 0
+	res.URLsPerCPUSec = 0
+	res.AllocBytesPerURL = 0
+	if urls > 0 {
+		if res.WallSeconds > 0 {
+			res.URLsPerSecond = float64(urls) / res.WallSeconds
+		}
+		if res.CPU.UserSeconds > 0 {
+			res.URLsPerCPUSec = float64(urls) / res.CPU.UserSeconds
+		}
+		res.AllocBytesPerURL = float64(res.Mem.TotalAllocBytes) / float64(urls)
+	}
+	return res
+}
+
 // stageMetrics runs fn as a measured stage and returns its StageResult. It pins the
 // goroutine, forces a GC so the heap baseline is clean, snapshots getrusage and
 // MemStats, runs fn under a heap sampler, then snapshots again and differences the

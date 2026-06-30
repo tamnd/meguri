@@ -16,6 +16,7 @@ import (
 	"github.com/tamnd/meguri"
 	"github.com/tamnd/meguri/engine"
 	"github.com/tamnd/meguri/fetch"
+	"github.com/tamnd/meguri/format"
 	"github.com/tamnd/meguri/frontier"
 	"github.com/tamnd/meguri/scale"
 )
@@ -46,9 +47,10 @@ func newScaleCmd() *cobra.Command {
 		profile  string
 		box      string
 		commit   string
-		outDir   string
-		doRun    bool
-		seedMode string
+		outDir    string
+		doRun     bool
+		doInspect bool
+		seedMode  string
 	)
 	cmd := &cobra.Command{
 		Use:   "scale",
@@ -148,6 +150,43 @@ func newScaleCmd() *cobra.Command {
 			seedStage.Notes = fmt.Sprintf("%d urls resident after dedup", seeded.Len())
 			result.Stages = append(result.Stages, seedStage)
 
+			// Inspect stage: read the checkpoint the seed stage wrote back off disk
+			// and decode every column. This is the only stage that touches the disk
+			// read path and the full columnar decode (zstd, FSST, the urlkey and host
+			// columns), so it fills the bytes_read side of the ledger and the decode
+			// throughput the recovery and serve stages build on. It reads the whole
+			// file, the cold-restore cost, not the tail-only inspect cmd shortcut.
+			if doInspect {
+				ckptPath := filepath.Join(outDir, fmt.Sprintf("%s.seed.meguri", tag))
+				inspectStage, err := profiledStage(pprofDir, "inspect", tag, func() (scale.StageResult, error) {
+					var decoded int
+					res, e := scale.StageResultFromInspect(0, func() (uint64, error) {
+						raw, e := os.ReadFile(ckptPath)
+						if e != nil {
+							return 0, e
+						}
+						part, e := format.Decode(raw)
+						if e != nil {
+							return 0, e
+						}
+						decoded = len(part.URLs)
+						return uint64(len(raw)), nil
+					})
+					if e != nil {
+						return res, e
+					}
+					// Restamp the URL denominator now that the decode reported it, so
+					// the per-URL decode throughput uses the real reconstructed count.
+					res = scale.WithURLs(res, decoded)
+					return res, nil
+				})
+				if err != nil {
+					return fmt.Errorf("inspect stage: %w", err)
+				}
+				inspectStage.Notes = fmt.Sprintf("%d urls decoded from checkpoint", inspectStage.URLs)
+				result.Stages = append(result.Stages, inspectStage)
+			}
+
 			// Run stage: drive the staged engine loop with the offline drain
 			// fetcher under a logical clock, so politeness waits collapse and the
 			// scheduler selection path is what we measure. Re-seed a fresh frontier
@@ -198,6 +237,7 @@ func newScaleCmd() *cobra.Command {
 	cmd.Flags().StringVar(&commit, "commit", "", "meguri commit the run was built from")
 	cmd.Flags().StringVar(&outDir, "out", "", "directory for results and profiles (default scale-results)")
 	cmd.Flags().BoolVar(&doRun, "run", true, "drive the run stage (engine drain) in addition to seed")
+	cmd.Flags().BoolVar(&doInspect, "inspect", true, "drive the inspect stage (read the checkpoint back and decode it) after seed")
 	cmd.Flags().StringVar(&seedMode, "seed-mode", "batch", "seed intake path: batch (DRUM merge, the default) or loop (per-key, the pre-fix baseline)")
 	return cmd
 }

@@ -79,3 +79,22 @@ The deterministic size anchors from the matching bench run on the same corpus (b
 ```
 go tool pprof -top scale-results/wide1m/pprof/cpu.seed.1m.pprof
 ```
+
+### F3: the read path is cheap, decode runs ~6x faster than encode and near-allocation-free
+
+The harness measured seed (build a frontier) and run (drain it) but never read a checkpoint back, so the whole disk-read side of the ledger was zero. The inspect stage closes that: it reads the `.meguri` the seed stage wrote off disk and decodes every column (zstd, FSST, the urlkey and host columns), the cold-restore cost a serve or recovery stage pays before it can do anything.
+
+On the 1M wide corpus (commit 65ea059, laptop smoke, `scale-results/wide1m-io/`):
+
+| stage | wall | urls/s wall | peak heap | alloc/url | mallocs | disk |
+| --- | --- | --- | --- | --- | --- | --- |
+| seed (encode) | 1.4635 s | 719.6k | 1.39 GiB | 2101 B | 1,205,390 | 24.61 MiB written |
+| inspect (decode) | 0.2458 s | 4.27M | 496 MiB | 728 B | 330 | 24.61 MiB read |
+
+Decode is 5.9x faster than encode in wall time and reconstructs all 1,049,819 URLs from a 25,805,603-byte file, which is 24.58 bytes/url read, exactly the deterministic on-disk anchor the bench reports. The striking number is mallocs: the decode allocates 330 objects total, against the 1.2 million the seed allocates, because the columnar reader bulk-allocates each column once and slices into it rather than building a struct per URL. Peak heap during decode is 496 MiB against the seed's 1.39 GiB.
+
+The consequence for the larger goal: a cold restore of a 1M partition costs about a quarter second and half a gigabyte of heap on the smoke box, so the recovery and serve stages doc 07 builds on start from a cheap read, not an expensive rebuild. The number to watch as the profiles grow is whether decode stays near-allocation-free; the 330-malloc figure is the regression anchor. Box-of-record restamps the absolute wall time.
+
+```
+go tool pprof -top scale-results/wide1m-io/pprof/cpu.inspect.1m.pprof
+```

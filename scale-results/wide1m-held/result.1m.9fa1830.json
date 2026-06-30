@@ -1,0 +1,105 @@
+{
+  "profile": "1m",
+  "provenance": {
+    "box": "",
+    "commit": "9fa1830",
+    "corpus": "corpus/profiles/scale-1m.jsonl",
+    "goos": "darwin",
+    "goarch": "arm64",
+    "num_cpu": 10
+  },
+  "started_at": "2026-06-30T09:42:32Z",
+  "stages": [
+    {
+      "stage": "seed",
+      "urls": 1053092,
+      "wall_seconds": 1.515253333,
+      "cpu": {
+        "user_seconds": 1.555687,
+        "sys_seconds": 0.124961
+      },
+      "mem": {
+        "peak_rss_bytes": 1407844352,
+        "peak_heap_inuse_bytes": 1508597760,
+        "held_heap_inuse_bytes": 502964224,
+        "total_alloc_bytes": 2212782176,
+        "mallocs": 1205388,
+        "num_gc": 7,
+        "gc_pause_total_ns": 306167,
+        "gc_cpu_fraction": 0.012968481096424985
+      },
+      "disk": {
+        "bytes_written": 25805603,
+        "bytes_read": 0,
+        "output_bytes": 25805603,
+        "fsync_count": 0,
+        "fsync_p50_ms": 0,
+        "fsync_p99_ms": 0
+      },
+      "urls_per_second": 694994.0165549862,
+      "urls_per_cpu_second": 676930.5136573103,
+      "alloc_bytes_per_url": 2101.223991825975,
+      "notes": "1049819 urls resident after dedup, held heap 479.1 bytes/url"
+    },
+    {
+      "stage": "inspect",
+      "urls": 1049819,
+      "wall_seconds": 0.25951675,
+      "cpu": {
+        "user_seconds": 0.325157,
+        "sys_seconds": 0.025559
+      },
+      "mem": {
+        "peak_rss_bytes": 1409859584,
+        "peak_heap_inuse_bytes": 574177280,
+        "total_alloc_bytes": 764076456,
+        "mallocs": 318,
+        "num_gc": 4,
+        "gc_pause_total_ns": 166876,
+        "gc_cpu_fraction": 0.009769983919246064
+      },
+      "disk": {
+        "bytes_written": 0,
+        "bytes_read": 25805603,
+        "output_bytes": 0,
+        "fsync_count": 0,
+        "fsync_p50_ms": 0,
+        "fsync_p99_ms": 0
+      },
+      "urls_per_second": 4045284.167592265,
+      "urls_per_cpu_second": 3228652.6201188965,
+      "alloc_bytes_per_url": 727.8173247007342,
+      "notes": "1049819 urls decoded from checkpoint"
+    },
+    {
+      "stage": "run",
+      "urls": 1049819,
+      "wall_seconds": 1.145246666,
+      "cpu": {
+        "user_seconds": 1.675317,
+        "sys_seconds": 0.687738
+      },
+      "mem": {
+        "peak_rss_bytes": 1410531328,
+        "peak_heap_inuse_bytes": 620240896,
+        "total_alloc_bytes": 152683176,
+        "mallocs": 1234326,
+        "num_gc": 0,
+        "gc_pause_total_ns": 0,
+        "gc_cpu_fraction": 0.009783507509092867
+      },
+      "disk": {
+        "bytes_written": 0,
+        "bytes_read": 0,
+        "output_bytes": 0,
+        "fsync_count": 0,
+        "fsync_p50_ms": 0,
+        "fsync_p99_ms": 0
+      },
+      "urls_per_second": 916675.0108661744,
+      "urls_per_cpu_second": 626639.0181679049,
+      "alloc_bytes_per_url": 145.43761924674635
+    }
+  ],
+  "pprof_dir": "scale-results/wide1m-held/pprof"
+}

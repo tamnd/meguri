@@ -140,6 +140,28 @@ func (s *SeenSet) Insert(key meguri.URLKey) {
 	}
 }
 
+// InsertBatch folds a batch of keys into both tiers in one DRUM pass per bucket,
+// the insert-only scale form of Insert: Merge is to Seen what this is to Insert.
+// It routes the keys to buckets by HostKey prefix and merges each bucket's run
+// against its sorted run once, so n inserts cost one sorted merge per bucket
+// rather than n shifts into the middle of a sorted slice (the O(n^2) the single-
+// key add pays at scale, doc 08 section 4.3). The caller owns classification: this
+// returns nothing, so it suits a seed loop that has already decided every key is
+// new (it deduplicates again internally, so a repeat is harmless, not doubled).
+func (s *SeenSet) InsertBatch(keys []meguri.URLKey) {
+	if len(keys) == 0 {
+		return
+	}
+	batch := make([]pendingKey, len(keys))
+	for i, k := range keys {
+		batch[i] = pendingKey{key: k, op: opInsertOnly}
+	}
+	s.exact.merge(batch)
+	for _, k := range keys {
+		s.filter.add(k)
+	}
+}
+
 // Len reports the number of distinct keys the exact set holds.
 func (s *SeenSet) Len() int { return s.exact.size }
 

@@ -1,6 +1,11 @@
 package format
 
-import m "github.com/tamnd/meguri"
+import (
+	"bufio"
+	"os"
+
+	m "github.com/tamnd/meguri"
+)
 
 // trailerSize is the fixed tail every file ends with: footer_length u32,
 // footer_crc32c u32, end magic.
@@ -142,6 +147,169 @@ func Encode(p *Partition) ([]byte, error) {
 	tail.bytes(Magic[:])
 	out = append(out, tail.b...)
 	return out, nil
+}
+
+// EncodeToFile writes a Partition's complete .meguri file to path, producing the
+// exact bytes Encode produces but streaming one region at a time so the whole
+// image is never held in memory at once. Encode accumulates every region and then
+// a second full-image copy in its output slice; at 100M URLs that doubled image is
+// several GB of avoidable checkpoint transient on top of the record materialization
+// the snapshot already pays (scale doc 12, F4). This builds each region, writes it
+// through a buffered writer, and drops it before building the next, so the resident
+// cost is the largest single region (the URL table or the string blob), not their
+// sum plus a copy. The header's FooterOffset is known only after the body is sized,
+// so a zero placeholder goes down first and the real header is written last with
+// WriteAt at offset 0; everything between is written front to back.
+//
+// The output is byte-for-byte identical to Encode(p): the same regions in the same
+// order, the same footer, trailer, and header. TestEncodeToFileMatchesEncode pins
+// the equality on the real corpus, so the streaming path can never drift from the
+// in-memory one without the gate catching it.
+func EncodeToFile(path string, p *Partition) (err error) {
+	if !sortedURLs(p.URLs) {
+		return ErrNotSorted
+	}
+	if !sortedHosts(p.Hosts) {
+		return ErrNotSorted
+	}
+
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := f.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
+	w := bufio.NewWriterSize(f, 1<<20)
+
+	codec := p.DefaultCodec
+	pos := uint64(HeaderSize)
+	if _, err = w.Write(make([]byte, HeaderSize)); err != nil {
+		return err
+	}
+
+	// writeRegion streams one region's bytes and records its descriptor, the same
+	// (id, offset, length, crc) Encode lays into the footer. The region slice is the
+	// caller's local and goes out of scope after the call, so the next region builds
+	// against the freed heap rather than alongside it.
+	var regions []regionDesc
+	writeRegion := func(id uint8, region []byte) error {
+		off := pos
+		if _, e := w.Write(region); e != nil {
+			return e
+		}
+		pos += uint64(len(region))
+		regions = append(regions, regionDesc{id: id, offset: off, length: uint64(len(region)), crc: crc32c(region)})
+		return nil
+	}
+
+	// URL and host tables: always present, always carry a descriptor (Encode adds
+	// both unconditionally). Their column directories feed the footer's stats.
+	urlRegion, urlDir := encodeColumnRegion(urlColumns(p.URLs, codec), pos, p.MaxPageRows)
+	if err = writeRegion(RegionURLTable, urlRegion); err != nil {
+		return err
+	}
+	urlRegion = nil
+
+	hostRegion, hostDir := encodeColumnRegion(hostColumns(p.Hosts, codec), pos, p.MaxPageRows)
+	if err = writeRegion(RegionHostTable, hostRegion); err != nil {
+		return err
+	}
+	hostRegion = nil
+
+	// Schedule, seen-set, and string blob: each present only when it has content,
+	// matching Encode's conditional descriptors and flags exactly.
+	if p.BuildSchedule {
+		if sched := encodeScheduleRegion(p.URLs, codec); len(sched) > 0 {
+			if err = writeRegion(RegionSchedule, sched); err != nil {
+				return err
+			}
+		}
+	}
+	if seen := encodeSeensetRegion(p.SeenFilter, uint64(len(p.URLs)), codec); len(seen) > 0 {
+		if err = writeRegion(RegionSeenset, seen); err != nil {
+			return err
+		}
+	}
+	if blob := encodeBlobRegion(p.Strings, codec); len(blob) > 0 {
+		if err = writeRegion(RegionStringBlob, blob); err != nil {
+			return err
+		}
+	}
+
+	footerOff := pos
+
+	totalComp := dirTotals(urlDir) + dirTotals(hostDir)
+	totalUncomp := uncompTotals(urlDir) + uncompTotals(hostDir)
+	dueMin, dueMax := dueRange(p.URLs)
+	stats := statsBlock{
+		urlCount:          uint64(len(p.URLs)),
+		hostCount:         uint64(len(p.Hosts)),
+		hostKeyLo:         p.HostKeyLo,
+		hostKeyHi:         p.HostKeyHi,
+		dueMin:            dueMin,
+		dueMax:            dueMax,
+		totalCompressed:   totalComp,
+		totalUncompressed: totalUncomp,
+	}
+	if len(p.URLs) > 0 {
+		stats.bytesPerURL = float32(footerOff) / float32(len(p.URLs))
+	}
+	footerBytes := encodeFooter(&footerData{
+		regions: regions,
+		urlDir:  urlDir,
+		hostDir: hostDir,
+		stats:   stats,
+		meta:    metaPairs(p.Meta),
+	})
+	if _, err = w.Write(footerBytes); err != nil {
+		return err
+	}
+
+	var tail wbuf
+	tail.u32(uint32(len(footerBytes)))
+	tail.u32(crc32c(footerBytes))
+	tail.bytes(Magic[:])
+	if _, err = w.Write(tail.b); err != nil {
+		return err
+	}
+	if err = w.Flush(); err != nil {
+		return err
+	}
+
+	// The header is the same byte sequence Encode writes, with FooterOffset now
+	// known. It goes to offset 0 over the placeholder; WriteAt bypasses the flushed
+	// buffer, so the flush above must precede it.
+	flags := FlagSorted
+	if _, ok := findRegion(regions, RegionSchedule); ok {
+		flags |= FlagHasSchedule
+	}
+	if _, ok := findRegion(regions, RegionSeenset); ok {
+		flags |= FlagHasSeenset
+	}
+	if _, ok := findRegion(regions, RegionStringBlob); ok {
+		flags |= FlagHasBlob
+	}
+	h := &Header{
+		VersionMajor: VersionMajor,
+		VersionMinor: VersionMinor,
+		PartitionID:  p.ID,
+		Flags:        flags,
+		ChecksumAlgo: ChecksumCRC32C,
+		DefaultCodec: codec,
+		HostKeyLo:    p.HostKeyLo,
+		HostKeyHi:    p.HostKeyHi,
+		URLCount:     uint64(len(p.URLs)),
+		HostCount:    uint64(len(p.Hosts)),
+		FooterOffset: footerOff,
+		CreatedHours: p.CreatedHours,
+	}
+	if _, err = f.WriteAt(h.Encode(), 0); err != nil {
+		return err
+	}
+	return f.Sync()
 }
 
 // Decode parses a complete .meguri file back into a Partition, verifying the

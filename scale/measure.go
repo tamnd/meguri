@@ -2,32 +2,18 @@ package scale
 
 import (
 	"runtime"
-	"syscall"
 	"time"
 )
 
 // rusageSnapshot is the OS resource view at a moment: cumulative user and system
 // CPU and the peak resident set so far. CPU is read as a delta across a stage; RSS
 // is a high-water mark the kernel maintains, so the value after a stage is the peak
-// the process reached during it.
+// the process reached during it. readRusage is supplied per platform (measure_unix.go
+// via getrusage, measure_windows.go via the process API).
 type rusageSnapshot struct {
 	user time.Duration
 	sys  time.Duration
 	rss  uint64
-}
-
-func readRusage() rusageSnapshot {
-	var ru syscall.Rusage
-	_ = syscall.Getrusage(syscall.RUSAGE_SELF, &ru)
-	return rusageSnapshot{
-		user: timevalDur(ru.Utime),
-		sys:  timevalDur(ru.Stime),
-		rss:  maxRSSBytes(ru.Maxrss),
-	}
-}
-
-func timevalDur(tv syscall.Timeval) time.Duration {
-	return time.Duration(tv.Sec)*time.Second + time.Duration(tv.Usec)*time.Microsecond
 }
 
 // StageResultFromSeed measures a seed-type stage: fn builds the frontier and

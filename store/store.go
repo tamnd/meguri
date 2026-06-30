@@ -74,6 +74,18 @@ type Store struct {
 	arenaMu sync.Mutex
 	arena   []byte // string region, uvarint-length-prefixed entries, offset 0 reserved
 
+	// Stage A spilled arena (spec 2072 doc 05): when set, the canonical-URL strings
+	// are not kept resident in arena above; they live in a derived spill file read
+	// by byte offset through a bounded LRU (spill), and arenaLen is the next offset
+	// the file will assign. arena stays nil in this mode. The spill file is a pure
+	// cache, rebuilt at Open from the snapshot string region plus the kindIntern log
+	// frames, so its durability is the log's, not its own.
+	spill        *spilledArena
+	spillFile    *os.File
+	arenaLen     int64  // next offset the spill file will assign (logical length)
+	arenaFlushed int64  // bytes of arenaLen already written to spillFile
+	arenaPending []byte // interned entries not yet flushed to spillFile
+
 	shards [numShards]urlShard
 
 	hostMu sync.Mutex
@@ -102,7 +114,20 @@ type Options struct {
 	ResidentBudget int        // max resident URL records, 0 = unbounded
 	PartitionID    uint32     // stamped into the .meguri snapshot
 	CreatedHours   uint32     // build time, epoch-hours
+
+	// SpillArena turns on the Stage A spilled arena (spec 2072 doc 05): the
+	// canonical-URL string region lives in a disk-backed spill file read through a
+	// bounded LRU instead of a fully resident []byte, removing ~70 B/url (~7 GiB at
+	// 100M) from the held heap. ArenaBudget is the LRU's resident byte ceiling
+	// (B_arena); 0 with SpillArena on picks a default working-set budget.
+	SpillArena  bool
+	ArenaBudget int64
 }
+
+// defaultArenaBudget is the B_arena used when SpillArena is on and ArenaBudget is
+// left 0: 64 MiB, the doc 52 measured sweet spot where the spill is a clear win on
+// the 10M corpus (the dispatch working set is far below the full arena at scale).
+const defaultArenaBudget = 64 << 20
 
 // Open opens or recovers a partition store rooted at dir. If dir holds a valid
 // checkpoint, Open loads the .meguri snapshot, rebuilds the index, and replays
@@ -143,7 +168,90 @@ func Open(dir string, opts Options) (*Store, error) {
 	if err := s.recover(meta); err != nil {
 		return nil, err
 	}
+	if opts.SpillArena {
+		budget := opts.ArenaBudget
+		if budget <= 0 {
+			budget = defaultArenaBudget
+		}
+		if err := s.enableArenaSpill(budget); err != nil {
+			return nil, err
+		}
+	}
 	return s, nil
+}
+
+// arenaPath is the spill file holding the disk-backed string region (Stage A). It
+// is a derived cache, rebuilt at every Open from the recovered resident arena, so
+// it carries no superblock pointer and needs no crash-consistency of its own.
+func (s *Store) arenaPath() string { return filepath.Join(s.dir, "arena.bin") }
+
+// enableArenaSpill switches the store onto the Stage A spilled arena (spec 2072
+// doc 05) after recover has rebuilt the resident arena. It writes the recovered
+// arena bytes to the spill file verbatim (so a byte offset into the file is the
+// same arena offset the resident []byte used), opens it for positioned reads
+// through a B_arena-bounded LRU, and drops the resident copy so the held heap no
+// longer carries the ~70 B/url string region. Offsets are preserved exactly, so
+// every URLRef a record holds resolves identically before and after the switch.
+func (s *Store) enableArenaSpill(budget int64) error {
+	s.arenaMu.Lock()
+	defer s.arenaMu.Unlock()
+
+	f, err := os.OpenFile(s.arenaPath(), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteAt(s.arena, 0); err != nil {
+		f.Close()
+		return err
+	}
+	s.arenaLen = int64(len(s.arena))
+	s.arenaFlushed = s.arenaLen // the initial region is fully on disk
+	s.spillFile = f
+	s.spill = newSpilledArena(f, s.arenaLen, budget)
+	s.arena = nil // free the resident region; the spill file is the source now
+	return nil
+}
+
+// arenaFlushThreshold is the pending-buffer size at which the spill appender
+// flushes to the file in one positioned write. Buffering turns the per-intern
+// WriteAt (one blocking syscall per URL, the dominant spill ingest cost measured
+// in doc 52) into one write per ~1 MiB of interned strings, roughly 15000 URLs,
+// without changing durability: arena.bin is a derived cache rebuilt from the
+// kindIntern log frames at Open, so an unflushed tail is recovered, not lost.
+const arenaFlushThreshold = 1 << 20
+
+// appendSpill buffers a freshly interned entry and returns the offset it was
+// placed at, advancing the logical arena length and the reader's size bound. The
+// bytes are flushed to the spill file in ~1 MiB blocks (flushArena), or on demand
+// before a read that would touch the unflushed tail. The caller holds arenaMu, so
+// the offset assignment and the buffer append are one step against any reader.
+func (s *Store) appendSpill(entry []byte) (uint64, error) {
+	off := uint64(s.arenaLen)
+	s.arenaPending = append(s.arenaPending, entry...)
+	s.arenaLen += int64(len(entry))
+	s.spill.setSize(s.arenaLen)
+	if len(s.arenaPending) >= arenaFlushThreshold {
+		if err := s.flushArena(); err != nil {
+			return 0, err
+		}
+	}
+	return off, nil
+}
+
+// flushArena writes the pending interned bytes to the spill file at the flushed
+// watermark and advances it. It is called under arenaMu when the buffer fills,
+// before a read of the unflushed tail, and before the checkpoint reads the whole
+// region back. A no-op when the buffer is empty.
+func (s *Store) flushArena() error {
+	if len(s.arenaPending) == 0 {
+		return nil
+	}
+	if _, err := s.spillFile.WriteAt(s.arenaPending, s.arenaFlushed); err != nil {
+		return err
+	}
+	s.arenaFlushed += int64(len(s.arenaPending))
+	s.arenaPending = s.arenaPending[:0]
+	return nil
 }
 
 func (s *Store) superPath() string           { return filepath.Join(s.dir, "super") }
@@ -167,11 +275,20 @@ func (s *Store) Intern(str string) (uint64, error) {
 	if str == "" {
 		return 0, nil
 	}
-	s.arenaMu.Lock()
-	off := uint64(len(s.arena))
 	entry := appendUvarint(nil, uint64(len(str)))
 	entry = append(entry, str...)
-	s.arena = append(s.arena, entry...)
+	s.arenaMu.Lock()
+	var off uint64
+	if s.spill != nil {
+		var err error
+		if off, err = s.appendSpill(entry); err != nil {
+			s.arenaMu.Unlock()
+			return 0, err
+		}
+	} else {
+		off = uint64(len(s.arena))
+		s.arena = append(s.arena, entry...)
+	}
 	s.arenaMu.Unlock()
 	if _, _, err := s.log.append(kindIntern, 0, nil, entry); err != nil {
 		return 0, err
@@ -185,6 +302,14 @@ func (s *Store) Intern(str string) (uint64, error) {
 func (s *Store) Str(off uint64) string {
 	s.arenaMu.Lock()
 	defer s.arenaMu.Unlock()
+	if s.spill != nil {
+		if off >= uint64(s.arenaFlushed) && off < uint64(s.arenaLen) {
+			if err := s.flushArena(); err != nil {
+				return ""
+			}
+		}
+		return s.spill.readArenaAt(off)
+	}
 	return readArena(s.arena, off)
 }
 
@@ -201,11 +326,20 @@ func (s *Store) InternRobots(blob []byte) (uint64, error) {
 		return 0, nil
 	}
 	packed := format.PackRobots(blob, s.codec)
-	s.arenaMu.Lock()
-	off := uint64(len(s.arena))
 	entry := appendUvarint(nil, uint64(len(packed)))
 	entry = append(entry, packed...)
-	s.arena = append(s.arena, entry...)
+	s.arenaMu.Lock()
+	var off uint64
+	if s.spill != nil {
+		var err error
+		if off, err = s.appendSpill(entry); err != nil {
+			s.arenaMu.Unlock()
+			return 0, err
+		}
+	} else {
+		off = uint64(len(s.arena))
+		s.arena = append(s.arena, entry...)
+	}
 	s.arenaMu.Unlock()
 	if _, _, err := s.log.append(kindIntern, 0, nil, entry); err != nil {
 		return 0, err
@@ -220,7 +354,18 @@ func (s *Store) InternRobots(blob []byte) (uint64, error) {
 // rather than panicking.
 func (s *Store) Robots(off uint64) []byte {
 	s.arenaMu.Lock()
-	packed := readArenaBytes(s.arena, off)
+	var packed []byte
+	if s.spill != nil {
+		if off >= uint64(s.arenaFlushed) && off < uint64(s.arenaLen) {
+			if err := s.flushArena(); err != nil {
+				s.arenaMu.Unlock()
+				return nil
+			}
+		}
+		packed = s.spill.readArenaBytesAt(off)
+	} else {
+		packed = readArenaBytes(s.arena, off)
+	}
 	codec := s.codec
 	s.arenaMu.Unlock()
 	if len(packed) == 0 {
@@ -473,6 +618,23 @@ func (s *Store) CheckpointFrom(part *format.Partition) error {
 // shared body of Checkpoint (snapshot sourced from the store's own index) and
 // CheckpointFrom (snapshot sourced from a caller's frontier).
 func (s *Store) commit(part *format.Partition) error {
+	// Stream the snapshot to disk one region at a time rather than materializing
+	// the whole image and writing it in a second pass: at 100M urls the doubled
+	// in-memory image is several GB of avoidable checkpoint transient on top of the
+	// record slice the snapshot already pays (scale doc 12, F4). EncodeToFile
+	// produces byte-identical output, pinned by TestEncodeToFileMatchesEncode.
+	return s.commitSnap(len(part.Strings), func(path string) error {
+		return format.EncodeToFile(path, part)
+	})
+}
+
+// commitSnap is the durable half every checkpoint shares: it writes the next
+// snapshot file (via writeSnap, which the caller picks: the materializing
+// EncodeToFile, or the bounded StreamEncodeToFile), rotates the log so
+// post-checkpoint updates continue the LSN sequence in a fresh log, and commits
+// the two-slot superblock only after the snapshot is durable. arenaLen is the
+// string region length the superblock records for recovery.
+func (s *Store) commitSnap(arenaLen int, writeSnap func(path string) error) error {
 	// The consistent cut: the frontier LSN the snapshot is consistent as of is the
 	// store's next LSN, captured before the rotation. The simplest correct cut for
 	// a frontier that can briefly pause its own dispatch is to checkpoint between
@@ -481,12 +643,7 @@ func (s *Store) commit(part *format.Partition) error {
 
 	nextGen := s.gen + 1
 	snapName := fmt.Sprintf("snap-%d.meguri", nextGen)
-	// Stream the snapshot to disk one region at a time rather than materializing
-	// the whole image and writing it in a second pass: at 100M urls the doubled
-	// in-memory image is several GB of avoidable checkpoint transient on top of the
-	// record slice the snapshot already pays (scale doc 12, F4). EncodeToFile
-	// produces byte-identical output, pinned by TestEncodeToFileMatchesEncode.
-	if err := format.EncodeToFile(s.snapPath(snapName), part); err != nil {
+	if err := writeSnap(s.snapPath(snapName)); err != nil {
 		return err
 	}
 
@@ -505,7 +662,7 @@ func (s *Store) commit(part *format.Partition) error {
 	meta := checkpointMeta{
 		gen:      nextGen,
 		frontier: frontier,
-		arenaLen: uint64(len(part.Strings)),
+		arenaLen: uint64(arenaLen),
 		snapshot: snapName,
 		logName:  newLogName,
 	}
@@ -572,7 +729,21 @@ func (s *Store) snapshotPartition() *format.Partition {
 		lo, hi = hosts[0].HostKey, hosts[len(hosts)-1].HostKey
 	}
 	s.arenaMu.Lock()
-	strs := append([]byte(nil), s.arena...)
+	var strs []byte
+	if s.spill != nil {
+		// Read the whole spill region back for the portable snapshot string region.
+		// This is a checkpoint-time full read, not a steady-state cost; the streaming
+		// checkpoint's arena handling (doc 2072 D9) is the follow-on that avoids even
+		// this materialization. Flush the pending tail first so the file holds the
+		// whole region before it is read back.
+		_ = s.flushArena()
+		strs = make([]byte, s.arenaLen)
+		if _, err := s.spillFile.ReadAt(strs, 0); err != nil {
+			strs = strs[:0]
+		}
+	} else {
+		strs = append([]byte(nil), s.arena...)
+	}
 	s.arenaMu.Unlock()
 	return &format.Partition{
 		ID:           s.id,

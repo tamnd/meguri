@@ -44,16 +44,21 @@ func (scaleDrainFetcher) Fetch(_ context.Context, req fetch.Request) (meguri.Out
 // job of `meguri bench`; this measures the numbers a clock and a box produce.
 func newScaleCmd() *cobra.Command {
 	var (
-		input    string
-		profile  string
-		box      string
-		commit   string
-		outDir    string
-		doRun     bool
-		doInspect bool
-		doIngest  bool
-		residentBudget int
-		seedMode  string
+		input            string
+		profile          string
+		box              string
+		commit           string
+		outDir           string
+		doSeed           bool
+		doRun            bool
+		doInspect        bool
+		doIngest         bool
+		residentBudget   int
+		seedMode         string
+		streamCheckpoint bool
+		pageRows         int
+		spillArena       bool
+		arenaBudget      int64
 	)
 	cmd := &cobra.Command{
 		Use:   "scale",
@@ -71,12 +76,22 @@ func newScaleCmd() *cobra.Command {
 				return err
 			}
 
-			lines, err := readCorpus(input)
-			if err != nil {
-				return err
-			}
-			if len(lines) == 0 {
-				return fmt.Errorf("corpus %s is empty", input)
+			// Only the seed, run, and inspect stages need the whole corpus resident
+			// (they iterate it more than once and measure the engine, not the parser).
+			// The ingest stage streams the corpus a line at a time, so a pure-ingest
+			// run never materializes the ~12 GB slice that, on top of a resident seed
+			// frontier, is what pins a 100M run past a 64 GB box.
+			needLines := doSeed || doRun || doInspect
+			var lines []corpusLine
+			if needLines {
+				loaded, lerr := readCorpus(input)
+				if lerr != nil {
+					return lerr
+				}
+				if len(loaded) == 0 {
+					return fmt.Errorf("corpus %s is empty", input)
+				}
+				lines = loaded
 			}
 
 			pprofDir := filepath.Join(outDir, "pprof")
@@ -130,35 +145,37 @@ func newScaleCmd() *cobra.Command {
 			// Seed stage: frontier.New, intake every URL, CheckpointBytes. The CPU
 			// profile wraps it so the intake hot path (canonicalize, hash, dedup,
 			// append, then encode) is captured for doc 05's cross-size comparison.
-			var seeded *frontier.Frontier
-			var heldHeap uint64
-			seedStage, err := profiledStage(pprofDir, "seed", tag, func() (scale.StageResult, error) {
-				return scale.StageResultFromSeed(len(lines), func() (uint64, error) {
-					fr := frontier.New(1, 0)
-					seedInto(fr)
-					// Held residency: the live heap the built frontier holds, measured
-					// before the checkpoint encode so it is the resident footprint the
-					// budget caps, not the one-shot encode spike the peak RSS captures.
-					heldHeap = scale.HeldHeap(fr)
-					blob, e := fr.CheckpointBytes()
-					if e != nil {
-						return 0, e
-					}
-					seeded = fr
-					ckptPath := filepath.Join(outDir, fmt.Sprintf("%s.seed.meguri", tag))
-					if e := os.WriteFile(ckptPath, blob, 0o644); e != nil {
-						return 0, e
-					}
-					return uint64(len(blob)), nil
+			if doSeed {
+				var seeded *frontier.Frontier
+				var heldHeap uint64
+				seedStage, err := profiledStage(pprofDir, "seed", tag, func() (scale.StageResult, error) {
+					return scale.StageResultFromSeed(len(lines), func() (uint64, error) {
+						fr := frontier.New(1, 0)
+						seedInto(fr)
+						// Held residency: the live heap the built frontier holds, measured
+						// before the checkpoint encode so it is the resident footprint the
+						// budget caps, not the one-shot encode spike the peak RSS captures.
+						heldHeap = scale.HeldHeap(fr)
+						blob, e := fr.CheckpointBytes()
+						if e != nil {
+							return 0, e
+						}
+						seeded = fr
+						ckptPath := filepath.Join(outDir, fmt.Sprintf("%s.seed.meguri", tag))
+						if e := os.WriteFile(ckptPath, blob, 0o644); e != nil {
+							return 0, e
+						}
+						return uint64(len(blob)), nil
+					})
 				})
-			})
-			if err != nil {
-				return fmt.Errorf("seed stage: %w", err)
+				if err != nil {
+					return fmt.Errorf("seed stage: %w", err)
+				}
+				seedStage.Mem.HeldHeapInUse = heldHeap
+				seedStage.Notes = fmt.Sprintf("%d urls resident after dedup, held heap %.1f bytes/url",
+					seeded.Len(), float64(heldHeap)/float64(seeded.Len()))
+				result.Stages = append(result.Stages, seedStage)
 			}
-			seedStage.Mem.HeldHeapInUse = heldHeap
-			seedStage.Notes = fmt.Sprintf("%d urls resident after dedup, held heap %.1f bytes/url",
-				seeded.Len(), float64(heldHeap)/float64(seeded.Len()))
-			result.Stages = append(result.Stages, seedStage)
 
 			// Inspect stage: read the checkpoint the seed stage wrote back off disk
 			// and decode every column. This is the only stage that touches the disk
@@ -241,28 +258,36 @@ func newScaleCmd() *cobra.Command {
 					return err
 				}
 				var (
-					ingestHeld    uint64
+					ingestHeld     uint64
 					ingestResident int
-					ingestDisk    uint64
-					ingestSnap    uint64
+					ingestURLs     int
+					ingestDisk     uint64
+					ingestSnap     uint64
 				)
 				ingestStage, err := profiledStage(pprofDir, "ingest", tag, func() (scale.StageResult, error) {
 					return scale.StageResultFromIngest(len(lines), func() (uint64, error) {
 						st, e := store.Open(storeDir, store.Options{
 							Durability:     store.DurabilityNormal,
 							ResidentBudget: residentBudget,
+							SpillArena:     spillArena,
+							ArenaBudget:    arenaBudget,
 						})
 						if e != nil {
 							return 0, e
 						}
+						// Host dedup is the one resident structure ingest keeps: a set of
+						// distinct host keys (millions, not the 100M URL count), so it stays
+						// small. Everything per-URL spills to the store's log.
 						seen := make(map[uint64]struct{}, 1<<16)
-						for _, ln := range lines {
+						ingestURLs = 0
+						ingestOne := func(ln corpusLine) error {
+							ingestURLs++
 							hk := meguri.HostKeyOf(ln.host)
 							if _, ok := seen[hk]; !ok {
 								seen[hk] = struct{}{}
 								hostRef, he := st.Intern(ln.host)
 								if he != nil {
-									return 0, he
+									return he
 								}
 								if _, he := st.PutHost(&meguri.HostRecord{
 									HostKey:    hk,
@@ -270,12 +295,12 @@ func newScaleCmd() *cobra.Command {
 									Grouping:   meguri.GroupFullHost,
 									CrawlDelay: 100,
 								}); he != nil {
-									return 0, he
+									return he
 								}
 							}
 							urlRef, ue := st.Intern(ln.url)
 							if ue != nil {
-								return 0, ue
+								return ue
 							}
 							key := meguri.URLKey{HostKey: hk, PathKey: meguri.PathKeyOf(frontier.PathOf(ln.url))}
 							if _, pe := st.PutURL(&meguri.URLRecord{
@@ -286,8 +311,20 @@ func newScaleCmd() *cobra.Command {
 								URLRef:          urlRef,
 								DiscoverySource: meguri.SourceSeed,
 							}); pe != nil {
-								return 0, pe
+								return pe
 							}
+							return nil
+						}
+						// When a resident stage already loaded the corpus, reuse the slice;
+						// otherwise stream it off disk so the ingest holds no corpus in RAM.
+						if lines != nil {
+							for _, ln := range lines {
+								if e := ingestOne(ln); e != nil {
+									return 0, e
+								}
+							}
+						} else if e := streamCorpus(input, ingestOne); e != nil {
+							return 0, e
 						}
 						// Held residency: the live heap the store holds with the budget
 						// in force, measured before the checkpoint so it is the capped
@@ -300,7 +337,16 @@ func newScaleCmd() *cobra.Command {
 							ingestResident = st.URLCount()
 						}
 						ingestDisk = dirSize(storeDir)
-						if ce := st.Checkpoint(); ce != nil {
+						// The bounded checkpoint (spec 2072 D9): stream the snapshot
+						// through the 256-shard k-way merge so the encode never
+						// materializes the partition, the transient that OOMs a 64 GB
+						// box at 100M. Byte-identical to the materializing path at the
+						// same page cap (TestCheckpointStreamingMatchesMaterialized).
+						if streamCheckpoint {
+							if ce := st.CheckpointStreaming(pageRows); ce != nil {
+								return 0, ce
+							}
+						} else if ce := st.Checkpoint(); ce != nil {
 							return 0, ce
 						}
 						ingestSnap = dirSize(storeDir)
@@ -312,6 +358,11 @@ func newScaleCmd() *cobra.Command {
 				})
 				if err != nil {
 					return fmt.Errorf("ingest stage: %w", err)
+				}
+				// A streamed ingest measured with urls=0 (the count is known only after
+				// the pass); restamp the real URL count so the per-URL ratios are right.
+				if lines == nil {
+					ingestStage = scale.WithURLs(ingestStage, ingestURLs)
 				}
 				ingestStage.Mem.HeldHeapInUse = ingestHeld
 				budgetNote := "unbounded"
@@ -349,11 +400,16 @@ func newScaleCmd() *cobra.Command {
 	cmd.Flags().StringVar(&box, "box", "", "box-of-record label (e.g. server2); empty means a smoke run, not a number of record")
 	cmd.Flags().StringVar(&commit, "commit", "", "meguri commit the run was built from")
 	cmd.Flags().StringVar(&outDir, "out", "", "directory for results and profiles (default scale-results)")
+	cmd.Flags().BoolVar(&doSeed, "seed", true, "drive the seed stage (resident frontier intake); set false for a pure bounded ingest run")
 	cmd.Flags().BoolVar(&doRun, "run", true, "drive the run stage (engine drain) in addition to seed")
 	cmd.Flags().BoolVar(&doInspect, "inspect", true, "drive the inspect stage (read the checkpoint back and decode it) after seed")
 	cmd.Flags().BoolVar(&doIngest, "ingest", false, "drive the ingest stage (durable store path with a resident budget, the bounded-memory 100M path)")
 	cmd.Flags().IntVar(&residentBudget, "resident-budget", 0, "max resident URL records during ingest, 0 = unbounded (the budget the held heap flattens at)")
 	cmd.Flags().StringVar(&seedMode, "seed-mode", "batch", "seed intake path: batch (DRUM merge, the default) or loop (per-key, the pre-fix baseline)")
+	cmd.Flags().BoolVar(&streamCheckpoint, "stream-checkpoint", false, "ingest checkpoint via the bounded k-way shard-merge stream (spec 2072 D9) instead of materializing the partition")
+	cmd.Flags().IntVar(&pageRows, "page-rows", 65536, "column page-row cap for the streaming checkpoint (must be > 0 for the bounded transient)")
+	cmd.Flags().BoolVar(&spillArena, "spill-arena", false, "spill the canonical-URL string arena to disk read through a bounded LRU (spec 2072 Stage A), removing ~70 B/url from the held heap")
+	cmd.Flags().Int64Var(&arenaBudget, "arena-budget", 0, "resident byte ceiling for the spilled arena LRU (B_arena); 0 picks the 64 MiB default")
 	return cmd
 }
 
@@ -363,17 +419,18 @@ type corpusLine struct {
 	host string
 }
 
-// readCorpus loads the CDX JSONL corpus into memory once so the seed and run
-// stages measure the engine, not the JSON parser. At 10M lines this is a few GB,
-// the same memory a fleet box holds the corpus in to seed a partition.
-func readCorpus(path string) ([]corpusLine, error) {
+// streamCorpus scans the CDX JSONL corpus a line at a time, decoding each into a
+// corpusLine and handing it to fn, holding no more than one line plus the scan
+// buffer in memory. It is the bounded intake the 100M ingest runs on: the corpus
+// never becomes a resident slice, so the only resident growth is the store's own
+// bounded structures. fn returning an error stops the scan and propagates it.
+func streamCorpus(path string, fn func(corpusLine) error) error {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer func() { _ = f.Close() }()
 
-	var out []corpusLine
 	sc := bufio.NewScanner(bufio.NewReader(f))
 	sc.Buffer(make([]byte, 0, 1<<20), 1<<24)
 	for sc.Scan() {
@@ -395,9 +452,24 @@ func readCorpus(path string) ([]corpusLine, error) {
 		if host == "" {
 			continue
 		}
-		out = append(out, corpusLine{url: rec.URL, host: host})
+		if err := fn(corpusLine{url: rec.URL, host: host}); err != nil {
+			return err
+		}
 	}
-	return out, sc.Err()
+	return sc.Err()
+}
+
+// readCorpus loads the CDX JSONL corpus into memory once so the seed and run
+// stages measure the engine, not the JSON parser. At 10M lines this is a few GB,
+// the same memory a fleet box holds the corpus in to seed a partition. The ingest
+// stage does not call this; it uses streamCorpus to stay bounded at 100M.
+func readCorpus(path string) ([]corpusLine, error) {
+	var out []corpusLine
+	err := streamCorpus(path, func(ln corpusLine) error {
+		out = append(out, ln)
+		return nil
+	})
+	return out, err
 }
 
 // profiledStage runs a stage under a CPU profile and writes a heap profile after,

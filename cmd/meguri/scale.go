@@ -42,12 +42,13 @@ func (scaleDrainFetcher) Fetch(_ context.Context, req fetch.Request) (meguri.Out
 // job of `meguri bench`; this measures the numbers a clock and a box produce.
 func newScaleCmd() *cobra.Command {
 	var (
-		input   string
-		profile string
-		box     string
-		commit  string
-		outDir  string
-		doRun   bool
+		input    string
+		profile  string
+		box      string
+		commit   string
+		outDir   string
+		doRun    bool
+		seedMode string
 	)
 	cmd := &cobra.Command{
 		Use:   "scale",
@@ -97,16 +98,38 @@ func newScaleCmd() *cobra.Command {
 				tag = "run"
 			}
 
-			// Seed stage: frontier.New, Seed every URL, CheckpointBytes. The CPU
+			// seedInto fills a fresh frontier from the corpus, either the per-key
+			// Seed loop (the O(n^2) intake the profiler flagged, kept as the "before"
+			// baseline) or the batched SeedBatch path (the fix, one DRUM merge per
+			// bucket). Both build an identical frontier; only the intake cost differs,
+			// which is exactly the number the paired before/after measures.
+			seedInto := func(fr *frontier.Frontier) {
+				if seedMode == "loop" {
+					for _, ln := range lines {
+						fr.Seed(ln.url, ln.host, 0.5, 0, 0, 10)
+					}
+					return
+				}
+				const window = 1 << 16
+				buf := make([]frontier.SeedSpec, 0, window)
+				for _, ln := range lines {
+					buf = append(buf, frontier.SeedSpec{URL: ln.url, Host: ln.host, Priority: 0.5, CrawlDelay: 10})
+					if len(buf) == window {
+						fr.SeedBatch(buf)
+						buf = buf[:0]
+					}
+				}
+				fr.SeedBatch(buf)
+			}
+
+			// Seed stage: frontier.New, intake every URL, CheckpointBytes. The CPU
 			// profile wraps it so the intake hot path (canonicalize, hash, dedup,
 			// append, then encode) is captured for doc 05's cross-size comparison.
 			var seeded *frontier.Frontier
 			seedStage, err := profiledStage(pprofDir, "seed", tag, func() (scale.StageResult, error) {
 				return scale.StageResultFromSeed(len(lines), func() (uint64, error) {
 					fr := frontier.New(1, 0)
-					for _, ln := range lines {
-						fr.Seed(ln.url, ln.host, 0.5, 0, 0, 10)
-					}
+					seedInto(fr)
 					blob, e := fr.CheckpointBytes()
 					if e != nil {
 						return 0, e
@@ -132,9 +155,7 @@ func newScaleCmd() *cobra.Command {
 			if doRun {
 				runStage, err := profiledStage(pprofDir, "run", tag, func() (scale.StageResult, error) {
 					fr := frontier.New(1, 0)
-					for _, ln := range lines {
-						fr.Seed(ln.url, ln.host, 0.5, 0, 0, 10)
-					}
+					seedInto(fr)
 					resident := fr.Len()
 					return scale.StageResultFromRun(resident, func() (uint64, error) {
 						eng := engine.New(fr, engine.Config{
@@ -177,6 +198,7 @@ func newScaleCmd() *cobra.Command {
 	cmd.Flags().StringVar(&commit, "commit", "", "meguri commit the run was built from")
 	cmd.Flags().StringVar(&outDir, "out", "", "directory for results and profiles (default scale-results)")
 	cmd.Flags().BoolVar(&doRun, "run", true, "drive the run stage (engine drain) in addition to seed")
+	cmd.Flags().StringVar(&seedMode, "seed-mode", "batch", "seed intake path: batch (DRUM merge, the default) or loop (per-key, the pre-fix baseline)")
 	return cmd
 }
 

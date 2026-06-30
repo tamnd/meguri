@@ -102,6 +102,18 @@ func (r *Reader) URLZone(col int) (min, max uint64, ok bool) {
 // rebuild its shell without decoding a single body column.
 func (r *Reader) Header() Header { return *r.header }
 
+// SeenFilter returns the serialized resident seen-set filter from the file's
+// seen-set region, or nil if the file has none. It is the bytes dedup.LoadFilter
+// restores, so a recovering engine reloads the approximate dedup tier from the
+// mapped file without re-adding every key (spec 2073 doc 08, the recovery path).
+func (r *Reader) SeenFilter() ([]byte, error) {
+	reg, ok := findRegion(r.footer.regions, RegionSeenset)
+	if !ok {
+		return nil, nil
+	}
+	return decodeSeensetRegion(r.file[reg.offset : reg.offset+reg.length])
+}
+
 // Hosts decodes the whole host table into records. The host table is the small
 // region of the file, one row per host rather than per URL, so it is materialized
 // whole where the URL table streams. A recovering engine reads it to rebuild the

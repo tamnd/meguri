@@ -61,6 +61,7 @@ func newScaleCmd() *cobra.Command {
 		arenaBudget      int64
 		diskIndex        bool
 		mergeBatch       int
+		doCheckpoint     bool
 	)
 	cmd := &cobra.Command{
 		Use:   "scale",
@@ -265,6 +266,7 @@ func newScaleCmd() *cobra.Command {
 					ingestURLs     int
 					ingestDisk     uint64
 					ingestSnap     uint64
+					ingestLat      latStats
 				)
 				ingestStage, err := profiledStage(pprofDir, "ingest", tag, func() (scale.StageResult, error) {
 					return scale.StageResultFromIngest(len(lines), func() (uint64, error) {
@@ -284,6 +286,7 @@ func newScaleCmd() *cobra.Command {
 						// small. Everything per-URL spills to the store's log.
 						seen := make(map[uint64]struct{}, 1<<16)
 						ingestURLs = 0
+						putLat := newLatHist()
 						ingestOne := func(ln corpusLine) error {
 							ingestURLs++
 							hk := meguri.HostKeyOf(ln.host)
@@ -307,6 +310,7 @@ func newScaleCmd() *cobra.Command {
 								return ue
 							}
 							key := meguri.URLKey{HostKey: hk, PathKey: meguri.PathKeyOf(frontier.PathOf(ln.url))}
+							t0 := time.Now()
 							if _, pe := st.PutURL(&meguri.URLRecord{
 								URLKey:          key,
 								HostKey:         hk,
@@ -317,6 +321,7 @@ func newScaleCmd() *cobra.Command {
 							}); pe != nil {
 								return pe
 							}
+							putLat.observe(time.Since(t0))
 							return nil
 						}
 						// When a resident stage already loaded the corpus, reuse the slice;
@@ -330,6 +335,7 @@ func newScaleCmd() *cobra.Command {
 						} else if e := streamCorpus(input, ingestOne); e != nil {
 							return 0, e
 						}
+						ingestLat = putLat.stats()
 						// Held residency: the live heap the store holds with the budget
 						// in force, measured before the checkpoint so it is the capped
 						// resident footprint, not the checkpoint encode spike.
@@ -346,12 +352,14 @@ func newScaleCmd() *cobra.Command {
 						// materializes the partition, the transient that OOMs a 64 GB
 						// box at 100M. Byte-identical to the materializing path at the
 						// same page cap (TestCheckpointStreamingMatchesMaterialized).
-						if streamCheckpoint {
-							if ce := st.CheckpointStreaming(pageRows); ce != nil {
+						if doCheckpoint {
+							if streamCheckpoint {
+								if ce := st.CheckpointStreaming(pageRows); ce != nil {
+									return 0, ce
+								}
+							} else if ce := st.Checkpoint(); ce != nil {
 								return 0, ce
 							}
-						} else if ce := st.Checkpoint(); ce != nil {
-							return 0, ce
 						}
 						ingestSnap = dirSize(storeDir)
 						if ce := st.Close(); ce != nil {
@@ -374,11 +382,12 @@ func newScaleCmd() *cobra.Command {
 					budgetNote = fmt.Sprintf("budget %d", residentBudget)
 				}
 				ingestStage.Notes = fmt.Sprintf(
-					"%s: %d resident of %d urls, held heap %.1f B/url, log %.1f B/url, checkpoint total %.1f B/url",
+					"%s: %d resident of %d urls, held heap %.1f B/url, disk %.1f B/url, checkpoint total %.1f B/url, PutURL p50 %s p90 %s p99 %s max %s",
 					budgetNote, ingestResident, ingestStage.URLs,
 					float64(ingestHeld)/float64(max(ingestResident, 1)),
 					float64(ingestDisk)/float64(max(ingestStage.URLs, 1)),
-					float64(ingestSnap)/float64(max(ingestStage.URLs, 1)))
+					float64(ingestSnap)/float64(max(ingestStage.URLs, 1)),
+					ingestLat.p50, ingestLat.p90, ingestLat.p99, ingestLat.max)
 				result.Stages = append(result.Stages, ingestStage)
 			}
 
@@ -416,6 +425,7 @@ func newScaleCmd() *cobra.Command {
 	cmd.Flags().Int64Var(&arenaBudget, "arena-budget", 0, "resident byte ceiling for the spilled arena LRU (B_arena); 0 picks the 64 MiB default")
 	cmd.Flags().BoolVar(&diskIndex, "disk-index", false, "hold the URL seen-set and location index on disk in the DRUM (spec 2072 Stage B), removing the ~80-90 B/url resident index term")
 	cmd.Flags().IntVar(&mergeBatch, "merge-batch", 0, "discoveries to accumulate before folding into the DRUM repository (0 picks the 2M default); smaller batches merge more often for less in-flight RAM")
+	cmd.Flags().BoolVar(&doCheckpoint, "checkpoint", true, "write the durable checkpoint after ingest; set false to measure pure ingest residency without the snapshot encode (the durable log+drum+arena store survives without the .meguri export)")
 	return cmd
 }
 
@@ -513,25 +523,85 @@ func profiledStage(dir, stage, tag string, fn func() (scale.StageResult, error))
 	return res, nil
 }
 
-// dirSize sums the byte size of every regular file directly under dir, the
-// on-disk footprint of a store partition (its log, snapshot, and superblock). It
-// is the bytes-on-disk denominator the ingest stage reports, measured by walking
-// the directory rather than tracking writes so it counts exactly what landed.
+// dirSize sums the byte size of every regular file under dir, recursing into
+// subdirectories, the full on-disk footprint of a store partition: its log and
+// superblock directly under dir, plus the DRUM repository and block index under
+// dir/drum. It walks the tree rather than tracking writes so it counts exactly
+// what landed, including the disk-index repository the earlier flat scan missed.
 func dirSize(dir string) uint64 {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return 0
-	}
 	var total uint64
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
+	_ = filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
 		}
-		if info, err := e.Info(); err == nil {
+		if !info.IsDir() {
 			total += uint64(info.Size())
 		}
-	}
+		return nil
+	})
 	return total
+}
+
+// latHist is a coarse log2-bucketed latency histogram for the PutURL hot path. It
+// holds one uint64 counter per power-of-two nanosecond bucket (bucket i counts
+// samples in [2^i, 2^(i+1)) ns), so observing a sample is one Leading-zeros and one
+// increment, no allocation and no lock, cheap enough to wrap every PutURL in a
+// 100M ingest. The percentile read walks the 64 buckets once and reports the
+// bucket's upper edge, so the figures are order-of-magnitude exact, which is all a
+// per-op latency at hundreds-of-nanoseconds scale needs to characterize the path.
+type latHist struct {
+	buckets [64]uint64
+	count   uint64
+}
+
+func newLatHist() *latHist { return &latHist{} }
+
+func (h *latHist) observe(d time.Duration) {
+	ns := uint64(d)
+	if ns == 0 {
+		ns = 1
+	}
+	b := 63
+	for ns>>b == 0 {
+		b--
+	}
+	h.buckets[b]++
+	h.count++
+}
+
+// latStats is the rendered percentile summary the ingest notes print.
+type latStats struct {
+	p50, p90, p99, max time.Duration
+}
+
+func (h *latHist) stats() latStats {
+	if h.count == 0 {
+		return latStats{}
+	}
+	edge := func(b int) time.Duration { return time.Duration(uint64(1) << uint(b+1)) }
+	pick := func(target uint64) time.Duration {
+		var cum uint64
+		for b := range 64 {
+			cum += h.buckets[b]
+			if cum >= target {
+				return edge(b)
+			}
+		}
+		return 0
+	}
+	var maxB int
+	for b := 63; b >= 0; b-- {
+		if h.buckets[b] > 0 {
+			maxB = b
+			break
+		}
+	}
+	return latStats{
+		p50: pick((h.count*50 + 99) / 100),
+		p90: pick((h.count*90 + 99) / 100),
+		p99: pick((h.count*99 + 99) / 100),
+		max: edge(maxB),
+	}
 }
 
 func shortCommit(c string) string {

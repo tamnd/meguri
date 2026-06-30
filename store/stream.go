@@ -33,7 +33,7 @@ func (s *Store) CheckpointStreaming(maxPageRows int) error {
 			return err
 		}
 		shell := s.snapshotShell()
-		return s.commitSnap(len(shell.Strings), func(path string) error {
+		return s.commitSnap(shellArenaLen(shell), func(path string) error {
 			src, err := newDrumSource(s)
 			if err != nil {
 				return err
@@ -43,7 +43,7 @@ func (s *Store) CheckpointStreaming(maxPageRows int) error {
 		})
 	}
 	shell := s.snapshotShell()
-	return s.commitSnap(len(shell.Strings), func(path string) error {
+	return s.commitSnap(shellArenaLen(shell), func(path string) error {
 		return format.StreamEncodeToFile(path, newMergeSource(s), maxPageRows, shell, s.dir)
 	})
 }
@@ -66,18 +66,42 @@ func (s *Store) snapshotShell() *format.Partition {
 	if len(hosts) > 0 {
 		lo, hi = hosts[0].HostKey, hosts[len(hosts)-1].HostKey
 	}
-	s.arenaMu.Lock()
-	strs := s.readArenaRegion()
-	s.arenaMu.Unlock()
-	return &format.Partition{
+	shell := &format.Partition{
 		ID:           s.id,
 		HostKeyLo:    lo,
 		HostKeyHi:    hi,
 		CreatedHours: s.created,
 		DefaultCodec: s.codec,
 		Hosts:        hosts,
-		Strings:      strs,
 	}
+	if s.spill != nil {
+		// Streaming blob region: hand the encoder the spill file as the arena source so
+		// the whole multi-gigabyte string region never lands in RAM. Flush the pending
+		// tail so the file holds [0, arenaLen); those bytes are append-only and immutable
+		// once flushed, so the encoder reads them by offset after the lock is released
+		// without racing a concurrent Intern that only ever grows the file past the cut.
+		s.arenaMu.Lock()
+		_ = s.flushArena()
+		shell.StringsAt = s.spillFile
+		shell.StringsSize = s.arenaLen
+		s.arenaMu.Unlock()
+		return shell
+	}
+	s.arenaMu.Lock()
+	shell.Strings = s.readArenaRegion()
+	s.arenaMu.Unlock()
+	return shell
+}
+
+// shellArenaLen is the durable string-region length the superblock records, so
+// recovery knows how much of the arena file the *Ref offsets index. It is the
+// streamed size in spill mode (StringsSize, the spill file's flushed cut) and the
+// materialized arena length otherwise.
+func shellArenaLen(shell *format.Partition) int {
+	if shell.StringsAt != nil {
+		return int(shell.StringsSize)
+	}
+	return len(shell.Strings)
 }
 
 // shardCursor walks one shard's live keys in ascending URLKey order, materializing

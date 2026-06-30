@@ -1,6 +1,9 @@
 package format
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"io"
+)
 
 // The string and blob region (doc 10 section 7) is the flat byte arena the
 // *Ref columns point into: the canonical URLs, the host and registrable-domain
@@ -28,17 +31,70 @@ func encodeBlobRegion(arena []byte, codec uint8) []byte {
 }
 
 // decodeBlobRegion recovers the string arena from a blob region's bytes,
-// verifying the page CRC and decompressing through the page's recorded codec.
+// verifying each page CRC and decompressing through its recorded codec.
+//
+// The materializing encode (encodeBlobRegion) writes the arena as one page, so
+// the common path is a single readPage. The streaming encode
+// (streamBlobRegion) writes the arena as a run of fixed-size pages concatenated
+// in order, so a 100M checkpoint never holds the whole multi-gigabyte arena in
+// RAM at once. Concatenating the pages' decoded payloads in order rebuilds the
+// exact uncompressed arena bytes either way, so the *Ref offsets the columns
+// carry resolve identically regardless of how many pages the region holds.
 func decodeBlobRegion(region []byte) ([]byte, error) {
 	if len(region) == 0 {
 		return nil, nil
 	}
-	_, arena, _, err := readPage(region)
-	if err != nil {
-		return nil, err
+	var arena []byte
+	for off := 0; off < len(region); {
+		_, payload, consumed, err := readPage(region[off:])
+		if err != nil {
+			return nil, err
+		}
+		arena = append(arena, payload...)
+		off += consumed
 	}
 	return arena, nil
 }
+
+// streamBlobRegion writes the string arena as a run of fixed-size blob pages,
+// each independently codec-framed, reading the arena from src through a bounded
+// chunk buffer so the encode's transient is one chunk, not the whole arena. The
+// decoded pages concatenate to the same bytes encodeBlobRegion would have
+// written as one page, so *Ref offsets are unchanged. It returns the number of
+// region bytes written. A zero size yields no region, matching M0.
+func streamBlobRegion(w io.Writer, src io.ReaderAt, size int64, chunk int, codec uint8) (int64, error) {
+	if size <= 0 {
+		return 0, nil
+	}
+	if chunk <= 0 {
+		chunk = blobStreamChunk
+	}
+	buf := make([]byte, chunk)
+	var written int64
+	for base := int64(0); base < size; {
+		n := chunk
+		if rem := size - base; rem < int64(n) {
+			n = int(rem)
+		}
+		if _, err := src.ReadAt(buf[:n], base); err != nil {
+			return written, err
+		}
+		page := writePage(PageBlob, EncRaw, codec, uint32(n), 0, uint64(base), buf[:n])
+		if _, err := w.Write(page); err != nil {
+			return written, err
+		}
+		written += int64(len(page))
+		base += int64(n)
+	}
+	return written, nil
+}
+
+// blobStreamChunk is the default uncompressed bytes per streamed blob page. It
+// bounds the streaming encode's transient (one chunk read plus its compressed
+// output) and is large enough that the per-page 32-byte header is negligible
+// against the arena: at 8 MiB a 6.5 GiB arena is about 830 pages, 26 KiB of
+// headers.
+const blobStreamChunk = 8 << 20
 
 // newArena returns a fresh string arena holding only the none sentinel: a
 // single zero byte at offset 0, so a zero *Ref reads back as absent (doc 10

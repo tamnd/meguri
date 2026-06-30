@@ -142,3 +142,134 @@ func TestDiskIndexSpillArena(t *testing.T) {
 		t.Fatalf("arena string lost across disk-index spill checkpoint: got %q want %q", u, "http://h3.test/p3")
 	}
 }
+
+// countInternFrames scans the store's current log and returns how many kindIntern
+// frames it holds, the per-string byte tax #43 set out to remove from the durable
+// tail when arena.bin is the string region's home.
+func countInternFrames(t *testing.T, s *Store) int {
+	t.Helper()
+	var n int
+	if err := s.log.replay(func(f frame) error {
+		if f.kind == kindIntern {
+			n++
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("replay log: %v", err)
+	}
+	return n
+}
+
+// TestDiskIndexSpillNoInternFrames is the #43 invariant: when the index is the DRUM
+// and the arena is spilled, the string region lives once in arena.bin, so the log
+// must carry no kindIntern frames at all. The same ingest into a disk-index store
+// without the spill keeps logging the frames, so the two counts bracket the change:
+// zero with the spill, one per distinct interned string without it.
+func TestDiskIndexSpillNoInternFrames(t *testing.T) {
+	const n = 2000
+	ingest := func(opt Options) *Store {
+		s, err := Open(t.TempDir(), opt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range n {
+			s.PutURL(mkURL(t, s, fmt.Sprintf("h%d.test", i%20), fmt.Sprintf("/p%d", i), float32(i)))
+		}
+		return s
+	}
+
+	spill := ingest(Options{Durability: DurabilityNormal, DiskIndex: true, SpillArena: true, ArenaBudget: 16 << 10})
+	defer spill.Close()
+	if got := countInternFrames(t, spill); got != 0 {
+		t.Fatalf("disk-index spill log carried %d kindIntern frames, want 0 (the strings are in arena.bin)", got)
+	}
+
+	plain := ingest(Options{Durability: DurabilityNormal, DiskIndex: true})
+	defer plain.Close()
+	// Each of the n distinct URL strings is interned and logged once, so the plain
+	// log carries one frame per URL: the per-string tax the spill removes entirely.
+	if got := countInternFrames(t, plain); got < n {
+		t.Fatalf("disk-index plain log carried %d kindIntern frames, want >= %d", got, n)
+	}
+}
+
+// TestDiskIndexSpillBoundedRecovery guards the latent OOM the #43 reopen path
+// closes: recovery must not rebuild the whole string region into RAM. After a
+// reopen the resident arena is nil and arena.bin is the source read through the
+// bounded LRU, so a 100M arena never has to fit in memory to recover. The pre-#43
+// path replayed every kindIntern frame back into a resident s.arena, which is the
+// 7.87 GB transient doc 01 named.
+func TestDiskIndexSpillBoundedRecovery(t *testing.T) {
+	dir := t.TempDir()
+	opt := Options{Durability: DurabilityNormal, DiskIndex: true, SpillArena: true, ArenaBudget: 16 << 10}
+	s, err := Open(dir, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 4000
+	for i := range n {
+		s.PutURL(mkURL(t, s, fmt.Sprintf("h%d.test", i%20), fmt.Sprintf("/p%d", i), float32(i)))
+	}
+	if err := s.CheckpointStreaming(256); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := Open(dir, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if r.arena != nil {
+		t.Fatalf("recovery rebuilt a resident arena of %d bytes, want nil (spill file is the source)", len(r.arena))
+	}
+	if r.spill == nil {
+		t.Fatal("reopened disk-index spill store has no spill reader")
+	}
+	// The strings still resolve, read back through the bounded reader off arena.bin.
+	got, ok := r.GetURL(meguri.MakeURLKey("h5.test", "/p25"))
+	if !ok || r.Str(got.URLRef) != "http://h5.test/p25" {
+		t.Fatalf("string unreadable after bounded recovery: ok=%v url=%q", ok, r.Str(got.URLRef))
+	}
+}
+
+// TestDiskIndexSpillPostCheckpointSurvives covers the Close flush path: a string
+// interned after the checkpoint lives only in the arena.bin tail, not in any
+// snapshot, so Close must flush and sync the pending tail or the reopened URLRef
+// dangles. With the kindIntern frame dropped there is no log copy to fall back on,
+// which is exactly why Close grew the spill flush.
+func TestDiskIndexSpillPostCheckpointSurvives(t *testing.T) {
+	dir := t.TempDir()
+	opt := Options{Durability: DurabilityNormal, DiskIndex: true, SpillArena: true, ArenaBudget: 16 << 10}
+	s, err := Open(dir, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 1000 {
+		s.PutURL(mkURL(t, s, fmt.Sprintf("h%d.test", i%20), fmt.Sprintf("/p%d", i), float32(i)))
+	}
+	if err := s.CheckpointStreaming(256); err != nil {
+		t.Fatal(err)
+	}
+	// This URL is interned only after the checkpoint, so it lives in the arena tail
+	// alone and Close must persist it.
+	post := mkURL(t, s, "late.test", "/fresh", 7)
+	if _, err := s.PutURL(post); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := Open(dir, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	got, ok := r.GetURL(meguri.MakeURLKey("late.test", "/fresh"))
+	if !ok || r.Str(got.URLRef) != "http://late.test/fresh" {
+		t.Fatalf("post-checkpoint intern lost across reopen: ok=%v url=%q", ok, r.Str(got.URLRef))
+	}
+}

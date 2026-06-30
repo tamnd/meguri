@@ -366,6 +366,71 @@ func locateRepo(bi *blockIndex, rf *os.File, key meguri.URLKey) (locEntry, bool,
 	return locEntry{}, false, nil
 }
 
+// Unmerged reports the number of discoveries routed since the last Merge, the
+// signal a host store uses to decide when to fold the in-flight batch into the
+// repository.
+func (d *DRUM) Unmerged() int64 { return d.unmerged.Load() }
+
+// ScanRepo walks the merged repository in URLKey order, calling fn for every live
+// (non-tombstoned) key with its location. It is the checkpoint and count path: the
+// repository is already globally sorted by URLKey, which is the snapshot's row
+// order, so a checkpoint streams straight from this scan with no extra sort or
+// k-way merge. The caller must Merge first so the repository reflects all
+// discoveries; ScanRepo reads only the on-disk repository, never the in-flight
+// buckets.
+func (d *DRUM) ScanRepo(fn func(key meguri.URLKey, off int64, lsn uint64) error) error {
+	rr, err := openRepoReader(d.repoPath, d.readBuf)
+	if err != nil {
+		return err
+	}
+	defer rr.close()
+	for {
+		e, ok, err := rr.next()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		if e.loc.tomb {
+			continue
+		}
+		if err := fn(e.key, e.loc.off, e.loc.lsn); err != nil {
+			return err
+		}
+	}
+}
+
+// RepoCursor is a pull-based sequential reader over the merged repository in
+// URLKey order, the streaming-checkpoint source (a host store wraps it to read
+// each record's body from the log and feed format.StreamEncodeToFile). It reads
+// only the on-disk repository; the caller Merges first so the repository is
+// current.
+type RepoCursor struct {
+	rr *repoReader
+}
+
+// OpenRepoCursor opens a cursor over the current repository.
+func (d *DRUM) OpenRepoCursor() (*RepoCursor, error) {
+	rr, err := openRepoReader(d.repoPath, d.readBuf)
+	if err != nil {
+		return nil, err
+	}
+	return &RepoCursor{rr: rr}, nil
+}
+
+// Next returns the next repository record: its key, location, and tombstone bit.
+// ok is false at end of repository.
+func (c *RepoCursor) Next() (key meguri.URLKey, off int64, lsn uint64, tomb bool, ok bool, err error) {
+	e, ok, err := c.rr.next()
+	if err != nil || !ok {
+		return meguri.URLKey{}, 0, 0, false, false, err
+	}
+	return e.key, e.loc.off, e.loc.lsn, e.loc.tomb, true, nil
+}
+
+func (c *RepoCursor) Close() error { return c.rr.close() }
+
 // Close flushes nothing implicitly (a caller checkpoints by calling Merge) and
 // releases the repository file handle. Buffered, unflushed discoveries are
 // re-derivable from the log, so closing without a final Merge loses no data.

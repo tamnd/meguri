@@ -24,6 +24,24 @@ import (
 // resulting file is identical to what Checkpoint would write for the same records
 // at the same page cap; only the path to it is bounded.
 func (s *Store) CheckpointStreaming(maxPageRows int) error {
+	if s.diskIndex {
+		// Fold the in-flight discoveries into the repository, then stream the snapshot
+		// straight from the sorted repository: no shard merge, no per-url key copy. The
+		// repository is already in URLKey order, so the source is a plain forward cursor
+		// reading each body from the log at the DRUM-stored offset (doc 04 section 6).
+		if err := s.forceMerge(); err != nil {
+			return err
+		}
+		shell := s.snapshotShell()
+		return s.commitSnap(len(shell.Strings), func(path string) error {
+			src, err := newDrumSource(s)
+			if err != nil {
+				return err
+			}
+			defer src.Close()
+			return format.StreamEncodeToFile(path, src, maxPageRows, shell, s.dir)
+		})
+	}
 	shell := s.snapshotShell()
 	return s.commitSnap(len(shell.Strings), func(path string) error {
 		return format.StreamEncodeToFile(path, newMergeSource(s), maxPageRows, shell, s.dir)
@@ -120,8 +138,8 @@ func (h cursorHeap) Len() int { return len(h) }
 func (h cursorHeap) Less(i, j int) bool {
 	return h[i].keys[h[i].i].Less(h[j].keys[h[j].i])
 }
-func (h cursorHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *cursorHeap) Push(x any)        { *h = append(*h, x.(*shardCursor)) }
+func (h cursorHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *cursorHeap) Push(x any)   { *h = append(*h, x.(*shardCursor)) }
 func (h *cursorHeap) Pop() any {
 	old := *h
 	n := len(old)

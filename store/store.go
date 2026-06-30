@@ -27,6 +27,7 @@ import (
 	"sync/atomic"
 
 	"github.com/tamnd/meguri"
+	"github.com/tamnd/meguri/drum"
 	"github.com/tamnd/meguri/format"
 )
 
@@ -88,6 +89,16 @@ type Store struct {
 
 	shards [numShards]urlShard
 
+	// Stage B disk index (spec 2072 doc 04): when set, the URL location index lives
+	// in an on-disk DRUM instead of the resident shards map, so the index no longer
+	// costs ~80-90 B/url resident (the ~8 GiB held heap the size ladder measured at
+	// 100M). The shards map stays allocated but unused for URLs in this mode; the
+	// host table and arena are unchanged. mergeBatch is the unmerged-discovery count
+	// that triggers a fold into the repository.
+	diskIndex  bool
+	drum       *drum.DRUM
+	mergeBatch int64
+
 	hostMu sync.Mutex
 	hosts  map[uint64]*hostLoc
 
@@ -122,7 +133,21 @@ type Options struct {
 	// (B_arena); 0 with SpillArena on picks a default working-set budget.
 	SpillArena  bool
 	ArenaBudget int64
+
+	// DiskIndex turns on the Stage B on-disk DRUM index (spec 2072 doc 04): the URL
+	// location index moves out of the resident shards map into a sorted on-disk
+	// repository, removing the ~80-90 B/url resident index term. MergeBatch is the
+	// number of buffered discoveries that triggers a merge into the repository; 0
+	// picks a default.
+	DiskIndex  bool
+	MergeBatch int
 }
+
+// defaultMergeBatch is the unmerged-discovery count that triggers a DRUM merge when
+// MergeBatch is left 0: 2,000,000 entries, large enough that each merge amortizes
+// the repository sweep over a big batch (doc 04 section 5.1) while keeping the
+// in-flight buffer and the staleness window bounded.
+const defaultMergeBatch = 2_000_000
 
 // defaultArenaBudget is the B_arena used when SpillArena is on and ArenaBudget is
 // left 0: 64 MiB, the doc 52 measured sweet spot where the spill is a clear win on
@@ -154,6 +179,18 @@ func Open(dir string, opts Options) (*Store, error) {
 	}
 	for i := range s.shards {
 		s.shards[i].m = make(map[meguri.URLKey]*urlLoc)
+	}
+	if opts.DiskIndex {
+		s.diskIndex = true
+		s.mergeBatch = int64(opts.MergeBatch)
+		if s.mergeBatch <= 0 {
+			s.mergeBatch = defaultMergeBatch
+		}
+		d, err := drum.Open(dir, drum.Options{})
+		if err != nil {
+			return nil, err
+		}
+		s.drum = d
 	}
 
 	meta, err := readSuperblock(s.superPath())
@@ -414,6 +451,19 @@ func (s *Store) PutURL(rec *meguri.URLRecord) (uint64, error) {
 		return 0, err
 	}
 
+	if s.diskIndex {
+		// The body is durable in the log frame at off; the DRUM holds only the
+		// location, folded into the repository on the next merge. No resident record,
+		// no resident index slot, so the held heap does not grow per URL.
+		if err := s.drum.Discover(rec.URLKey, off, lsn); err != nil {
+			return 0, err
+		}
+		if err := s.maybeMerge(); err != nil {
+			return 0, err
+		}
+		return lsn, nil
+	}
+
 	cp := *rec
 	sh := s.shard(rec.URLKey)
 	sh.mu.Lock()
@@ -435,6 +485,17 @@ func (s *Store) PutURL(rec *meguri.URLRecord) (uint64, error) {
 // GetURL returns the current record for key, materializing it from disk if it was
 // evicted. The bool is false if the key is absent or tombstoned.
 func (s *Store) GetURL(key meguri.URLKey) (meguri.URLRecord, bool) {
+	if s.diskIndex {
+		off, _, present, err := s.drum.Locate(key)
+		if err != nil || !present {
+			return meguri.URLRecord{}, false
+		}
+		_, _, _, val, err := s.log.readAt(off)
+		if err != nil {
+			return meguri.URLRecord{}, false
+		}
+		return decodeURL(key, val), true
+	}
 	sh := s.shard(key)
 	sh.mu.RLock()
 	loc := sh.m[key]
@@ -479,6 +540,12 @@ func (s *Store) DeleteURL(key meguri.URLKey) error {
 	}
 	if err := s.log.commit(off + int64(frameHeaderSize+16+4)); err != nil {
 		return err
+	}
+	if s.diskIndex {
+		if err := s.drum.Tombstone(key, off, lsn); err != nil {
+			return err
+		}
+		return s.maybeMerge()
 	}
 	sh := s.shard(key)
 	sh.mu.Lock()
@@ -531,6 +598,12 @@ func (s *Store) GetHost(key uint64) (meguri.HostRecord, bool) {
 
 // URLCount reports the number of live (non-tombstoned) URL records.
 func (s *Store) URLCount() int {
+	if s.diskIndex {
+		_ = s.forceMerge()
+		var n int
+		_ = s.drum.ScanRepo(func(meguri.URLKey, int64, uint64) error { n++; return nil })
+		return n
+	}
 	var n int
 	for i := range s.shards {
 		sh := &s.shards[i]
@@ -600,6 +673,11 @@ func (s *Store) Close() error {
 	if err := s.log.syncAll(); err != nil {
 		return err
 	}
+	if s.diskIndex && s.drum != nil {
+		if err := s.drum.Close(); err != nil {
+			return err
+		}
+	}
 	return s.log.close()
 }
 
@@ -667,6 +745,34 @@ func (s *Store) commitSnap(arenaLen int, writeSnap func(path string) error) erro
 		return err
 	}
 
+	if s.diskIndex {
+		// Disk-index mode: the DRUM repository is the durable index and the append-only
+		// log is the durable body store its offsets address, so the log is not rotated
+		// or reclaimed at a checkpoint. Rotating it would strand every offset the DRUM
+		// holds for a record that was not re-logged after the cut. The .meguri snapshot
+		// is written as a portable export (redistribution, cold archive), not as the
+		// local home of the bodies. Compacting the body log, or paging bodies out of the
+		// columnar snapshot so the log can be reclaimed, is the doc 14 follow-up; until
+		// then the body log grows with the corpus, which is the on-disk body term the
+		// size ladder already budgets, not a resident cost.
+		meta := checkpointMeta{
+			gen:      nextGen,
+			frontier: frontier,
+			arenaLen: uint64(arenaLen),
+			snapshot: snapName,
+			logName:  s.logName,
+		}
+		if err := writeSuperblock(s.superPath(), meta); err != nil {
+			return err
+		}
+		prevGen := s.gen
+		s.gen = nextGen
+		if prevGen > 0 {
+			_ = os.Remove(s.snapPath(fmt.Sprintf("snap-%d.meguri", prevGen)))
+		}
+		return nil
+	}
+
 	// Rotate to a fresh log that continues the LSN sequence, so post-checkpoint
 	// updates land in the new log and the old one becomes reclaimable.
 	newLogName := fmt.Sprintf("log-%d", nextGen+1)
@@ -711,28 +817,42 @@ func (s *Store) commitSnap(arenaLen int, writeSnap func(path string) error) erro
 // through the index means a larger-than-memory store checkpoints by streaming,
 // not by holding the whole frontier resident.
 func (s *Store) snapshotPartition() *format.Partition {
-	urls := make([]meguri.URLRecord, 0, s.URLCount())
-	for i := range s.shards {
-		sh := &s.shards[i]
-		sh.mu.RLock()
-		for key, loc := range sh.m {
-			if loc.tomb {
-				continue
-			}
-			if loc.rec != nil {
-				urls = append(urls, *loc.rec)
-				continue
-			}
-			off := loc.off
-			sh.mu.RUnlock()
+	var urls []meguri.URLRecord
+	if s.diskIndex {
+		// The repository is already globally sorted by URLKey, the snapshot's row
+		// order, so a scan yields the records in order with no extra sort. Bodies are
+		// read from the log at the location the DRUM stored.
+		_ = s.forceMerge()
+		_ = s.drum.ScanRepo(func(key meguri.URLKey, off int64, _ uint64) error {
 			if _, _, _, val, err := s.log.readAt(off); err == nil {
 				urls = append(urls, decodeURL(key, val))
 			}
+			return nil
+		})
+	} else {
+		urls = make([]meguri.URLRecord, 0, s.URLCount())
+		for i := range s.shards {
+			sh := &s.shards[i]
 			sh.mu.RLock()
+			for key, loc := range sh.m {
+				if loc.tomb {
+					continue
+				}
+				if loc.rec != nil {
+					urls = append(urls, *loc.rec)
+					continue
+				}
+				off := loc.off
+				sh.mu.RUnlock()
+				if _, _, _, val, err := s.log.readAt(off); err == nil {
+					urls = append(urls, decodeURL(key, val))
+				}
+				sh.mu.RLock()
+			}
+			sh.mu.RUnlock()
 		}
-		sh.mu.RUnlock()
+		sort.Slice(urls, func(i, j int) bool { return urls[i].URLKey.Less(urls[j].URLKey) })
 	}
-	sort.Slice(urls, func(i, j int) bool { return urls[i].URLKey.Less(urls[j].URLKey) })
 
 	s.hostMu.Lock()
 	hosts := make([]meguri.HostRecord, 0, len(s.hosts))
@@ -784,7 +904,14 @@ func (s *Store) recover(meta checkpointMeta) error {
 		s.created = part.CreatedHours
 		s.codec = part.DefaultCodec
 		s.hostKeyLo, s.hostKeyHi = part.HostKeyLo, part.HostKeyHi
-		if len(part.Strings) > 0 {
+		// In disk-index mode the log is never rotated (commitSnap keeps it as the body
+		// store), so it holds every intern frame since gen 0 and the replay below
+		// rebuilds the arena at its exact original offsets, starting from the same
+		// offset-0 sentinel. Loading the snapshot Strings too would prepend a full
+		// second copy, so a post-checkpoint re-intern (Intern never dedups) whose offset
+		// is L would resolve into the duplicated region instead of its own string. The
+		// snapshot is an export here, not the arena's home, so its Strings are not read.
+		if len(part.Strings) > 0 && !s.diskIndex {
 			s.arena = append([]byte(nil), part.Strings...)
 		}
 		// Snapshot rows load resident and pinned: their bodies have no log offset
@@ -794,9 +921,19 @@ func (s *Store) recover(meta checkpointMeta) error {
 		// churn of records pulled in, updated, and spilled (doc 11 section 6.3). A
 		// per-row random read of the columnar snapshot, which would let the cold base
 		// spill too, is the doc 14 follow-up.
-		for i := range part.URLs {
-			rec := part.URLs[i]
-			s.shard(rec.URLKey).m[rec.URLKey] = &urlLoc{rec: &rec, lsn: 0}
+		//
+		// In disk-index mode the URL index of record is the DRUM repository, which is
+		// durable on disk and reopened intact, so the snapshot rows are not loaded into
+		// any resident map and not re-fed to the DRUM: the .meguri snapshot is a
+		// projection of the repository (snapshotPartition streams it from ScanRepo), so
+		// the repository already holds every snapshot key. Migrating a non-disk-index
+		// snapshot into the DRUM is the doc 09 path and is not done here; disk-index
+		// stores are grown disk-index from the start.
+		if !s.diskIndex {
+			for i := range part.URLs {
+				rec := part.URLs[i]
+				s.shard(rec.URLKey).m[rec.URLKey] = &urlLoc{rec: &rec, lsn: 0}
+			}
 		}
 		for i := range part.Hosts {
 			h := part.Hosts[i]
@@ -820,6 +957,18 @@ func (s *Store) recover(meta checkpointMeta) error {
 			s.arena = append(s.arena, fr.val...)
 		case kindURL:
 			key := meguri.URLKeyFromBytes([16]byte(fr.key))
+			if s.diskIndex {
+				// The log frame carries the body's offset and lsn the DRUM indexes by,
+				// so replay folds the post-merge tail back into the DRUM. The tail is
+				// the writes since the last merge whose in-memory buckets were lost on
+				// the crash; re-feeding already-merged keys is idempotent (the merge
+				// dedups by key and keeps the highest lsn). A final merge after replay
+				// makes them durable in the repository again.
+				if fr.tomb {
+					return s.drum.Tombstone(key, fr.off, fr.lsn)
+				}
+				return s.drum.Insert(key, fr.off, fr.lsn)
+			}
 			sh := s.shard(key)
 			loc := sh.m[key]
 			if loc == nil {
@@ -851,6 +1000,15 @@ func (s *Store) recover(meta checkpointMeta) error {
 	})
 	if err != nil {
 		return err
+	}
+
+	// Fold the replayed tail into the repository so a point read right after Open is
+	// served from disk, not the overlay, and the next checkpoint streams a complete
+	// repository.
+	if s.diskIndex {
+		if err := s.forceMerge(); err != nil {
+			return err
+		}
 	}
 
 	// Resume past the highest durable LSN so the next write cannot collide with a

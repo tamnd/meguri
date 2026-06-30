@@ -56,6 +56,16 @@ func newSeedCmd() *cobra.Command {
 			skipped := 0
 			sc := bufio.NewScanner(bufio.NewReader(in))
 			sc.Buffer(make([]byte, 0, 1<<20), 1<<24)
+			// Intake a window at a time through the DRUM batch path: the seen-set
+			// folds each window in one sorted merge per bucket rather than shifting a
+			// sorted slice per key, the O(n^2) the per-key Seed loop pays on a host's
+			// run. The window is bounded so memory stays flat as the input grows.
+			const seedWindow = 1 << 16
+			window := make([]frontier.SeedSpec, 0, seedWindow)
+			flush := func() {
+				fr.SeedBatch(window)
+				window = window[:0]
+			}
 			for sc.Scan() {
 				line := strings.TrimSpace(sc.Text())
 				if line == "" {
@@ -74,11 +84,17 @@ func newSeedCmd() *cobra.Command {
 					skipped++
 					continue
 				}
-				fr.Seed(rec.URL, host, float32(priority), 0, 0, delay)
+				window = append(window, frontier.SeedSpec{
+					URL: rec.URL, Host: host, Priority: float32(priority), CrawlDelay: delay,
+				})
+				if len(window) == seedWindow {
+					flush()
+				}
 			}
 			if err := sc.Err(); err != nil {
 				return fmt.Errorf("read input: %w", err)
 			}
+			flush()
 
 			raw, err := fr.CheckpointBytes()
 			if err != nil {

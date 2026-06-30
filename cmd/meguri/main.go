@@ -29,6 +29,7 @@ func main() {
 	root.AddCommand(newMapCmd())
 	root.AddCommand(newPackCmd())
 	root.AddCommand(newRunCmd())
+	root.AddCommand(newScaleCmd())
 	root.AddCommand(newScheduleCmd())
 	root.AddCommand(newSeedCmd())
 	root.AddCommand(newServeCmd())

@@ -3,6 +3,8 @@ package format
 import (
 	"bytes"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"testing"
@@ -159,6 +161,59 @@ func TestByteStable(t *testing.T) {
 	}
 	if !bytes.Equal(a, c) {
 		t.Fatalf("decode then encode is not byte-stable")
+	}
+}
+
+// TestEncodeToFileMatchesEncode pins the streaming file encoder to the in-memory
+// one: EncodeToFile must produce the exact bytes Encode produces, across both
+// codecs and every optional region (schedule, seen-set, multi-page columns), so
+// the bounded-memory checkpoint path can never drift from the gated byte-stable
+// format without this catching it.
+func TestEncodeToFileMatchesEncode(t *testing.T) {
+	seen := make([]byte, 777)
+	for i := range seen {
+		seen[i] = byte(i*7 + 3)
+	}
+	cases := []struct {
+		name  string
+		build func(codec uint8) *Partition
+	}{
+		{"basic", func(c uint8) *Partition { return buildPartition(t, c) }},
+		{"schedule", func(c uint8) *Partition { p := buildPartition(t, c); p.BuildSchedule = true; return p }},
+		{"seenset", func(c uint8) *Partition { p := buildPartition(t, c); p.SeenFilter = seen; return p }},
+		{"multipage", func(c uint8) *Partition { p := buildPartition(t, c); p.MaxPageRows = 2; return p }},
+		{"all", func(c uint8) *Partition {
+			p := buildPartition(t, c)
+			p.BuildSchedule = true
+			p.SeenFilter = seen
+			p.MaxPageRows = 2
+			return p
+		}},
+	}
+	for _, tc := range cases {
+		for _, codec := range []uint8{CodecNone, CodecZstd} {
+			p := tc.build(codec)
+			want, err := Encode(p)
+			if err != nil {
+				t.Fatalf("%s codec %d: encode: %v", tc.name, codec, err)
+			}
+			path := filepath.Join(t.TempDir(), "out.meguri")
+			if err := EncodeToFile(path, p); err != nil {
+				t.Fatalf("%s codec %d: encode to file: %v", tc.name, codec, err)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("%s codec %d: read back: %v", tc.name, codec, err)
+			}
+			if !bytes.Equal(want, got) {
+				t.Fatalf("%s codec %d: streamed file differs from Encode (%d vs %d bytes)",
+					tc.name, codec, len(want), len(got))
+			}
+			// And it must decode cleanly, the same partition the in-memory path yields.
+			if _, err := Decode(got); err != nil {
+				t.Fatalf("%s codec %d: decode streamed file: %v", tc.name, codec, err)
+			}
+		}
 	}
 }
 

@@ -233,6 +233,32 @@ func (s *Store) enableArenaSpill(budget int64) error {
 	s.arenaMu.Lock()
 	defer s.arenaMu.Unlock()
 
+	// Disk-index spill mode: arena.bin is the durable home of the string region
+	// (#43), not a derived cache. Intern dropped the kindIntern frames, so the
+	// recovered resident arena is empty and the file on disk is the only record of
+	// the strings. Reopen it in place and take its byte length as the live arena
+	// length; truncating it (the fresh path below) would erase every interned URL.
+	// A zero-length or absent file means a fresh store, so fall through and create it.
+	// recover leaves the resident arena at the 1-byte offset-0 sentinel when no
+	// kindIntern frame was replayed (the #43 disk-index case), so sentinel-only
+	// counts as empty here; a larger arena means an older log still carried the
+	// frames and the create path below rebuilds arena.bin from them.
+	if s.diskIndex && len(s.arena) <= 1 {
+		if fi, err := os.Stat(s.arenaPath()); err == nil && fi.Size() > 0 {
+			f, err := os.OpenFile(s.arenaPath(), os.O_RDWR, 0o644)
+			if err != nil {
+				return err
+			}
+			n := fi.Size()
+			s.arenaLen = n
+			s.arenaFlushed = n
+			s.spillFile = f
+			s.spill = newSpilledArena(f, n, budget)
+			s.arena = nil
+			return nil
+		}
+	}
+
 	f, err := os.OpenFile(s.arenaPath(), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
@@ -347,11 +373,26 @@ func (s *Store) Intern(str string) (uint64, error) {
 		s.arena = append(s.arena, entry...)
 	}
 	s.arenaMu.Unlock()
-	if _, _, err := s.log.append(kindIntern, 0, nil, entry); err != nil {
-		return 0, err
+	// In disk-index spill mode the spill file is the durable home of the string
+	// region (#43), so the kindIntern frame is dropped: it would be a second copy of
+	// the bytes already in arena.bin, the single largest removable waste in the log
+	// (~79 B/url, the doc 00 disk drift). Recovery reads the strings back from
+	// arena.bin directly. Every other mode keeps logging the frame: resident-arena
+	// stores have no spill file, and non-disk-index spill stores rotate the log at
+	// each checkpoint and rebuild the post-checkpoint arena tail from it.
+	if !s.internDurableInArena() {
+		if _, _, err := s.log.append(kindIntern, 0, nil, entry); err != nil {
+			return 0, err
+		}
 	}
 	return off, nil
 }
+
+// internDurableInArena reports whether interned strings are durable in the spill
+// file alone, so the kindIntern log frame can be skipped. That holds only when the
+// arena is spilled and the index is the DRUM (the 100M path), where the log is
+// never rotated and arena.bin is reopened in place at recovery.
+func (s *Store) internDurableInArena() bool { return s.spill != nil && s.diskIndex }
 
 // Str reads back the string interned at off, the inverse of Intern. A zero or
 // out-of-range offset returns the empty string, so the none sentinel and a stale
@@ -398,8 +439,10 @@ func (s *Store) InternRobots(blob []byte) (uint64, error) {
 		s.arena = append(s.arena, entry...)
 	}
 	s.arenaMu.Unlock()
-	if _, _, err := s.log.append(kindIntern, 0, nil, entry); err != nil {
-		return 0, err
+	if !s.internDurableInArena() {
+		if _, _, err := s.log.append(kindIntern, 0, nil, entry); err != nil {
+			return 0, err
+		}
 	}
 	return off, nil
 }
@@ -670,6 +713,23 @@ func putU64(b []byte, v uint64) {
 
 // Close flushes the log and closes the file.
 func (s *Store) Close() error {
+	// Flush and sync the spilled arena tail before anything else. In disk-index
+	// spill mode arena.bin is the durable home of the string region (#43), so a
+	// post-checkpoint intern buffered in arenaPending must reach the file or a
+	// recovered URLRef into the tail would dangle. A no-op in the other modes, where
+	// arena.bin is a derived cache the log can rebuild.
+	if s.spill != nil {
+		s.arenaMu.Lock()
+		if err := s.flushArena(); err != nil {
+			s.arenaMu.Unlock()
+			return err
+		}
+		if err := s.spillFile.Sync(); err != nil {
+			s.arenaMu.Unlock()
+			return err
+		}
+		s.arenaMu.Unlock()
+	}
 	if err := s.log.syncAll(); err != nil {
 		return err
 	}

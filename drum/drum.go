@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/tamnd/meguri"
 )
@@ -77,6 +78,12 @@ type DRUM struct {
 	biMu     sync.RWMutex
 	bi       *blockIndex
 	repoFile *os.File
+
+	// unmerged counts discoveries routed since the last merge (buffered in buckets
+	// or flushed to pending files). When zero, a point read skips the overlay scan
+	// entirely and answers straight from the repository block, the steady state for
+	// a due URL (no readdir, no bucket walk).
+	unmerged atomic.Int64
 }
 
 // Open opens or recovers a DRUM rooted at dir. It creates the drum/ subdirectory,
@@ -172,6 +179,7 @@ func (d *DRUM) route(e pendEntry) error {
 	b.bytes += pendRecordSize
 	full := b.bytes >= d.flushBytes
 	b.mu.Unlock()
+	d.unmerged.Add(1)
 	if full {
 		return d.flushBucket(int(e.key.HostKey & (numBuckets - 1)))
 	}
@@ -255,6 +263,7 @@ func (d *DRUM) Merge() ([]Classification, error) {
 	for _, p := range names {
 		_ = os.Remove(p)
 	}
+	d.unmerged.Store(0)
 	return verdicts, nil
 }
 
@@ -265,7 +274,11 @@ func (d *DRUM) Merge() ([]Classification, error) {
 // rediscovery whose record moved since the last merge is found at its newest frame
 // (section 4.2). A tombstoned key reports absent.
 func (d *DRUM) Locate(key meguri.URLKey) (off int64, lsn uint64, present bool, err error) {
-	best, found := d.overlayLocate(key)
+	var best locEntry
+	var found bool
+	if d.unmerged.Load() > 0 {
+		best, found = d.overlayLocate(key)
+	}
 
 	d.biMu.RLock()
 	bi, rf := d.bi, d.repoFile

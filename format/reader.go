@@ -337,6 +337,109 @@ func (r *Reader) DueByWheel(now uint32) ([]m.URLKey, error) {
 	return out, nil
 }
 
+// LookupURL returns the URL record stored under key, or ok=false when the
+// partition does not hold it. It is the point read the live store needs once the
+// .meguri file is the body store rather than the append log (doc 03 change 3): a
+// GetURL that misses the in-memory tail resolves the base record here by key,
+// with no log byte offset to chase. The lookup is a zone-pruned page search. The
+// header HostKey range rejects an out-of-partition key in O(1). For a multi-page
+// table the hostkey column's per-page skip list narrows the scan to the pages
+// whose zone covers the key's host, and a binary search inside each candidate
+// page finds the row by full URLKey, the rows being stored in URLKey order (the
+// streamed repository's order). A single-page table decodes its columns once and
+// binary-searches the whole set.
+func (r *Reader) LookupURL(key m.URLKey) (m.URLRecord, bool, error) {
+	var zero m.URLRecord
+	if key.HostKey < r.header.HostKeyLo || key.HostKey > r.header.HostKeyHi {
+		return zero, false, nil
+	}
+
+	dirByID := make(map[int]columnDir, len(r.footer.urlDir))
+	for _, d := range r.footer.urlDir {
+		dirByID[d.columnID] = d
+	}
+	hkDir, ok := dirByID[colURLHostKey]
+	if !ok {
+		return zero, false, ErrCorrupt
+	}
+
+	// Single-page table: no skip list to prune with, so decode the columns whole
+	// once and binary-search the full set. This is the unchanged shape for a
+	// partition that did not opt into page splitting.
+	if hkDir.numPages <= 1 || len(hkDir.pages) == 0 {
+		cols, err := r.projectAllURL()
+		if err != nil {
+			return zero, false, err
+		}
+		recs, err := urlRecordsFromColumns(cols, r.URLCount())
+		if err != nil {
+			return zero, false, err
+		}
+		if rec, found := searchURLRecords(recs, key); found {
+			return rec, true, nil
+		}
+		return zero, false, nil
+	}
+
+	// Multi-page: decode only the pages whose hostkey zone covers key.HostKey. A
+	// host's rows can span more than one page, so every candidate is searched, but
+	// pages whose [zoneMin, zoneMax] excludes the host are skipped without a decode.
+	for pi := range hkDir.pages {
+		pe := hkDir.pages[pi]
+		if pe.hasZone && (pe.zoneMax < key.HostKey || pe.zoneMin > key.HostKey) {
+			continue
+		}
+		cols := make(map[int][]byte, urlColumnCount)
+		for id := range urlColumnCount {
+			d, ok := dirByID[id]
+			if !ok {
+				return zero, false, ErrCorrupt
+			}
+			page, err := decodeColumnPage(r.file, d, pi)
+			if err != nil {
+				return zero, false, err
+			}
+			cols[id] = page
+		}
+		recs, err := urlRecordsFromColumns(cols, int(pe.numValues))
+		if err != nil {
+			return zero, false, err
+		}
+		if rec, found := searchURLRecords(recs, key); found {
+			return rec, true, nil
+		}
+	}
+	return zero, false, nil
+}
+
+// projectAllURL decodes every URL column, the full-record projection a point
+// lookup needs to reconstruct a row. It is projectURL over the whole schema.
+func (r *Reader) projectAllURL() (map[int][]byte, error) {
+	ids := make([]int, urlColumnCount)
+	for i := range ids {
+		ids[i] = i
+	}
+	return r.projectURL(ids...)
+}
+
+// searchURLRecords binary-searches a URLKey-ordered record slice for key, the
+// per-page probe LookupURL runs once the candidate page is decoded.
+func searchURLRecords(recs []m.URLRecord, key m.URLKey) (m.URLRecord, bool) {
+	lo, hi := 0, len(recs)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		switch recs[mid].URLKey.Compare(key) {
+		case 0:
+			return recs[mid], true
+		case -1:
+			lo = mid + 1
+		default:
+			hi = mid
+		}
+	}
+	return m.URLRecord{}, false
+}
+
 // Exported URL column ids, the stable schema positions a projection names. They
 // match the on-disk column directory and never change once shipped (doc 10
 // section 4, the URL table columns).

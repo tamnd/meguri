@@ -59,6 +59,8 @@ func newScaleCmd() *cobra.Command {
 		pageRows         int
 		spillArena       bool
 		arenaBudget      int64
+		diskIndex        bool
+		mergeBatch       int
 	)
 	cmd := &cobra.Command{
 		Use:   "scale",
@@ -271,6 +273,8 @@ func newScaleCmd() *cobra.Command {
 							ResidentBudget: residentBudget,
 							SpillArena:     spillArena,
 							ArenaBudget:    arenaBudget,
+							DiskIndex:      diskIndex,
+							MergeBatch:     mergeBatch,
 						})
 						if e != nil {
 							return 0, e
@@ -410,6 +414,8 @@ func newScaleCmd() *cobra.Command {
 	cmd.Flags().IntVar(&pageRows, "page-rows", 65536, "column page-row cap for the streaming checkpoint (must be > 0 for the bounded transient)")
 	cmd.Flags().BoolVar(&spillArena, "spill-arena", false, "spill the canonical-URL string arena to disk read through a bounded LRU (spec 2072 Stage A), removing ~70 B/url from the held heap")
 	cmd.Flags().Int64Var(&arenaBudget, "arena-budget", 0, "resident byte ceiling for the spilled arena LRU (B_arena); 0 picks the 64 MiB default")
+	cmd.Flags().BoolVar(&diskIndex, "disk-index", false, "hold the URL seen-set and location index on disk in the DRUM (spec 2072 Stage B), removing the ~80-90 B/url resident index term")
+	cmd.Flags().IntVar(&mergeBatch, "merge-batch", 0, "discoveries to accumulate before folding into the DRUM repository (0 picks the 2M default); smaller batches merge more often for less in-flight RAM")
 	return cmd
 }
 

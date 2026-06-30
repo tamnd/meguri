@@ -12,9 +12,11 @@ A `.meguri` file is the serialized form of one frontier partition. It is self-de
 +--------+----------------------------------------------------+
 | MEG1   |  header (64 bytes)                                 |
 +--------+----------------------------------------------------+
-|        |  url table region    (columns, paged)             |
-|        |  host table region   (columns, paged)             |
-|        |  string/blob region  (the string arena)           |
+|        |  url table region     (columns, paged)            |
+|        |  host table region    (columns, paged)            |
+|        |  schedule index region (timing wheel, optional)   |
+|        |  seen-set filter region (dedup blob, optional)    |
+|        |  string/blob region   (the string arena)          |
 +--------+----------------------------------------------------+
 |        |  footer (region directory, column directories,    |
 |        |          stats, string metadata)                  |
@@ -35,13 +37,15 @@ Every URL is identified by a 128-bit key: the high 64 bits are the host key, the
 
 ## Regions
 
-Between the header and the footer sit the data regions, in a fixed order:
+Between the header and the footer sit up to five data regions, in a fixed order. The two tables and the string arena are always present; the schedule index and the seen-set filter are written only when the partition carries them, and a reader finds out which from the region directory.
 
 - **URL table.** One column per field of the per-URL record: the key halves, the crawl status, the priority, the timestamps, the change-rate estimate, the content fingerprints, and so on. There are far more URLs than anything else, so this is the largest region and the one designed to stay on disk.
 - **Host table.** One column per field of the per-host record: the resolved IP, the robots state, the politeness buckets, the per-host budgets, and the imported quality signal. There are few hosts, so this region stays resident.
+- **Schedule index.** The durable form of the frontier's resident due-queue: a bucketed timing wheel that groups URL rows by their next crawl time, so a scheduler finds due work by reading a bucket directory instead of scanning the whole `next_due` column. The wheel coarsens as the horizon recedes, a near tier of one-hour buckets covering a week, a mid tier of one-day buckets covering a quarter, a far tier of thirty-day buckets covering two years, plus one overflow bucket. It is written as a single page; reading "what is due at now" becomes "every row in a bucket whose window has opened", a superset the `next_due` column then confirms exactly. Omitted when no row is scheduled.
+- **Seen-set filter.** The partition's resident approximate-dedup filter, carried so a reload does not have to re-add every URL key to rebuild it. The region wraps the opaque filter blob the dedup package produced (a blocked-Bloom filter today) in one page; the format frames it with the block codec and a page CRC but does not interpret the bytes, and `num_values` records how many keys the filter holds. Omitted when the checkpoint carries no serialized filter.
 - **String/blob region.** A shared arena of the variable-length strings the fixed-width columns point into by offset: canonical URLs, host names, ETags. A record stores an offset, not the bytes, so the fixed columns stay fixed-width and packable.
 
-Each region's bounds and CRC32C live in the footer's region directory, so the reader verifies a whole region with one checksum before trusting any column in it.
+Each region's bounds and CRC32C live in the footer's region directory, so the reader verifies a whole region with one checksum before trusting any column in it. The header's flags name which regions are present, which is what `meguri inspect` prints on its `flags` line.
 
 ## Columns and pages
 

@@ -2,6 +2,7 @@ package format
 
 import (
 	"bytes"
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -203,5 +204,82 @@ func streamTestPartition(codec uint8, maxRows int, urls []m.URLRecord) *Partitio
 		URLs:         urls,
 		Hosts:        hosts,
 		Strings:      arena,
+	}
+}
+
+// TestStreamBlobRegionRoundTrip pins the chunked streaming blob writer to the
+// materializing one: streamBlobRegion fed an arena through an io.ReaderAt, at
+// several chunk sizes (including ones that split spans mid-string and one larger
+// than the arena, the single-page case), must decode back to the exact arena
+// bytes. This is the residency fix for the 100M checkpoint, where the arena is
+// gigabytes and cannot be framed as one in-RAM page; the gate is that the *Ref
+// offsets, which index the uncompressed arena, survive the multi-page framing.
+func TestStreamBlobRegionRoundTrip(t *testing.T) {
+	arena := []byte{0}
+	for i := range 5000 {
+		arena = binary.AppendUvarint(arena, uint64(len("https://example.com/path/")+i%7))
+		arena = append(arena, []byte("https://example.com/path/")...)
+		arena = append(arena, byte('a'+i%26))
+	}
+	for _, codec := range []uint8{CodecNone, CodecZstd} {
+		for _, chunk := range []int{1, 7, 64, 1000, len(arena), len(arena) + 1} {
+			var got bytes.Buffer
+			n, err := streamBlobRegion(&got, bytes.NewReader(arena), int64(len(arena)), chunk, codec)
+			if err != nil {
+				t.Fatalf("codec=%d chunk=%d: stream: %v", codec, chunk, err)
+			}
+			if int(n) != got.Len() {
+				t.Fatalf("codec=%d chunk=%d: reported len %d != written %d", codec, chunk, n, got.Len())
+			}
+			back, err := decodeBlobRegion(got.Bytes())
+			if err != nil {
+				t.Fatalf("codec=%d chunk=%d: decode: %v", codec, chunk, err)
+			}
+			if !bytes.Equal(back, arena) {
+				t.Fatalf("codec=%d chunk=%d: arena round trip differs (%d vs %d bytes)", codec, chunk, len(back), len(arena))
+			}
+		}
+	}
+}
+
+// TestStreamEncodeToFileBlobSourceMatchesStrings pins the streaming blob path of
+// the whole checkpoint: a .meguri written with p.StringsAt (the arena read from
+// an io.ReaderAt page by page) must be byte-identical to one written with the
+// same arena materialized in p.Strings, across both codecs and several chunkable
+// arena sizes. This is the gate that lets Store.CheckpointStreaming feed the
+// spill file directly instead of reading the whole arena into RAM.
+func TestStreamEncodeToFileBlobSourceMatchesStrings(t *testing.T) {
+	for _, codec := range []uint8{CodecNone, CodecZstd} {
+		for _, n := range []int{0, 6, 100} {
+			p := streamTestPartition(codec, 16, makeURLRecords(n))
+
+			dir := t.TempDir()
+			pathA := filepath.Join(dir, "strings.meguri")
+			pathB := filepath.Join(dir, "stringsat.meguri")
+
+			if err := StreamEncodeToFile(pathA, &sliceURLSource{recs: p.URLs}, 16, p, dir); err != nil {
+				t.Fatalf("codec=%d n=%d: strings: %v", codec, n, err)
+			}
+
+			pAt := *p
+			pAt.StringsAt = bytes.NewReader(p.Strings)
+			pAt.StringsSize = int64(len(p.Strings))
+			pAt.Strings = nil
+			if err := StreamEncodeToFile(pathB, &sliceURLSource{recs: p.URLs}, 16, &pAt, dir); err != nil {
+				t.Fatalf("codec=%d n=%d: stringsAt: %v", codec, n, err)
+			}
+
+			a, err := os.ReadFile(pathA)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b, err := os.ReadFile(pathB)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(a, b) {
+				t.Fatalf("codec=%d n=%d: StringsAt file differs from Strings file (%d vs %d bytes)", codec, n, len(a), len(b))
+			}
+		}
 	}
 }

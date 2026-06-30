@@ -1,6 +1,10 @@
 package format
 
-import m "github.com/tamnd/meguri"
+import (
+	"io"
+
+	m "github.com/tamnd/meguri"
+)
 
 // Partition is the in-memory image of one .meguri file: the URL and host tables
 // plus the shared string arena their *Ref fields point into. It is the unit a
@@ -21,6 +25,16 @@ type Partition struct {
 	URLs    []m.URLRecord
 	Hosts   []m.HostRecord
 	Strings []byte // arena the URLRef/ETagRef/HostRef/RegistrableRef offsets index
+
+	// StringsAt and StringsSize are the streaming alternative to Strings for the
+	// bounded-memory checkpoint (StreamEncodeToFile). When StringsAt is non-nil the
+	// encoder reads the [0, StringsSize) string arena from it through a bounded
+	// chunk buffer and writes the blob region page by page, so a 100M checkpoint
+	// never materializes the whole multi-gigabyte arena in RAM. The streamed pages
+	// decode to the same bytes Strings would have framed as one page, so the *Ref
+	// offsets are identical. A non-nil StringsAt takes precedence over Strings.
+	StringsAt   io.ReaderAt
+	StringsSize int64
 
 	// SeenFilter is the optional serialized resident seen-set filter (doc 10
 	// section 6, the seen-set filter region). It is the approximate dedup tier

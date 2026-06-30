@@ -124,7 +124,21 @@ func StreamEncodeToFile(path string, src URLRecordSource, maxRows int, p *Partit
 			return err
 		}
 	}
-	if blob := encodeBlobRegion(p.Strings, codec); len(blob) > 0 {
+	if p.StringsAt != nil {
+		// Streaming blob region: the arena is read from p.StringsAt page by page so
+		// the whole multi-gigabyte arena never lands in RAM. The region's CRC is
+		// folded as the pages are written, matching writeRegion's descriptor.
+		if p.StringsSize > 0 {
+			off := pos
+			rc := crc32.New(castagnoli)
+			n, e := streamBlobRegion(io.MultiWriter(w, rc), p.StringsAt, p.StringsSize, 0, codec)
+			if e != nil {
+				return e
+			}
+			pos += uint64(n)
+			regions = append(regions, regionDesc{id: RegionStringBlob, offset: off, length: uint64(n), crc: rc.Sum32()})
+		}
+	} else if blob := encodeBlobRegion(p.Strings, codec); len(blob) > 0 {
 		if err = writeRegion(RegionStringBlob, blob); err != nil {
 			return err
 		}

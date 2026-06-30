@@ -98,3 +98,24 @@ The consequence for the larger goal: a cold restore of a 1M partition costs abou
 ```
 go tool pprof -top scale-results/wide1m-io/pprof/cpu.inspect.1m.pprof
 ```
+
+### F4: peak RSS is not the held residency, the checkpoint encode is a second memory lever
+
+Doc 12 sizes the 100M single-box budget against a resident-bytes-per-URL figure derived from seed peak RSS (1358.7 B/url from the 142k seed, 1260.8 from the 1M seed). Profiling the seed heap shows that figure conflates two different things, and separating them changes which lever the 100M ceiling actually turns on.
+
+The seed stage now measures held heap: the live heap the built frontier holds after a forced GC, taken before the checkpoint encode, so it is the resident footprint that survives between operations rather than the one-shot encode high-water. On the 1M wide corpus (commit 9fa1830, laptop smoke, `scale-results/wide1m-held/`):
+
+| number | bytes/url | 100M extrapolation | what it is |
+| --- | --- | --- | --- |
+| held heap | 479.1 | 44.6 GB | the resident frontier, the thing the residency budget caps |
+| checkpoint transient | 957.9 | 89.2 GB | peak heap minus held, the encode buffers plus the compressed blob |
+| peak heap | 1437.0 | 133.8 GB | held plus transient, the high-water during CheckpointBytes |
+| peak RSS | 1341.0 | 124.9 GB | the process resident high-water (heap minus allocator slack returned) |
+
+The striking number is the transient: the checkpoint encode allocates 957.9 bytes/url, twice the held frontier, because CheckpointBytes materializes the column buffers and the compressed blob in memory all at once. So the peak RSS doc 12 budgets against is dominated by the checkpoint, not by the resident frontier. The held frontier at 100M is 44.6 GB, which a 64 GB box survives at rest; the checkpoint encode pushes it to 134 GB, which it does not.
+
+The consequence is that the 100M ceiling has two levers, not one. The resident-budget cap (doc 12's lever) bounds the held frontier. A streaming or bounded-memory checkpoint encoder, which does not materialize the whole blob at once, would bound the 958 B/url transient independently. Both are needed: capping the resident set to a 2M budget makes the held frontier about 960 MB, but if the encoder still spikes proportional to the resident set the checkpoint peak stays the binding constraint. The conclusion doc 12 reaches (uncapped 100M does not fit, the budget is mandatory) is unchanged and if anything reinforced, but the mechanism is now measured: it is the checkpoint-encode peak that breaks the box first, and the encoder's transient is itself a thing to fix. The held-heap figure carries a caveat: it includes the harness corpus buffer the run stage still references (about 24 percent of live heap by the in-use profile), so the engine-only held residency is lower again, around 360 bytes/url, which only widens the gap between held and peak.
+
+```
+go tool pprof -top -sample_index=inuse_space scale-results/wide1m-io/pprof/heap.seed.1m.pprof
+```

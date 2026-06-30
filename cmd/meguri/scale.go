@@ -128,10 +128,15 @@ func newScaleCmd() *cobra.Command {
 			// profile wraps it so the intake hot path (canonicalize, hash, dedup,
 			// append, then encode) is captured for doc 05's cross-size comparison.
 			var seeded *frontier.Frontier
+			var heldHeap uint64
 			seedStage, err := profiledStage(pprofDir, "seed", tag, func() (scale.StageResult, error) {
 				return scale.StageResultFromSeed(len(lines), func() (uint64, error) {
 					fr := frontier.New(1, 0)
 					seedInto(fr)
+					// Held residency: the live heap the built frontier holds, measured
+					// before the checkpoint encode so it is the resident footprint the
+					// budget caps, not the one-shot encode spike the peak RSS captures.
+					heldHeap = scale.HeldHeap(fr)
 					blob, e := fr.CheckpointBytes()
 					if e != nil {
 						return 0, e
@@ -147,7 +152,9 @@ func newScaleCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("seed stage: %w", err)
 			}
-			seedStage.Notes = fmt.Sprintf("%d urls resident after dedup", seeded.Len())
+			seedStage.Mem.HeldHeapInUse = heldHeap
+			seedStage.Notes = fmt.Sprintf("%d urls resident after dedup, held heap %.1f bytes/url",
+				seeded.Len(), float64(heldHeap)/float64(seeded.Len()))
 			result.Stages = append(result.Stages, seedStage)
 
 			// Inspect stage: read the checkpoint the seed stage wrote back off disk

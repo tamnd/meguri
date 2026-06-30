@@ -43,11 +43,27 @@ type Provenance struct {
 type MemSummary struct {
 	PeakRSSBytes    uint64  `json:"peak_rss_bytes"`
 	PeakHeapInUse   uint64  `json:"peak_heap_inuse_bytes"`
+	HeldHeapInUse   uint64  `json:"held_heap_inuse_bytes,omitempty"`
 	TotalAllocBytes uint64  `json:"total_alloc_bytes"`
 	Mallocs         uint64  `json:"mallocs"`
 	NumGC           uint32  `json:"num_gc"`
 	GCPauseTotalNs  uint64  `json:"gc_pause_total_ns"`
 	GCCPUFraction   float64 `json:"gc_cpu_fraction"`
+}
+
+// HeldHeap measures the live heap an object holds after a forced GC, the resident
+// footprint that survives between operations rather than the transient peak a
+// one-shot encode spikes to. The seed stage uses it to separate the held frontier
+// (the number the residency budget caps) from the checkpoint-encode high-water the
+// peak RSS captures. It forces a GC so only reachable bytes remain, then reads the
+// heap in-use. ref keeps the measured object alive across the GC so it is not
+// collected before the read.
+func HeldHeap(ref any) uint64 {
+	runtime.GC()
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	runtime.KeepAlive(ref)
+	return ms.HeapInuse
 }
 
 // CPUTime is the user and system CPU a stage burned, read from getrusage deltas.
@@ -227,6 +243,14 @@ func (r Result) WriteHuman(w io.Writer) {
 			human(s.URLsPerSecond), human(s.URLsPerCPUSec))
 		fmt.Fprintf(w, "  peak rss        %s\n", humanBytes(s.Mem.PeakRSSBytes))
 		fmt.Fprintf(w, "  peak heap       %s\n", humanBytes(s.Mem.PeakHeapInUse))
+		if s.Mem.HeldHeapInUse > 0 {
+			held := s.Mem.HeldHeapInUse
+			perURL := ""
+			if s.URLs > 0 {
+				perURL = fmt.Sprintf(", %.1f bytes/url", float64(held)/float64(s.URLs))
+			}
+			fmt.Fprintf(w, "  held heap       %s%s\n", humanBytes(held), perURL)
+		}
 		fmt.Fprintf(w, "  alloc/url       %.1f bytes (%s total, %d objects)\n",
 			s.AllocBytesPerURL, humanBytes(s.Mem.TotalAllocBytes), s.Mem.Mallocs)
 		fmt.Fprintf(w, "  gc              %d cycles, %.2f ms pause total, %.4f cpu fraction\n",

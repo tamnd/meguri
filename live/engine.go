@@ -17,15 +17,23 @@ import (
 // This is the read and dedup half. The write half (a bounded delta plus compaction)
 // layers on top and is what turns a discovery into a new file generation.
 type Engine struct {
-	path     string
-	file     []byte // the mmap'd base file bytes, not a copy
-	closeMap func() error
-	base     *format.Reader
-	filter   *dedup.Filter
-	hostLo   uint64
-	hostHi   uint64
-	urlCount int
+	path       string
+	file       []byte // the mmap'd base file bytes, not a copy
+	closeMap   func() error
+	base       *format.Reader
+	filter     *dedup.Filter
+	hostLo     uint64
+	hostHi     uint64
+	urlCount   int
+	baseProbes uint64 // dedup decisions that fell through the filter to the base
 }
+
+// keyCachePages is the decoded key-page cache the engine installs on its reader so
+// the slow path (a filter hit confirmed against the base) amortizes the page
+// decode across a clustered probe stream. The base is host-clustered, so a recrawl
+// reading a host's keys in order hits one page repeatedly; a small cache turns all
+// but the first probe per page into a binary search over already-decoded bytes.
+const keyCachePages = 64
 
 // Open maps the .meguri file and loads the resident filter from its seen-set
 // region. The file is mapped, not read, so a multi-gigabyte base costs reclaimable
@@ -56,6 +64,7 @@ func Open(path string) (*Engine, error) {
 			return nil, err
 		}
 	}
+	r.EnableKeyCache(keyCachePages)
 	h := r.Header()
 	return &Engine{
 		path:     path,
@@ -78,9 +87,16 @@ func (e *Engine) Seen(key m.URLKey) (bool, error) {
 	if e.filter != nil && !e.filter.MaybeContains(key) {
 		return false, nil
 	}
-	_, ok, err := e.base.LookupURL(key)
-	return ok, err
+	e.baseProbes++
+	return e.base.ContainsURL(key)
 }
+
+// BaseProbes is the number of dedup decisions that fell through the resident
+// filter to the mapped base, the slow-path count. On a fresh discovery stream it
+// is the filter's false positives; on a recrawl it is the rediscoveries. It is the
+// honest split between the resident fast path and the file-touching slow path, the
+// metric the residency claim of doc 08 turns on.
+func (e *Engine) BaseProbes() uint64 { return e.baseProbes }
 
 // GetURL returns the record for key and whether it was found. It takes the same
 // filter-then-base path as Seen, so an absent key that the filter rules out costs

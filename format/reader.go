@@ -16,6 +16,78 @@ type Reader struct {
 	file   []byte
 	header *Header
 	footer *footerData
+	keyc   *keyCache
+}
+
+// keyPage is one decoded key-column page: the hostkey and pathkey bytes and the
+// row count they hold. It is what a presence check binary-searches, cached so a
+// clustered probe stream (a recrawl reading many keys in the same host) does not
+// re-decompress the same page on every probe.
+type keyPage struct {
+	hk, pk []byte
+	n      int
+}
+
+// keyCache is a small fixed-capacity cache of decoded key pages with ring
+// eviction. It turns the base presence check from a page decode per probe into a
+// decode per distinct hot page, the amortization the file-backed engine's slow
+// path (a filter hit confirmed against the base) needs so a rediscovery-heavy or
+// recrawl stream does not pay a full zstd+FSST page decode on every key. It is not
+// safe for concurrent use, matching the single-goroutine read path it serves.
+type keyCache struct {
+	cap   int
+	pages map[int]keyPage
+	ring  []int
+	next  int
+}
+
+// EnableKeyCache installs a decoded key-page cache of capPages pages on the
+// reader, so repeated presence checks into the same pages amortize the decode.
+// capPages <= 0 disables it. It is opt-in because a one-shot scan gains nothing
+// from it and a cache holds decoded pages resident; the live engine turns it on
+// for the probe-stream read path.
+func (r *Reader) EnableKeyCache(capPages int) {
+	if capPages <= 0 {
+		r.keyc = nil
+		return
+	}
+	r.keyc = &keyCache{
+		cap:   capPages,
+		pages: make(map[int]keyPage, capPages),
+		ring:  make([]int, 0, capPages),
+	}
+}
+
+// keyPageAt returns the decoded key columns of page pi, serving them from the
+// cache when present and decoding and caching them otherwise. With no cache
+// installed it decodes every time, the unchanged behavior.
+func (r *Reader) keyPageAt(hkDir, pkDir columnDir, pi, nv int) (keyPage, error) {
+	if r.keyc != nil {
+		if kp, ok := r.keyc.pages[pi]; ok {
+			return kp, nil
+		}
+	}
+	hk, err := decodeColumnPage(r.file, hkDir, pi)
+	if err != nil {
+		return keyPage{}, err
+	}
+	pk, err := decodeColumnPage(r.file, pkDir, pi)
+	if err != nil {
+		return keyPage{}, err
+	}
+	kp := keyPage{hk: hk, pk: pk, n: nv}
+	if r.keyc != nil {
+		c := r.keyc
+		if len(c.ring) < c.cap {
+			c.ring = append(c.ring, pi)
+		} else {
+			delete(c.pages, c.ring[c.next])
+			c.ring[c.next] = pi
+			c.next = (c.next + 1) % c.cap
+		}
+		c.pages[pi] = kp
+	}
+	return kp, nil
 }
 
 // NewReader parses a .meguri file's header and footer, verifying their
@@ -439,6 +511,101 @@ func (r *Reader) LookupURL(key m.URLKey) (m.URLRecord, bool, error) {
 		}
 	}
 	return zero, false, nil
+}
+
+// ContainsURL reports whether key is stored in the partition, the dedup-confirm
+// primitive the file-backed engine runs when its resident filter says "maybe"
+// (spec 2073 doc 08). It is LookupURL stripped to a presence test: it decodes only
+// the two key columns, not the full thirteen-column record, so a confirmation
+// costs a key-column page decode rather than a whole-row projection. The header
+// host range rejects an out-of-partition key in O(1); a multi-page table prunes to
+// the pages whose hostkey zone covers the key and binary-searches each by URLKey;
+// a single-page table decodes its key columns once and binary-searches the set.
+func (r *Reader) ContainsURL(key m.URLKey) (bool, error) {
+	if key.HostKey < r.header.HostKeyLo || key.HostKey > r.header.HostKeyHi {
+		return false, nil
+	}
+	var hkDir, pkDir columnDir
+	var okHK, okPK bool
+	for _, d := range r.footer.urlDir {
+		switch d.columnID {
+		case colURLHostKey:
+			hkDir, okHK = d, true
+		case colURLPathKey:
+			pkDir, okPK = d, true
+		}
+	}
+	if !okHK || !okPK {
+		return false, ErrCorrupt
+	}
+
+	// Single-page table: decode the two key columns whole once and binary-search.
+	if hkDir.numPages <= 1 || len(hkDir.pages) == 0 {
+		keys, err := r.URLKeys()
+		if err != nil {
+			return false, err
+		}
+		return searchURLKeys(keys, key), nil
+	}
+
+	// Multi-page: decode the key columns only for pages whose hostkey zone covers
+	// the key, binary-searching each candidate. A host's rows can span pages, so
+	// every zone-covering page is searched, but the rest are skipped without a
+	// decode.
+	for pi := range hkDir.pages {
+		pe := hkDir.pages[pi]
+		if pe.hasZone && (pe.zoneMax < key.HostKey || pe.zoneMin > key.HostKey) {
+			continue
+		}
+		nv := int(pe.numValues)
+		kp, err := r.keyPageAt(hkDir, pkDir, pi, nv)
+		if err != nil {
+			return false, err
+		}
+		if len(kp.hk) < nv*8 || len(kp.pk) < nv*8 {
+			return false, ErrCorrupt
+		}
+		if searchKeyColumns(kp.hk, kp.pk, nv, key) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// searchURLKeys binary-searches a URLKey-ordered slice for key.
+func searchURLKeys(keys []m.URLKey, key m.URLKey) bool {
+	lo, hi := 0, len(keys)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		switch keys[mid].Compare(key) {
+		case 0:
+			return true
+		case -1:
+			lo = mid + 1
+		default:
+			hi = mid
+		}
+	}
+	return false
+}
+
+// searchKeyColumns binary-searches the parallel hostkey and pathkey column bytes
+// of one decoded page for key, the rows being stored URLKey-ascending.
+func searchKeyColumns(hk, pk []byte, n int, key m.URLKey) bool {
+	lo, hi := 0, n
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		cur := m.URLKey{HostKey: getU64(hk, mid), PathKey: getU64(pk, mid)}
+		switch cur.Compare(key) {
+		case 0:
+			return true
+		case -1:
+			lo = mid + 1
+		default:
+			hi = mid
+		}
+	}
+	return false
 }
 
 // projectAllURL decodes every URL column, the full-record projection a point

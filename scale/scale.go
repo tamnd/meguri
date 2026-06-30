@@ -100,6 +100,7 @@ type StageResult struct {
 	URLsPerSecond    float64     `json:"urls_per_second"`     // count / wall, paired with CPU below
 	URLsPerCPUSec    float64     `json:"urls_per_cpu_second"` // count / user CPU, the load-stable rate
 	AllocBytesPerURL float64     `json:"alloc_bytes_per_url"`
+	RSS              RSSSplit    `json:"rss_split,omitzero"` // anon/file resident split, the doc 08 residency term
 	Notes            string      `json:"notes,omitempty"`
 }
 
@@ -242,6 +243,15 @@ func (r Result) WriteHuman(w io.Writer) {
 		fmt.Fprintf(w, "  throughput      %s urls/s wall, %s urls/cpu-s\n",
 			human(s.URLsPerSecond), human(s.URLsPerCPUSec))
 		fmt.Fprintf(w, "  peak rss        %s\n", humanBytes(s.Mem.PeakRSSBytes))
+		if s.RSS.Available {
+			perURL := ""
+			if s.URLs > 0 {
+				perURL = fmt.Sprintf(", %.2f anon B/url", float64(s.RSS.AnonBytes)/float64(s.URLs))
+			}
+			fmt.Fprintf(w, "  rss split       %s anon, %s file, %s shmem (vmrss %s)%s\n",
+				humanBytes(s.RSS.AnonBytes), humanBytes(s.RSS.FileBytes),
+				humanBytes(s.RSS.ShmemBytes), humanBytes(s.RSS.VMRSSBytes), perURL)
+		}
 		fmt.Fprintf(w, "  peak heap       %s\n", humanBytes(s.Mem.PeakHeapInUse))
 		if s.Mem.HeldHeapInUse > 0 {
 			held := s.Mem.HeldHeapInUse

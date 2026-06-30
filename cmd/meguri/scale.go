@@ -18,9 +18,67 @@ import (
 	"github.com/tamnd/meguri/fetch"
 	"github.com/tamnd/meguri/format"
 	"github.com/tamnd/meguri/frontier"
+	"github.com/tamnd/meguri/live"
 	"github.com/tamnd/meguri/scale"
 	"github.com/tamnd/meguri/store"
 )
+
+// corpusSource pulls the CDX JSONL corpus one line at a time as live.Items for a
+// bulk build. It is the streaming intake the file-backed engine loads 100M from:
+// the corpus never becomes a resident slice, only the scan buffer plus the line in
+// hand, so the build's residency is the loader's own bounded structures, not the
+// corpus. Key construction matches the rest of the harness (host key from the
+// host, path key from the canonical path).
+type corpusSource struct {
+	f   *os.File
+	sc  *bufio.Scanner
+	cnt int
+}
+
+func newCorpusSource(path string) (*corpusSource, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	sc := bufio.NewScanner(bufio.NewReader(f))
+	sc.Buffer(make([]byte, 0, 1<<20), 1<<24)
+	return &corpusSource{f: f, sc: sc}, nil
+}
+
+func (s *corpusSource) Next() (live.Item, bool, error) {
+	for s.sc.Scan() {
+		line := strings.TrimSpace(s.sc.Text())
+		if line == "" {
+			continue
+		}
+		var rec struct {
+			URL  string `json:"url"`
+			Host string `json:"host"`
+		}
+		if json.Unmarshal([]byte(line), &rec) != nil || rec.URL == "" {
+			continue
+		}
+		host := rec.Host
+		if host == "" {
+			host = frontier.HostOf(rec.URL)
+		}
+		if host == "" {
+			continue
+		}
+		s.cnt++
+		key := meguri.URLKey{
+			HostKey: meguri.HostKeyOf(host),
+			PathKey: meguri.PathKeyOf(frontier.PathOf(rec.URL)),
+		}
+		return live.Item{Key: key, URL: rec.URL, Host: host}, true, nil
+	}
+	if err := s.sc.Err(); err != nil {
+		return live.Item{}, false, err
+	}
+	return live.Item{}, false, nil
+}
+
+func (s *corpusSource) close() error { return s.f.Close() }
 
 // scaleDrainFetcher is the offline fetcher the scale runner binds so the run stage
 // measures the frontier, not the network: every dispatched URL is marked crawled
@@ -62,6 +120,11 @@ func newScaleCmd() *cobra.Command {
 		diskIndex        bool
 		mergeBatch       int
 		doCheckpoint     bool
+		doLive           bool
+		liveExpect       uint64
+		liveRunRows      int
+		liveSample       int
+		liveFP           float64
 	)
 	cmd := &cobra.Command{
 		Use:   "scale",
@@ -391,6 +454,214 @@ func newScaleCmd() *cobra.Command {
 				result.Stages = append(result.Stages, ingestStage)
 			}
 
+			// Live stage: the clean-room file-backed engine of spec 2073 doc 08. It
+			// is the single-file path the 100M goal runs on: one mmapped .meguri file
+			// is intake, dedup, and lookup, with no DRUM, no append log, no spilled
+			// arena. The build sub-stage streams the corpus through BulkLoad into one
+			// compact file in bounded memory (external sort, host-clustered arena,
+			// streaming columnar encode). The lookup sub-stage maps the file back and
+			// replays the corpus as a dedup pass, so the resident cost is the blocked
+			// Bloom filter while the multi-gigabyte base stays reclaimable page cache.
+			// The anon/file RSS split is the metric of record: anon is the budget the
+			// box caps, file is the mapped base the kernel reclaims first.
+			if doLive {
+				livePath := filepath.Join(outDir, fmt.Sprintf("%s.live.meguri", tag))
+				if err := os.Remove(livePath); err != nil && !os.IsNotExist(err) {
+					return err
+				}
+				var (
+					buildRes live.BuildResult
+					buildRSS scale.RSSSplit
+				)
+				buildStage, err := profiledStage(pprofDir, "live-build", tag, func() (scale.StageResult, error) {
+					return scale.StageResultFromLive(0, func() (uint64, error) {
+						src, e := newCorpusSource(input)
+						if e != nil {
+							return 0, e
+						}
+						r, e := live.BulkLoad(src, live.BuildOptions{
+							Path:         livePath,
+							TmpDir:       outDir,
+							ExpectedKeys: liveExpect,
+							RunRows:      liveRunRows,
+							PageRows:     pageRows,
+							FPRate:       liveFP,
+							Codec:        format.CodecZstd,
+							NowHours:     uint32(time.Now().Unix() / 3600),
+							Status:       meguri.StatusScheduled,
+							Source:       meguri.SourceSeed,
+						})
+						if e != nil {
+							_ = src.close()
+							return 0, e
+						}
+						_ = src.close()
+						buildRes = r
+						buildRSS = scale.ReadRSSSplit()
+						return uint64(r.FileBytes), nil
+					})
+				})
+				if err != nil {
+					return fmt.Errorf("live-build stage: %w", err)
+				}
+				buildStage = scale.WithURLs(buildStage, buildRes.URLCount)
+				buildStage.RSS = buildRSS
+				buildStage.Notes = fmt.Sprintf(
+					"%d urls, %d hosts, file %.2f B/url, filter %.2f bits/url, anon %s after build",
+					buildRes.URLCount, buildRes.HostCount,
+					float64(buildRes.FileBytes)/float64(max(buildRes.URLCount, 1)),
+					buildRes.BitsPerURL, humanRSSBytes(buildRSS.AnonBytes))
+				result.Stages = append(result.Stages, buildStage)
+
+				// Dedup sub-stage: map the file back and replay the corpus as a stream
+				// of fresh discoveries, the common intake case. Each key is perturbed so
+				// it is absent from the base, so the resident filter answers "new"
+				// without faulting a file page; only the filter's false positives fall
+				// through to the cheap base presence check. This is the throughput that
+				// matters at 100M: intake against a large base stays resident, the
+				// multi-gigabyte file untouched. The RSS split after the pass is the
+				// proof: anon is the filter, file stays near zero because the fast path
+				// never decodes a page. The handful of confirmed hits are false
+				// positives (a perturbed key is never really present).
+				var (
+					dedupURLs int
+					dedupBase uint64
+					dedupHit  int
+					dedupLat  latStats
+					dedupRate float64
+					dedupRSS  scale.RSSSplit
+					dedupBPU  float64
+				)
+				const pathPerturb = 0x8000000000000001
+				dedupStage, err := profiledStage(pprofDir, "live-dedup", tag, func() (scale.StageResult, error) {
+					return scale.StageResultFromLive(0, func() (uint64, error) {
+						eng, e := live.Open(livePath)
+						if e != nil {
+							return 0, e
+						}
+						defer func() { _ = eng.Close() }()
+						dedupBPU = eng.BitsPerURL()
+						src, e := newCorpusSource(input)
+						if e != nil {
+							return 0, e
+						}
+						defer func() { _ = src.close() }()
+						lat := newLatHist()
+						for {
+							it, ok, ne := src.Next()
+							if ne != nil {
+								return 0, ne
+							}
+							if !ok {
+								break
+							}
+							dedupURLs++
+							probe := it.Key
+							probe.PathKey ^= pathPerturb
+							t0 := time.Now()
+							hit, se := eng.Seen(probe)
+							if se != nil {
+								return 0, se
+							}
+							lat.observe(time.Since(t0))
+							if hit {
+								dedupHit++ // base confirmed a perturbed key present (vanishingly rare)
+							}
+						}
+						dedupLat = lat.stats()
+						dedupRate = lat.engineRate()
+						dedupBase = eng.BaseProbes()
+						dedupRSS = scale.ReadRSSSplit()
+						return uint64(buildRes.FileBytes), nil
+					})
+				})
+				if err != nil {
+					return fmt.Errorf("live-dedup stage: %w", err)
+				}
+				dedupStage = scale.WithURLs(dedupStage, dedupURLs)
+				dedupStage.RSS = dedupRSS
+				dedupStage.Notes = fmt.Sprintf(
+					"%d probes, %d filter-miss (resident, no file), %d base-confirm (%.3f%% FP), %d present, filter %.2f bits/url, %s, Seen p50 %s p99 %s engine %s urls/s",
+					dedupURLs, dedupURLs-int(dedupBase), dedupBase,
+					100*float64(dedupBase)/float64(max(dedupURLs, 1)), dedupHit, dedupBPU,
+					rssNote(dedupRSS), dedupLat.p50, dedupLat.p99, humanCount(dedupRate))
+				result.Stages = append(result.Stages, dedupStage)
+
+				// Rediscover sub-stage: the minority path, a rediscovery that hits the
+				// base. It samples present keys and looks each one up, so every probe is
+				// a filter hit confirmed against the mapped file, the cost of a true
+				// rediscovery (one zone-pruned key-column page decode). It is sampled,
+				// not run over the whole corpus, because the slow path's per-op cost is
+				// what we characterize, not its aggregate (a real stream hits it rarely).
+				var (
+					rediscSeen int
+					rediscN    int
+					rediscLat  latStats
+					rediscRate float64
+					rediscRSS  scale.RSSSplit
+				)
+				rediscStage, err := profiledStage(pprofDir, "live-rediscover", tag, func() (scale.StageResult, error) {
+					return scale.StageResultFromLive(0, func() (uint64, error) {
+						eng, e := live.Open(livePath)
+						if e != nil {
+							return 0, e
+						}
+						defer func() { _ = eng.Close() }()
+						src, e := newCorpusSource(input)
+						if e != nil {
+							return 0, e
+						}
+						defer func() { _ = src.close() }()
+						// Sample every stride-th key up to the sample cap, so the probes
+						// are spread across the whole host-clustered key space rather than
+						// one contiguous page.
+						stride := max(buildRes.URLCount/liveSample, 1)
+						lat := newLatHist()
+						idx := 0
+						for rediscN < liveSample {
+							it, ok, ne := src.Next()
+							if ne != nil {
+								return 0, ne
+							}
+							if !ok {
+								break
+							}
+							if idx%stride != 0 {
+								idx++
+								continue
+							}
+							idx++
+							rediscN++
+							t0 := time.Now()
+							hit, se := eng.Seen(it.Key)
+							if se != nil {
+								return 0, se
+							}
+							lat.observe(time.Since(t0))
+							if hit {
+								rediscSeen++
+							}
+						}
+						rediscLat = lat.stats()
+						rediscRate = lat.engineRate()
+						rediscRSS = scale.ReadRSSSplit()
+						return uint64(buildRes.FileBytes), nil
+					})
+				})
+				if err != nil {
+					return fmt.Errorf("live-rediscover stage: %w", err)
+				}
+				rediscStage = scale.WithURLs(rediscStage, rediscN)
+				rediscStage.RSS = rediscRSS
+				rediscStage.Disk = scale.DiskSummary{BytesRead: uint64(buildRes.FileBytes)}
+				rediscStage.Notes = fmt.Sprintf(
+					"%d/%d sampled keys confirmed off mapped file (cache %d pages), %s, Seen p50 %s p90 %s p99 %s max %s, engine %s urls/s",
+					rediscSeen, rediscN, 64,
+					rssNote(rediscRSS),
+					rediscLat.p50, rediscLat.p90, rediscLat.p99, rediscLat.max, humanCount(rediscRate))
+				result.Stages = append(result.Stages, rediscStage)
+			}
+
 			// Write the JSON ledger entry and the human summary.
 			jsonPath := filepath.Join(outDir, fmt.Sprintf("result.%s.%s.json", tag, shortCommit(commit)))
 			jf, err := os.Create(jsonPath)
@@ -426,7 +697,44 @@ func newScaleCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&diskIndex, "disk-index", false, "hold the URL seen-set and location index on disk in the DRUM (spec 2072 Stage B), removing the ~80-90 B/url resident index term")
 	cmd.Flags().IntVar(&mergeBatch, "merge-batch", 0, "discoveries to accumulate before folding into the DRUM repository (0 picks the 2M default); smaller batches merge more often for less in-flight RAM")
 	cmd.Flags().BoolVar(&doCheckpoint, "checkpoint", true, "write the durable checkpoint after ingest; set false to measure pure ingest residency without the snapshot encode (the durable log+drum+arena store survives without the .meguri export)")
+	cmd.Flags().BoolVar(&doLive, "live", false, "drive the clean-room file-backed engine (spec 2073 doc 08): bulk-load the corpus into one mmapped .meguri file, then replay it as a dedup pass, capturing the anon/file RSS split")
+	cmd.Flags().Uint64Var(&liveExpect, "live-expect", 0, "expected distinct URL count for the live build (sizes the resident filter; 0 picks 1M, pass the real corpus size for a 100M run)")
+	cmd.Flags().IntVar(&liveRunRows, "live-run-rows", 0, "external-sort buffer cap in rows for the live build (0 picks 1M, the bounded-memory sort window)")
+	cmd.Flags().IntVar(&liveSample, "live-sample", 100000, "present-key sample size for the live-rediscover stage (the base point-lookup latency is characterized on a sample, not the whole corpus)")
+	cmd.Flags().Float64Var(&liveFP, "live-fp", 0, "resident filter false-positive rate for the live build (0 picks 1%); a lower rate keeps base-confirmations rare at 100M, trading a few more bits/url of resident filter")
 	return cmd
+}
+
+// humanRSSBytes renders a byte count in MiB for the live stage notes, the unit the
+// anon/file residency split reads in (a 100M filter is hundreds of MiB, the mapped
+// base is gigabytes).
+func humanRSSBytes(b uint64) string {
+	return fmt.Sprintf("%.1f MiB", float64(b)/(1<<20))
+}
+
+// humanCount renders a rate or count with a K/M/B suffix for the live stage notes.
+func humanCount(v float64) string {
+	switch {
+	case v >= 1e9:
+		return fmt.Sprintf("%.2fB", v/1e9)
+	case v >= 1e6:
+		return fmt.Sprintf("%.2fM", v/1e6)
+	case v >= 1e3:
+		return fmt.Sprintf("%.2fk", v/1e3)
+	default:
+		return fmt.Sprintf("%.0f", v)
+	}
+}
+
+// rssNote renders the anon/file residency split for a stage note, or "n/a" off
+// Linux where /proc/self/status (the only source of the split) does not exist. The
+// runs of record are on Linux, so this populates there; on the darwin dev box it
+// keeps the note honest rather than printing a misleading zero split.
+func rssNote(rss scale.RSSSplit) string {
+	if !rss.Available {
+		return "rss split n/a (non-Linux box)"
+	}
+	return fmt.Sprintf("anon %s file %s", humanRSSBytes(rss.AnonBytes), humanRSSBytes(rss.FileBytes))
 }
 
 // corpusLine is the one capture the scale runner seeds from.
@@ -552,6 +860,7 @@ func dirSize(dir string) uint64 {
 type latHist struct {
 	buckets [64]uint64
 	count   uint64
+	totalNs uint64
 }
 
 func newLatHist() *latHist { return &latHist{} }
@@ -561,12 +870,24 @@ func (h *latHist) observe(d time.Duration) {
 	if ns == 0 {
 		ns = 1
 	}
+	h.totalNs += ns
 	b := 63
 	for ns>>b == 0 {
 		b--
 	}
 	h.buckets[b]++
 	h.count++
+}
+
+// engineRate is the throughput of the measured op alone, count over the summed
+// observed durations, isolating the engine from the corpus parse the stage wall
+// also includes. It is the number that says how fast the dedup decision itself is,
+// independent of how fast the JSONL feeding it parses.
+func (h *latHist) engineRate() float64 {
+	if h.totalNs == 0 {
+		return 0
+	}
+	return float64(h.count) / (float64(h.totalNs) / 1e9)
 }
 
 // latStats is the rendered percentile summary the ingest notes print.

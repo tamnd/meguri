@@ -37,6 +37,15 @@ func StageResultFromIngest(urls int, fn func() (written uint64, err error)) (Sta
 	return stageMetrics("ingest", urls, fn)
 }
 
+// StageResultFromLive measures a live-engine stage: fn drives the file-backed
+// engine (a bulk load that writes one .meguri, or a dedup/lookup pass over the
+// mapped file), returning the file bytes it produced or touched. urls is the URL
+// count fn processed. The caller stamps the anon/file RSS split onto the result,
+// the residency term the mmap design is judged on (spec 2073 doc 08).
+func StageResultFromLive(urls int, fn func() (bytes uint64, err error)) (StageResult, error) {
+	return stageMetrics("live", urls, fn)
+}
+
 // StageResultFromInspect measures an inspect-type stage: fn reads a .meguri
 // checkpoint off disk and decodes its columns, returning the bytes it read.
 // urls is the URL count the decode reconstructed, the denominator for the

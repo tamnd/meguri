@@ -218,6 +218,8 @@ func newScaleCmd() *cobra.Command {
 		liveCompactIns    int
 		liveSchedule      bool
 		liveScheduleBatch int
+		liveRecrawl       bool
+		liveRecrawlChange float64
 	)
 	cmd := &cobra.Command{
 		Use:   "scale",
@@ -892,6 +894,79 @@ func newScaleCmd() *cobra.Command {
 						schedLat.p50, schedLat.p90, schedLat.p99, schedLat.max, humanCount(schedRate))
 					result.Stages = append(result.Stages, scheduleStage)
 				}
+
+				// Recrawl sub-stage: the Stage 3 write, "update a URL after it is
+				// fetched". It reads the newest generation (gen2 after a compaction, else
+				// the base), streams every row in stored key order, and for a row that is
+				// due folds a typed crawl outcome into its change-rate counters, re-
+				// estimates the Poisson rate, and reschedules it, writing the result as a
+				// new generation with an atomic swap. The now is set past every due time,
+				// so the whole frontier is folded: the heaviest recrawl, the write twin of
+				// the schedule drain. The read is the sequential cursor the compaction
+				// uses, so the base streams through as reclaimable cache and the outcome
+				// fold never pays the random point-lookup tail a per-key GetURL would.
+				if liveRecrawl {
+					recrawlIn := livePath
+					if liveCompact {
+						recrawlIn = filepath.Join(outDir, fmt.Sprintf("%s.gen2.meguri", tag))
+					}
+					gen3Path := filepath.Join(outDir, fmt.Sprintf("%s.gen3.meguri", tag))
+					if err := os.Remove(gen3Path); err != nil && !os.IsNotExist(err) {
+						return fmt.Errorf("clear gen3: %w", err)
+					}
+					nowHours := uint32(time.Now().Unix() / 3600)
+					var (
+						recRes  live.RecrawlResult
+						recRSS  scale.RSSSplit
+						recIn   int64
+						recRate float64
+					)
+					recrawlStage, err := profiledStage(pprofDir, "live-recrawl", tag, func() (scale.StageResult, error) {
+						return scale.StageResultFromLive(0, func() (uint64, error) {
+							if fi, se := os.Stat(recrawlIn); se == nil {
+								recIn = fi.Size()
+							}
+							t0 := time.Now()
+							r, e := live.Recrawl(recrawlIn, live.RecrawlOptions{
+								OutPath:    gen3Path,
+								TmpDir:     outDir,
+								PageRows:   pageRows,
+								Codec:      format.CodecZstd,
+								NowHours:   nowHours,
+								FPRate:     liveFP,
+								Tau:        1e-4,
+								ChangeRate: liveRecrawlChange,
+								Seed:       1,
+							})
+							if e != nil {
+								return 0, e
+							}
+							wall := time.Since(t0)
+							if wall > 0 {
+								recRate = float64(r.Recrawled) / wall.Seconds()
+							}
+							recRes = r
+							recRSS = scale.ReadRSSSplit()
+							return uint64(r.FileBytes), nil
+						})
+					})
+					if err != nil {
+						return fmt.Errorf("live-recrawl stage: %w", err)
+					}
+					recrawlStage = scale.WithURLs(recrawlStage, recRes.URLCount)
+					recrawlStage.RSS = recRSS
+					recrawlStage.Disk = scale.DiskSummary{
+						BytesRead:    uint64(recIn),
+						BytesWritten: uint64(recRes.FileBytes),
+						OutputBytes:  uint64(recRes.FileBytes),
+					}
+					recrawlStage.Notes = fmt.Sprintf(
+						"%d urls out (%d recrawled, %d carried, %d changed, %d no-change), %d hosts, file %.2f B/url, filter %.2f bits/url, mean lambda %.3e/hr, %s, recrawl %s urls/s",
+						recRes.URLCount, recRes.Recrawled, recRes.Carried, recRes.Changed, recRes.NoChange,
+						recRes.HostCount, float64(recRes.FileBytes)/float64(max(recRes.URLCount, 1)), recRes.BitsPerURL,
+						recRes.MeanLambda, rssNote(recRSS), humanCount(recRate))
+					result.Stages = append(result.Stages, recrawlStage)
+				}
 			}
 
 			// Write the JSON ledger entry and the human summary.
@@ -939,6 +1014,8 @@ func newScaleCmd() *cobra.Command {
 	cmd.Flags().IntVar(&liveCompactIns, "live-compact-inserts", 250000, "number of new keys to insert through the delta (discoveries not in the base)")
 	cmd.Flags().BoolVar(&liveSchedule, "live-schedule", false, "run the Stage 3 scheduler read (spec 2073 doc 08): drain the due set off the newest generation with the bounded DueCursor, capturing dispatch throughput and the anon/file RSS split")
 	cmd.Flags().IntVar(&liveScheduleBatch, "live-schedule-batch", 10000, "due-key batch cap for the schedule dispatch scan (the scheduler pulls work in capped batches, not the whole due set at once)")
+	cmd.Flags().BoolVar(&liveRecrawl, "live-recrawl", false, "run the Stage 3 recrawl write (spec 2073 doc 08): fold a typed crawl outcome into every due row of the newest generation, re-estimate its change rate, and reschedule it into a new generation with an atomic swap")
+	cmd.Flags().Float64Var(&liveRecrawlChange, "live-recrawl-change", 0.2, "probability a folded outcome is a real content change (the rest are 304 no-change), the synthetic outcome stream's change rate")
 	return cmd
 }
 

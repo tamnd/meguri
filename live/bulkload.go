@@ -8,7 +8,6 @@ import (
 	"slices"
 
 	m "github.com/tamnd/meguri"
-	"github.com/tamnd/meguri/dedup"
 	"github.com/tamnd/meguri/format"
 )
 
@@ -87,10 +86,13 @@ func BulkLoad(src Source, opts BuildOptions) (BuildResult, error) {
 	}
 	defer os.RemoveAll(work)
 
-	// Phase 1: stream the source into sorted runs, adding every key to the filter
-	// and collecting the distinct hosts. This is the only pass that sees the raw
-	// source, so it does all the per-item work the later phases must not repeat.
-	filter := dedup.NewFilter(cap, opts.FPRate)
+	// Phase 1: stream the source into sorted runs and collect the distinct hosts.
+	// This is the only pass that sees the raw source, so it does all the per-item
+	// work the later phases must not repeat. The seen-set keys are collected in the
+	// sorted phase-2 merge instead of here: the ribbon (dedup/ribbon.go) is a static
+	// filter solved once over the distinct key set, and the merge hands the keys up
+	// already ordered so dups drop in place.
+	seen := newSeenBuilder(opts.FPRate, cap)
 	hosts := make(map[uint64]string, 1<<16)
 	rb := newRunBuilder(work, opts.RunRows)
 	for {
@@ -101,7 +103,6 @@ func BulkLoad(src Source, opts BuildOptions) (BuildResult, error) {
 		if !ok {
 			break
 		}
-		filter.Add(it.Key)
 		if _, seen := hosts[it.Key.HostKey]; !seen {
 			hosts[it.Key.HostKey] = it.Host
 		}
@@ -174,6 +175,7 @@ func BulkLoad(src Source, opts BuildOptions) (BuildResult, error) {
 		if !ok {
 			break
 		}
+		seen.addSorted(it.key)
 		ref, e := arena.intern(it.url)
 		if e != nil {
 			_ = closeRuns()
@@ -224,7 +226,12 @@ func BulkLoad(src Source, opts BuildOptions) (BuildResult, error) {
 
 	// Phase 3: streaming columnar encode. The source feeds records in key order from
 	// the records temp; the arena temp is the string region read through StringsAt.
-	filterBytes := filter.Marshal()
+	// The seen-set filter is solved here, once, over the keys the merge collected.
+	filterBytes, bitsPerURL, err := seen.marshal()
+	if err != nil {
+		_ = recFile.Close()
+		return res, err
+	}
 	p := &format.Partition{
 		ID:            opts.PartitionID,
 		HostKeyLo:     hostKeyLo,
@@ -257,7 +264,7 @@ func BulkLoad(src Source, opts BuildOptions) (BuildResult, error) {
 		URLCount:   urlCount,
 		HostCount:  len(hostRecs),
 		FileBytes:  fi.Size(),
-		BitsPerURL: filter.BitsPerURL(),
+		BitsPerURL: bitsPerURL,
 	}
 	return res, nil
 }

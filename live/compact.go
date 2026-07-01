@@ -8,7 +8,6 @@ import (
 	"slices"
 
 	m "github.com/tamnd/meguri"
-	"github.com/tamnd/meguri/dedup"
 	"github.com/tamnd/meguri/format"
 )
 
@@ -81,16 +80,12 @@ func Compact(basePath string, delta *Delta, opts CompactOptions) (CompactResult,
 
 	entries := delta.sorted()
 
-	// The seen filter of the new file is the base filter with the delta's keys added,
-	// so no full base rescan is needed to rebuild it. A base without a filter (not a
-	// BulkLoad output) falls back to a fresh filter sized for the merged count.
-	filter, err := loadOrBuildFilter(base, len(entries), opts.FPRate)
-	if err != nil {
-		return res, err
-	}
-	for i := range entries {
-		filter.Add(entries[i].Rec.URLKey)
-	}
+	// The seen filter of the new file is the ribbon solved over the merged key set.
+	// The ribbon is static (dedup/ribbon.go), so it cannot be the base filter with the
+	// delta added the way the blocked-Bloom was; instead the merge-join below hands
+	// every emitted key up in sorted order and this collector builds the filter once at
+	// seal. Sizing the key slice for base+delta avoids reallocation during the merge.
+	seen := newSeenBuilder(opts.FPRate, uint64(base.URLCount()+len(entries)))
 
 	// One sequential arena reader serves the whole read: host strings sit at the low
 	// end of the base arena (BulkLoad interns hosts before URLs) and the URL strings
@@ -141,6 +136,7 @@ func Compact(basePath string, delta *Delta, opts CompactOptions) (CompactResult,
 		if !ok {
 			break
 		}
+		seen.addSorted(rec.URLKey)
 		encodeRow(rowBuf[:], &rec)
 		if _, e := recW.Write(rowBuf[:]); e != nil {
 			_ = arena.close()
@@ -163,8 +159,15 @@ func Compact(basePath string, delta *Delta, opts CompactOptions) (CompactResult,
 		return res, e
 	}
 
-	// Phase 3: streaming columnar encode into a temp file, then an atomic rename so a
-	// reader never sees a half-written generation.
+	// Phase 3: solve the seen-set ribbon over the merged keys, then streaming columnar
+	// encode into a temp file and an atomic rename so a reader never sees a half-written
+	// generation.
+	filterBytes, bitsPerURL, err := seen.marshal()
+	if err != nil {
+		_ = recFile.Close()
+		_ = arena.close()
+		return res, err
+	}
 	tmpOut := opts.OutPath + ".tmp"
 	p := &format.Partition{
 		ID:            opts.PartitionID,
@@ -175,7 +178,7 @@ func Compact(basePath string, delta *Delta, opts CompactOptions) (CompactResult,
 		Hosts:         hostRecs,
 		StringsAt:     arena.file(),
 		StringsSize:   arena.size(),
-		SeenFilter:    filter.Marshal(),
+		SeenFilter:    filterBytes,
 		MaxPageRows:   opts.PageRows,
 		BlobFrontCode: true,
 	}
@@ -207,40 +210,9 @@ func Compact(basePath string, delta *Delta, opts CompactOptions) (CompactResult,
 		Updated:    mj.updated,
 		Carried:    mj.carried,
 		FileBytes:  fi.Size(),
-		BitsPerURL: filter.BitsPerURL(),
+		BitsPerURL: bitsPerURL,
 	}
 	return res, nil
-}
-
-// loadOrBuildFilter returns the new file's seen filter. It reuses the base's filter
-// region when present (the common case, a BulkLoad or Compact output), so the merged
-// file's filter is the base's plus the delta keys the caller adds. When the base has
-// no filter region the filter is rebuilt by scanning the base keys, sized for the
-// merged count.
-func loadOrBuildFilter(base *format.Reader, deltaKeys int, fp float64) (*dedup.Filter, error) {
-	fb, err := base.SeenFilter()
-	if err != nil {
-		return nil, err
-	}
-	if len(fb) > 0 {
-		return dedup.LoadFilter(fb)
-	}
-	filter := dedup.NewFilter(uint64(base.URLCount()+deltaKeys), fp)
-	cur, err := base.URLRows()
-	if err != nil {
-		return nil, err
-	}
-	for {
-		rec, ok, e := cur.Next()
-		if e != nil {
-			return nil, e
-		}
-		if !ok {
-			break
-		}
-		filter.Add(rec.URLKey)
-	}
-	return filter, nil
 }
 
 // buildHostTable interns the union of the base and delta hosts into the new arena and

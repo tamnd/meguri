@@ -90,8 +90,10 @@ func Recrawl(basePath string, opts RecrawlOptions) (RecrawlResult, error) {
 	}
 	defer os.RemoveAll(work)
 
-	// The recrawl introduces no keys, so the new file's filter is the base's unchanged.
-	filter, err := loadOrBuildFilter(base, 0, opts.FPRate)
+	// The recrawl introduces no keys, so the new file's seen filter is the base's,
+	// carried through byte for byte. The ribbon is static and its key set is unchanged,
+	// so there is nothing to re-solve; a base with no filter region carries none.
+	filterBytes, err := base.SeenFilter()
 	if err != nil {
 		return res, err
 	}
@@ -212,7 +214,7 @@ func Recrawl(basePath string, opts RecrawlOptions) (RecrawlResult, error) {
 		Hosts:         hostRecs,
 		StringsAt:     arena.file(),
 		StringsSize:   arena.size(),
-		SeenFilter:    filter.Marshal(),
+		SeenFilter:    filterBytes,
 		MaxPageRows:   opts.PageRows,
 		BlobFrontCode: true,
 	}
@@ -240,7 +242,9 @@ func Recrawl(basePath string, opts RecrawlOptions) (RecrawlResult, error) {
 	res.URLCount = res.Recrawled + res.Carried
 	res.HostCount = len(hostRecs)
 	res.FileBytes = fi.Size()
-	res.BitsPerURL = filter.BitsPerURL()
+	if rf, e := dedup.UnmarshalFilter(filterBytes); e == nil {
+		res.BitsPerURL = rf.BitsPerURL()
+	}
 	if res.Recrawled > 0 {
 		res.MeanLambda = lambdaSum / float64(res.Recrawled)
 	}

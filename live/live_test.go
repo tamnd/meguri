@@ -111,6 +111,61 @@ func TestBulkLoadOpenDedup(t *testing.T) {
 	}
 }
 
+// TestBulkLoadSeenFilterIsRibbon checks the seal writes the ribbon form into the
+// seen-set region (kind byte 1, not the blocked Bloom's 0), that the width tracks
+// the FPRate through RibbonBitsForFPR, and that the engine loads it and honors the
+// one-sided contract: every built key probes seen with no false negative.
+func TestBulkLoadSeenFilterIsRibbon(t *testing.T) {
+	items := makeItems(5000, 41)
+	path := filepath.Join(t.TempDir(), "p.meguri")
+	if _, err := BulkLoad(&sliceSource{items: items}, BuildOptions{
+		Path:         path,
+		TmpDir:       t.TempDir(),
+		ExpectedKeys: uint64(len(items)),
+		Codec:        format.CodecZstd,
+		FPRate:       1e-4, // r=14
+		NowHours:     1000,
+	}); err != nil {
+		t.Fatalf("BulkLoad: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	r, err := format.NewReader(raw)
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	fb, err := r.SeenFilter()
+	if err != nil {
+		t.Fatalf("SeenFilter: %v", err)
+	}
+	if len(fb) < 2 || fb[1] != 1 { // 1 == dedup.filterKindRibbon
+		t.Fatalf("seen filter kind = %d, want ribbon (1)", fb[1])
+	}
+
+	eng, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer eng.Close()
+	for _, it := range items {
+		seen, err := eng.Seen(it.Key)
+		if err != nil {
+			t.Fatalf("Seen(%v): %v", it.Key, err)
+		}
+		if !seen {
+			t.Fatalf("built key %v probed new, the one-sided contract broke", it.Key)
+		}
+	}
+	// r=14 at the 0.90 band load lands near 15.6 bits/url; assert it sits in the
+	// r-bit band, well under the blocked-Bloom's 22.
+	if bpu := eng.BitsPerURL(); bpu <= 0 || bpu > 18 {
+		t.Fatalf("ribbon bits/url = %.2f, outside the r=14 band", bpu)
+	}
+}
+
 // readArena decodes the file's string region the same way a reader would, so the
 // test can resolve a record's URLRef back to its string.
 func readArena(path string) ([]byte, error) {

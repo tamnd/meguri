@@ -279,6 +279,20 @@ func unpackBits(b []byte, count int, rbits uint) []uint16 {
 	return out
 }
 
+// RibbonBitsForFPR maps a target false-positive rate to the ribbon fingerprint
+// width that meets it. A ribbon's realized FPR is exactly 2^-r for the r-bit
+// fingerprint compare, independent of the key distribution, so r is the smallest
+// width with 2^-r <= fp, that is ceil(-log2(fp)). It is clamped to the 1..16 a
+// uint16 slot holds. The region's bits per key is then r/load, so a 1e-4 target
+// maps to r=14 and about 15.6 bits per key, a third under the blocked-Bloom's 22.
+func RibbonBitsForFPR(fp float64) int {
+	if fp <= 0 || fp >= 1 {
+		return defaultRibbonR
+	}
+	r := int(math.Ceil(-math.Log2(fp)))
+	return min(max(r, 1), maxRibbonRBits)
+}
+
 // RibbonOption configures a ribbon snapshot build.
 type RibbonOption func(*ribbonConfig)
 

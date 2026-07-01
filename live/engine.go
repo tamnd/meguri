@@ -9,8 +9,9 @@ import (
 // Engine is the file-backed live store of spec 2073 doc 08: the mapped .meguri file
 // is the durable state, and the engine reads dedup, lookup, and schedule straight
 // off it. The base is the mapped file (read-only, reclaimable page cache), the
-// filter is the resident blocked Bloom that answers "is this new" without touching
-// the file, and the file's sorted keys are the exact set a filter hit is confirmed
+// filter is the resident one-sided membership filter (the ribbon snapshot the seal
+// writes, or the blocked Bloom an older file carries) that answers "is this new"
+// without touching the file, and the file's sorted keys are the exact set a hit is confirmed
 // against. There is no DRUM, no append log, and no spilled arena; the only resident
 // per-URL cost is the filter.
 //
@@ -21,7 +22,7 @@ type Engine struct {
 	file       []byte // the mmap'd base file bytes, not a copy
 	closeMap   func() error
 	base       *format.Reader
-	filter     *dedup.Filter
+	filter     *dedup.ResidentFilter
 	hostLo     uint64
 	hostHi     uint64
 	urlCount   int
@@ -56,9 +57,9 @@ func Open(path string) (*Engine, error) {
 		_ = closer()
 		return nil, err
 	}
-	var filter *dedup.Filter
+	var filter *dedup.ResidentFilter
 	if len(fb) > 0 {
-		filter, err = dedup.LoadFilter(fb)
+		filter, err = dedup.UnmarshalFilter(fb)
 		if err != nil {
 			_ = closer()
 			return nil, err

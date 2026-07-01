@@ -18,16 +18,32 @@ import (
 // This is the read and dedup half. The write half (a bounded delta plus compaction)
 // layers on top and is what turns a discovery into a new file generation.
 type Engine struct {
-	path       string
-	file       []byte // the mmap'd base file bytes, not a copy
-	closeMap   func() error
-	base       *format.Reader
-	filter     *dedup.ResidentFilter
-	hostLo     uint64
-	hostHi     uint64
-	urlCount   int
-	baseProbes uint64 // dedup decisions that fell through the filter to the base
+	path        string
+	file        []byte // the mmap'd base file bytes, not a copy
+	closeMap    func() error
+	base        *format.Reader
+	filter      *dedup.ResidentFilter
+	hostLo      uint64
+	hostHi      uint64
+	urlCount    int
+	baseProbes  uint64 // dedup decisions that fell through the filter to the base
+	trustFilter bool   // Seen trusts a filter hit as final, skipping the base-confirm
 }
+
+// OpenOption configures an Engine at Open time.
+type OpenOption func(*Engine)
+
+// WithTrustFilter makes Seen treat a filter hit as an authoritative "seen" and
+// skip the base-confirm decode. This is the M3 dedup default (doc 03): the confirm
+// exists only to recover the filter's one-sided false positives, and at the ribbon's
+// measured rate that decode is more than half the pass paid to rescue at most one in
+// ten thousand keys. A trusted run trades that: a false positive drops one
+// genuinely-new URL as a duplicate, at the filter's ~2^-r rate, and never faults a
+// file page for a hit. Correct only where the caller accepts the filter's
+// false-positive rate as its drop rate; the scale dedup pass does, exact callers
+// (GetURL, the write path) do not use it. With no filter present the flag is inert
+// and Seen still falls through to the base.
+func WithTrustFilter() OpenOption { return func(e *Engine) { e.trustFilter = true } }
 
 // keyCachePages is the decoded key-page cache the engine installs on its reader so
 // the slow path (a filter hit confirmed against the base) amortizes the page
@@ -41,7 +57,7 @@ const keyCachePages = 64
 // page cache and not heap (the goal-box property). If the file has no seen-set
 // region the filter is left nil and dedup falls through to the file for every key,
 // which is correct but slower; a file BulkLoad wrote always carries the region.
-func Open(path string) (*Engine, error) {
+func Open(path string, opts ...OpenOption) (*Engine, error) {
 	b, closer, err := mmapFile(path)
 	if err != nil {
 		return nil, err
@@ -67,7 +83,7 @@ func Open(path string) (*Engine, error) {
 	}
 	r.EnableKeyCache(keyCachePages)
 	h := r.Header()
-	return &Engine{
+	e := &Engine{
 		path:     path,
 		file:     b,
 		closeMap: closer,
@@ -76,17 +92,27 @@ func Open(path string) (*Engine, error) {
 		hostLo:   h.HostKeyLo,
 		hostHi:   h.HostKeyHi,
 		urlCount: r.URLCount(),
-	}, nil
+	}
+	for _, opt := range opts {
+		opt(e)
+	}
+	return e, nil
 }
 
 // Seen reports whether key is already in the store, the dedup decision. A filter
 // miss is an authoritative "new", returned without faulting a single file page,
 // which is the common case on a discovery stream and why intake does not thrash the
-// map. A filter hit is confirmed against the mapped base: a true positive is a
-// rediscovery, a false positive decodes one page and finds nothing.
+// map. A filter hit is confirmed against the mapped base by default: a true positive
+// is a rediscovery, a false positive decodes one page and finds nothing. Under
+// WithTrustFilter the confirm is skipped and a filter hit returns seen directly, so
+// the pass never faults a file page for a hit and accepts the filter's one-sided
+// false positives as its drop rate (M3, doc 03).
 func (e *Engine) Seen(key m.URLKey) (bool, error) {
 	if e.filter != nil && !e.filter.MaybeContains(key) {
 		return false, nil
+	}
+	if e.trustFilter && e.filter != nil {
+		return true, nil
 	}
 	e.baseProbes++
 	return e.base.ContainsURL(key)

@@ -166,6 +166,71 @@ func TestBulkLoadSeenFilterIsRibbon(t *testing.T) {
 	}
 }
 
+// TestEngineTrustFilterSkipsBase is the M3 contract: opened WithTrustFilter, a
+// filter hit returns seen without ever touching the base, so every present key still
+// probes seen (the one-sided guarantee holds) but BaseProbes stays zero. The default
+// engine confirms each hit against the base, so it does record base probes. An
+// absent key the filter rules out costs no base access in either mode.
+func TestEngineTrustFilterSkipsBase(t *testing.T) {
+	items := makeItems(4000, 31)
+	path := filepath.Join(t.TempDir(), "p.meguri")
+	if _, err := BulkLoad(&sliceSource{items: items}, BuildOptions{
+		Path:         path,
+		TmpDir:       t.TempDir(),
+		ExpectedKeys: uint64(len(items)),
+		Codec:        format.CodecZstd,
+		FPRate:       1e-4,
+		NowHours:     1000,
+	}); err != nil {
+		t.Fatalf("BulkLoad: %v", err)
+	}
+
+	// Trust mode: every member seen, no base probes at all.
+	trust, err := Open(path, WithTrustFilter())
+	if err != nil {
+		t.Fatalf("Open trust: %v", err)
+	}
+	defer trust.Close()
+	for _, it := range items {
+		seen, err := trust.Seen(it.Key)
+		if err != nil {
+			t.Fatalf("trust Seen(%v): %v", it.Key, err)
+		}
+		if !seen {
+			t.Fatalf("trust mode dropped present key %v, one-sided contract broke", it.Key)
+		}
+	}
+	if bp := trust.BaseProbes(); bp != 0 {
+		t.Fatalf("trust mode made %d base probes, want 0 (it must never touch the base on a hit)", bp)
+	}
+
+	// Default mode: same present keys, but each hit is confirmed against the base,
+	// so the base-probe count is the hit count.
+	confirm, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open confirm: %v", err)
+	}
+	defer confirm.Close()
+	for _, it := range items {
+		if _, err := confirm.Seen(it.Key); err != nil {
+			t.Fatalf("confirm Seen(%v): %v", it.Key, err)
+		}
+	}
+	if bp := confirm.BaseProbes(); bp != uint64(len(items)) {
+		t.Fatalf("confirm mode made %d base probes, want %d (one per present hit)", bp, len(items))
+	}
+
+	// An absent key the filter rules out short-circuits before the base in both
+	// modes, so trust made no base probes for it either.
+	absent := m.URLKey{HostKey: m.HostKeyOf("nope.invalid"), PathKey: m.PathKeyOf("/x")}
+	if seen, err := trust.Seen(absent); err != nil || seen {
+		t.Fatalf("trust absent key seen=%v err=%v", seen, err)
+	}
+	if bp := trust.BaseProbes(); bp != 0 {
+		t.Fatalf("trust mode touched the base for a filter-miss key, base probes = %d", bp)
+	}
+}
+
 // readArena decodes the file's string region the same way a reader would, so the
 // test can resolve a record's URLRef back to its string.
 func readArena(path string) ([]byte, error) {

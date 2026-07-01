@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/pprof"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -146,22 +147,39 @@ func newShardDedupCmd() *cobra.Command {
 		seedDir string
 		store   string
 		workers int
+		confirm bool
+		trueHit bool
+		cpuProf string
 	)
 	cmd := &cobra.Command{
 		Use:   "dedup",
 		Short: "Replay every shard's seed as fresh discoveries against its engine, in parallel",
-		Long:  "dedup opens each shard's engine and replays that shard's seed slice as perturbed (guaranteed-absent) probes, the intake case, with at most --workers shards resident at once so the resident filter cost is bounded by the pool, not the shard count.",
+		Long:  "dedup opens each shard's engine and replays that shard's seed slice against the resident filter, with at most --workers shards resident at once so the filter cost is bounded by the pool, not the shard count. By default it perturbs each key to be guaranteed-absent (the intake case) and trusts the filter's answer without a base-confirm decode (M3). --confirm restores the pre-M3 base decode, and --hits replays the keys unperturbed as true rediscoveries so the confirm decode cost is visible.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if seedDir == "" || store == "" {
 				return fmt.Errorf("--seed and --store are required")
 			}
-			return runShardDedup(cmd.OutOrStdout(), seedDir, store, workers)
+			if cpuProf != "" {
+				cf, err := os.Create(cpuProf)
+				if err != nil {
+					return err
+				}
+				defer func() { _ = cf.Close() }()
+				if err := pprof.StartCPUProfile(cf); err != nil {
+					return err
+				}
+				defer pprof.StopCPUProfile()
+			}
+			return runShardDedup(cmd.OutOrStdout(), seedDir, store, workers, confirm, trueHit)
 		},
 	}
 	cmd.Flags().StringVar(&seedDir, "seed", "", "seed directory holding the .mgs shards")
 	cmd.Flags().StringVar(&store, "store", "", "store directory holding the shard .meguri files and manifest")
 	cmd.Flags().IntVar(&workers, "workers", 0, "concurrent shard dedup workers (0 = number of cores)")
+	cmd.Flags().BoolVar(&confirm, "confirm", false, "confirm each filter hit against the base file (the pre-M3 exact path); default trusts the filter")
+	cmd.Flags().BoolVar(&trueHit, "hits", false, "replay seed keys unperturbed so every probe is a true rediscovery, to measure the confirm decode cost")
+	cmd.Flags().StringVar(&cpuProf, "cpuprofile", "", "write a CPU profile of the dedup pass to this path")
 	return cmd
 }
 
@@ -169,7 +187,7 @@ func newShardDedupCmd() *cobra.Command {
 // opens one shard's seed and engine, probes every key perturbed so the resident filter
 // answers without a file page, then closes both, so at most workers filters are
 // resident at once.
-func runShardDedup(stdout io.Writer, seedDir, store string, workers int) error {
+func runShardDedup(stdout io.Writer, seedDir, store string, workers int, confirm, trueHit bool) error {
 	man, err := live.ReadStoreManifest(store)
 	if err != nil {
 		return err
@@ -191,7 +209,7 @@ func runShardDedup(stdout io.Writer, seedDir, store string, workers int) error {
 	for range workers {
 		wg.Go(func() {
 			for i := range work {
-				p, b, h, e := dedupOneShard(seedDir, store, man.Shards[i])
+				p, b, h, e := dedupOneShard(seedDir, store, man.Shards[i], confirm, trueHit)
 				probes.Add(p)
 				baseProbes.Add(b)
 				hits.Add(h)
@@ -217,23 +235,58 @@ func runShardDedup(stdout io.Writer, seedDir, store string, workers int) error {
 
 	p := probes.Load()
 	b := baseProbes.Load()
-	fmt.Fprintf(stdout, "shard dedup: %d probes, %d workers, %s wall, %s probes/s\n",
-		p, workers, wall.Round(time.Millisecond), humanRate(int(p), wall))
-	fmt.Fprintf(stdout, "  %d filter-miss (resident, no file), %d base-confirm (%.3f%% FP), %d present\n",
-		p-b, b, 100*float64(b)/float64(max64(p, 1)), hits.Load())
+	h := hits.Load()
+	// filterHits is the number of probes the resident filter answered maybe-seen.
+	// Under --confirm every filter hit reaches the base, so it is the base-confirm
+	// count; trusting the filter it is the count Seen returned true on directly.
+	filterHits := h
+	if confirm {
+		filterHits = b
+	}
+	probe := "intake (perturbed, guaranteed-absent)"
+	if trueHit {
+		probe = "rediscover (unperturbed, true hits)"
+	}
+	mode := "trust filter"
+	if confirm {
+		mode = "confirm against base"
+	}
+	fmt.Fprintf(stdout, "shard dedup [%s, %s]: %d probes, %d workers, %s wall, %s probes/s\n",
+		probe, mode, p, workers, wall.Round(time.Millisecond), humanRate(int(p), wall))
+	fmt.Fprintf(stdout, "  %d filter-miss (resident, no file), %d filter-hit, %d base-confirm, %d seen\n",
+		p-filterHits, filterHits, b, h)
+	if trueHit {
+		// Unperturbed: every key is present, so seen must equal probes or the
+		// one-sided filter dropped a real key. new is the false-negative count.
+		fmt.Fprintf(stdout, "  %d new (false negatives, must be 0), %.4f%% of probes\n",
+			p-h, 100*float64(p-h)/float64(max64(p, 1)))
+	} else {
+		// Perturbed: every key is genuinely-new, so seen is the drop count. Under
+		// trust it is the filter's realized false positives; under confirm the base
+		// rescues them so it falls to zero. The delta between the two is the FPR.
+		fmt.Fprintf(stdout, "  %d dropped-as-seen (realized FP), %.4f%% of probes, %d kept-new\n",
+			h, 100*float64(h)/float64(max64(p, 1)), p-h)
+	}
 	return nil
 }
 
-// dedupOneShard opens one shard's seed and engine and replays the seed as perturbed
-// probes, returning the probe, base-confirm, and present counts. It is the unit of
-// parallel dedup work; nothing it touches is shared.
-func dedupOneShard(seedDir, store string, ref live.ShardRef) (probes, base, hits uint64, err error) {
+// dedupOneShard opens one shard's seed and engine and replays the seed against the
+// resident filter, returning the probe, base-confirm, and seen counts. It is the
+// unit of parallel dedup work; nothing it touches is shared. confirm restores the
+// base-confirm decode (default trusts the filter, M3); trueHit replays the keys
+// unperturbed so every probe is a true rediscovery rather than a guaranteed-absent
+// intake probe.
+func dedupOneShard(seedDir, store string, ref live.ShardRef, confirm, trueHit bool) (probes, base, hits uint64, err error) {
 	src, err := newSeedItemSource(filepath.Join(seedDir, seedShardName(ref.Index)))
 	if err != nil {
 		return 0, 0, 0, err
 	}
 	defer func() { _ = src.Close() }()
-	eng, err := live.Open(filepath.Join(store, ref.Path))
+	var opts []live.OpenOption
+	if !confirm {
+		opts = append(opts, live.WithTrustFilter())
+	}
+	eng, err := live.Open(filepath.Join(store, ref.Path), opts...)
 	if err != nil {
 		return 0, 0, 0, err
 	}
@@ -249,7 +302,9 @@ func dedupOneShard(seedDir, store string, ref live.ShardRef) (probes, base, hits
 		}
 		probes++
 		probe := it.Key
-		probe.PathKey ^= pathPerturb
+		if !trueHit {
+			probe.PathKey ^= pathPerturb
+		}
 		hit, se := eng.Seen(probe)
 		if se != nil {
 			return probes, base, hits, se

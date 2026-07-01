@@ -42,11 +42,12 @@ func newShardCmd() *cobra.Command {
 
 func newShardBuildCmd() *cobra.Command {
 	var (
-		seedDir string
-		store   string
-		pool    int
-		codec   string
-		fpr     float64
+		seedDir  string
+		store    string
+		pool     int
+		codec    string
+		fpr      float64
+		pageRows int
 	)
 	cmd := &cobra.Command{
 		Use:   "build",
@@ -56,11 +57,14 @@ func newShardBuildCmd() *cobra.Command {
 			if seedDir == "" || store == "" {
 				return fmt.Errorf("--seed and --store are required")
 			}
+			if pageRows <= 0 {
+				return fmt.Errorf("--page-rows must be > 0 so key columns are paged and a confirm decodes one page, not the whole column")
+			}
 			cd := format.CodecZstd
 			if codec == "none" || codec == "raw" {
 				cd = format.CodecNone
 			}
-			return runShardBuild(cmd.OutOrStdout(), seedDir, store, pool, cd, fpr)
+			return runShardBuild(cmd.OutOrStdout(), seedDir, store, pool, cd, fpr, pageRows)
 		},
 	}
 	cmd.Flags().StringVar(&seedDir, "seed", "", "seed directory holding the .mgs shards and manifest")
@@ -68,12 +72,13 @@ func newShardBuildCmd() *cobra.Command {
 	cmd.Flags().IntVar(&pool, "pool", 0, "concurrent shard builds (0 = number of cores)")
 	cmd.Flags().StringVar(&codec, "codec", "zstd", "shard body codec: zstd or none")
 	cmd.Flags().Float64Var(&fpr, "fpr", 1e-4, "seen-set filter false-positive budget per shard (the spec target)")
+	cmd.Flags().IntVar(&pageRows, "page-rows", 65536, "column page-row cap; a filter false positive confirms against one page, so this bounds the per-confirm decode")
 	return cmd
 }
 
 // runShardBuild reads the seed manifest and builds every shard's .meguri with the
 // bounded pool, then reports per-shard and aggregate numbers.
-func runShardBuild(stdout io.Writer, seedDir, store string, pool int, codec uint8, fpr float64) error {
+func runShardBuild(stdout io.Writer, seedDir, store string, pool int, codec uint8, fpr float64, pageRows int) error {
 	man, err := seed.ReadManifest(seedDir)
 	if err != nil {
 		return err
@@ -101,6 +106,7 @@ func runShardBuild(stdout io.Writer, seedDir, store string, pool int, codec uint
 				ExpectedKeys: expect,
 				Codec:        codec,
 				FPRate:       fpr,
+				PageRows:     pageRows,
 			},
 		}
 	}

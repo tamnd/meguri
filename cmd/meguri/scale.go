@@ -101,6 +101,73 @@ func (s *corpusSource) close() error {
 	return s.f.Close()
 }
 
+// buildLiveDelta streams the pinned corpus and fills a Stage 2 write buffer with a
+// realistic mix of the two write kinds a live crawl produces: recrawl updates against
+// keys that are in the base, and inserts of keys that are not. The first `updates`
+// corpus rows become updates, their keys unchanged so they collide with the base and
+// exercise the merge's tie path; each is stamped as if a recrawl just moved it to
+// Crawled with the crawl counters bumped and the next fetch pushed a day out. The next
+// `inserts` rows become discoveries, their PathKey perturbed by the same constant the
+// dedup stage uses so the key is guaranteed absent from the base and the merge takes
+// the insert path. Bounding the delta to updates+inserts keeps the resident write
+// buffer a fixed fraction of the base, which is the residency claim the compaction
+// stage measures.
+func buildLiveDelta(input string, delta *live.Delta, updates, inserts int, nowHours uint32) error {
+	src, err := newCorpusSource(input)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = src.close() }()
+	// Keep the insert keys off the base with the dedup stage's perturbation so the two
+	// stages agree on what "a key the base does not have" means.
+	const pathPerturb = 0x8000000000000001
+	seen := 0
+	for {
+		it, ok, ne := src.Next()
+		if ne != nil {
+			return ne
+		}
+		if !ok {
+			break
+		}
+		if seen < updates {
+			// A recrawl update: same key, fresh crawl state a day out.
+			delta.Put(live.DeltaEntry{
+				Rec: meguri.URLRecord{
+					URLKey:          it.Key,
+					Status:          meguri.StatusCrawled,
+					Priority:        0.5,
+					FirstSeen:       nowHours,
+					LastCrawled:     nowHours,
+					NextDue:         nowHours + 24,
+					CrawlCount:      1,
+					DiscoverySource: meguri.SourceSeed,
+				},
+				URL:  it.URL,
+				Host: it.Host,
+			})
+		} else if seen < updates+inserts {
+			// A discovery: perturb the path so the key is absent from the base.
+			key := it.Key
+			key.PathKey ^= pathPerturb
+			delta.Put(live.DeltaEntry{
+				Rec: meguri.URLRecord{
+					URLKey:          key,
+					Status:          meguri.StatusScheduled,
+					Priority:        0.5,
+					DiscoverySource: meguri.SourceLink,
+				},
+				URL:  it.URL,
+				Host: it.Host,
+			})
+		} else {
+			break
+		}
+		seen++
+	}
+	return nil
+}
+
 // scaleDrainFetcher is the offline fetcher the scale runner binds so the run stage
 // measures the frontier, not the network: every dispatched URL is marked crawled
 // with a 200 at the current epoch-hour, no body, no links. It is the same idea as
@@ -146,6 +213,9 @@ func newScaleCmd() *cobra.Command {
 		liveRunRows      int
 		liveSample       int
 		liveFP           float64
+		liveCompact      bool
+		liveCompactUpd   int
+		liveCompactIns   int
 	)
 	cmd := &cobra.Command{
 		Use:   "scale",
@@ -681,6 +751,69 @@ func newScaleCmd() *cobra.Command {
 					rssNote(rediscRSS),
 					rediscLat.p50, rediscLat.p90, rediscLat.p99, rediscLat.max, humanCount(rediscRate))
 				result.Stages = append(result.Stages, rediscStage)
+
+				// Compact sub-stage: the Stage 2 write path. Buffer a bounded delta of
+				// recrawl updates (existing keys re-fetched with fresh crawl state) and
+				// inserts (new discoveries), then fold it into the base file to produce
+				// the next generation. The read side is the cursor-based merge the
+				// rediscovery tail argued for: the base URL table is walked once in key
+				// order, not probed at random, so the arena resolves sequentially with
+				// one blob page resident. That is the property the doc claims and this
+				// stage measures at 100M: the base rewrites within the box budget, the
+				// anon term bounded by the delta plus host table plus filter while the
+				// base and output stream through as reclaimable page cache.
+				if liveCompact {
+					nowHours := uint32(time.Now().Unix() / 3600)
+					delta := live.NewDelta()
+					deltaT0 := time.Now()
+					if e := buildLiveDelta(input, delta, liveCompactUpd, liveCompactIns, nowHours); e != nil {
+						return fmt.Errorf("live-compact delta build: %w", e)
+					}
+					deltaWall := time.Since(deltaT0)
+					gen2Path := filepath.Join(outDir, fmt.Sprintf("%s.gen2.meguri", tag))
+					if err := os.Remove(gen2Path); err != nil && !os.IsNotExist(err) {
+						return err
+					}
+					var (
+						compRes live.CompactResult
+						compRSS scale.RSSSplit
+					)
+					compactStage, err := profiledStage(pprofDir, "live-compact", tag, func() (scale.StageResult, error) {
+						return scale.StageResultFromLive(0, func() (uint64, error) {
+							r, e := live.Compact(livePath, delta, live.CompactOptions{
+								OutPath:  gen2Path,
+								TmpDir:   outDir,
+								PageRows: pageRows,
+								Codec:    format.CodecZstd,
+								FPRate:   liveFP,
+								NowHours: nowHours,
+							})
+							if e != nil {
+								return 0, e
+							}
+							compRes = r
+							compRSS = scale.ReadRSSSplit()
+							return uint64(r.FileBytes), nil
+						})
+					})
+					if err != nil {
+						return fmt.Errorf("live-compact stage: %w", err)
+					}
+					compactStage = scale.WithURLs(compactStage, compRes.URLCount)
+					compactStage.RSS = compRSS
+					compactStage.Disk = scale.DiskSummary{
+						BytesRead:    uint64(buildRes.FileBytes),
+						BytesWritten: uint64(compRes.FileBytes),
+						OutputBytes:  uint64(compRes.FileBytes),
+					}
+					compactStage.Notes = fmt.Sprintf(
+						"%d urls out (%d carried, %d updated, %d inserted), %d hosts, file %.2f B/url, filter %.2f bits/url, delta %d entries built in %s, %s",
+						compRes.URLCount, compRes.Carried, compRes.Updated, compRes.Inserted,
+						compRes.HostCount, float64(compRes.FileBytes)/float64(max(compRes.URLCount, 1)),
+						compRes.BitsPerURL, delta.Len(), deltaWall.Round(time.Millisecond),
+						rssNote(compRSS))
+					result.Stages = append(result.Stages, compactStage)
+				}
 			}
 
 			// Write the JSON ledger entry and the human summary.
@@ -723,6 +856,9 @@ func newScaleCmd() *cobra.Command {
 	cmd.Flags().IntVar(&liveRunRows, "live-run-rows", 0, "external-sort buffer cap in rows for the live build (0 picks 1M, the bounded-memory sort window)")
 	cmd.Flags().IntVar(&liveSample, "live-sample", 100000, "present-key sample size for the live-rediscover stage (the base point-lookup latency is characterized on a sample, not the whole corpus)")
 	cmd.Flags().Float64Var(&liveFP, "live-fp", 0, "resident filter false-positive rate for the live build (0 picks 1%); a lower rate keeps base-confirmations rare at 100M, trading a few more bits/url of resident filter")
+	cmd.Flags().BoolVar(&liveCompact, "live-compact", false, "run the Stage 2 write path (spec 2073 doc 08): buffer a bounded delta of recrawl updates and inserts, then compact it into the base .meguri to produce the next file generation with an atomic swap")
+	cmd.Flags().IntVar(&liveCompactUpd, "live-compact-updates", 1000000, "number of recrawl updates to buffer in the delta before compacting (existing keys re-fetched with fresh crawl state)")
+	cmd.Flags().IntVar(&liveCompactIns, "live-compact-inserts", 250000, "number of new keys to insert through the delta (discoveries not in the base)")
 	return cmd
 }
 

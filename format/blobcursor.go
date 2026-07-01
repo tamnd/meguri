@@ -9,6 +9,42 @@ import (
 // breaks the ascending-access contract the sequential reader relies on.
 var ErrArenaBackward = errors.New("format: arena ref moved backward")
 
+// ArenaRandReader resolves arena refs in any order. It decodes the whole string arena
+// once, so its resident cost is the arena size, not one page, and it is the tool for a
+// file whose arena is not key-ordered: an engine checkpoint interns strings in the
+// insertion order URLs were discovered, so a walk in URLKey order hits refs that jump
+// backward, which ArenaSeqReader rejects by contract. A key-ordered, front-coded file
+// (BulkLoad or a compaction wrote it) should use ArenaSeqReader instead, whose
+// transient is one page and so scales to a 100M arena; this reader is for the general
+// unordered file where correctness beats the page bound.
+type ArenaRandReader struct {
+	arena []byte
+}
+
+// ArenaRandReader opens a random-access reader over the file's string blob, decoding
+// the whole arena up front. A file with no blob region yields a reader that resolves
+// every ref to nil.
+func (r *Reader) ArenaRandReader() (*ArenaRandReader, error) {
+	reg, ok := findRegion(r.footer.regions, RegionStringBlob)
+	if !ok {
+		return &ArenaRandReader{}, nil
+	}
+	arena, err := decodeBlobRegion(r.file[reg.offset : reg.offset+reg.length])
+	if err != nil {
+		return nil, err
+	}
+	return &ArenaRandReader{arena: arena}, nil
+}
+
+// At returns the string interned at ref, or nil for the zero sentinel or an
+// out-of-range ref. The slice aliases the decoded arena and stays valid for the
+// reader's life, unlike ArenaSeqReader.At whose result the next call overwrites. The
+// error is always nil; it matches ArenaSeqReader.At's signature so an export can hold
+// either behind one interface.
+func (a *ArenaRandReader) At(ref uint64) ([]byte, error) {
+	return arenaRead(a.arena, ref), nil
+}
+
 // ArenaSeqReader resolves string-arena refs in ascending order without holding the
 // whole (possibly multi-gigabyte) arena resident. It is the read side of Stage 2
 // compaction (spec 2073 doc 08): the compactor walks the base URL table in URLKey

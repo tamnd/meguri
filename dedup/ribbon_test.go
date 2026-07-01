@@ -117,6 +117,39 @@ func TestRibbonBitsKnob(t *testing.T) {
 	}
 }
 
+// TestRibbonBitsForFPR pins the target-FPR to fingerprint-width mapping the live
+// seal uses. A ribbon's realized false-positive rate is exactly 2^-r, so r is
+// ceil(-log2(fp)) clamped to the 1..16 a uint16 slot holds. The 1e-4 seen-set
+// target maps to r=14, and at the width-64 band's 0.90 load that is r/0.90 = 15.56
+// bits per key, a third under the blocked-Bloom's measured 22.1.
+func TestRibbonBitsForFPR(t *testing.T) {
+	cases := []struct {
+		fp   float64
+		want int
+	}{
+		{1e-4, 14}, // the seen-set target: 2^-14 = 6.1e-5 <= 1e-4
+		{1e-2, 7},  // 2^-7 = 7.8e-3 <= 1e-2
+		{0.5, 1},   // 2^-1 = 0.5
+		{2e-4, 13}, // 2^-13 = 1.22e-4 <= 2e-4
+		{1e-9, 16}, // clamped to the 16-bit slot ceiling
+		{0, defaultRibbonR},
+		{1, defaultRibbonR},
+		{-1, defaultRibbonR},
+	}
+	for _, c := range cases {
+		if got := RibbonBitsForFPR(c.fp); got != c.want {
+			t.Fatalf("RibbonBitsForFPR(%g) = %d, want %d", c.fp, got, c.want)
+		}
+	}
+	// The mapped r must actually meet the target: 2^-r <= fp for the real fp's.
+	for _, fp := range []float64{1e-4, 1e-2, 2e-4, 1e-3} {
+		r := RibbonBitsForFPR(fp)
+		if realized := 1.0 / float64(int64(1)<<r); realized > fp {
+			t.Fatalf("r=%d for fp=%g realizes %g, over target", r, fp, realized)
+		}
+	}
+}
+
 // TestRibbonRejectsGarbage checks the reader refuses a truncated or malformed
 // ribbon blob rather than panicking or fabricating a filter.
 func TestRibbonRejectsGarbage(t *testing.T) {

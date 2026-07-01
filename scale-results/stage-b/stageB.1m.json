@@ -1,0 +1,46 @@
+{
+  "profile": "1m",
+  "provenance": {
+    "box": "mac-m",
+    "commit": "",
+    "corpus": "corpus/profiles/scale-1m.jsonl",
+    "goos": "darwin",
+    "goarch": "arm64",
+    "num_cpu": 10
+  },
+  "started_at": "2026-06-30T15:51:05Z",
+  "stages": [
+    {
+      "stage": "ingest",
+      "urls": 1053092,
+      "wall_seconds": 9.018209167,
+      "cpu": {
+        "user_seconds": 3.243597,
+        "sys_seconds": 3.825095
+      },
+      "mem": {
+        "peak_rss_bytes": 364740608,
+        "peak_heap_inuse_bytes": 245899264,
+        "held_heap_inuse_bytes": 75210752,
+        "total_alloc_bytes": 2336209656,
+        "mallocs": 14981957,
+        "num_gc": 55,
+        "gc_pause_total_ns": 20983671,
+        "gc_cpu_fraction": 0.0016263019702720649
+      },
+      "disk": {
+        "bytes_written": 297710532,
+        "bytes_read": 0,
+        "output_bytes": 297710532,
+        "fsync_count": 0,
+        "fsync_p50_ms": 0,
+        "fsync_p99_ms": 0
+      },
+      "urls_per_second": 116773.96038379113,
+      "urls_per_cpu_second": 324667.9535096376,
+      "alloc_bytes_per_url": 2218.428832428696,
+      "notes": "unbounded: 1049819 resident of 1053092 urls, held heap 71.6 B/url, log 282.7 B/url, checkpoint total 307.2 B/url"
+    }
+  ],
+  "pprof_dir": "/tmp/sb-1m/pprof"
+}

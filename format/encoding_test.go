@@ -2,6 +2,7 @@ package format
 
 import (
 	"reflect"
+	"strconv"
 	"testing"
 )
 
@@ -93,6 +94,87 @@ func TestBitpackRoundTrip(t *testing.T) {
 		if !reflect.DeepEqual(got, vals) {
 			t.Fatalf("width %d: bitpack round trip mismatch", width)
 		}
+	}
+}
+
+// bitunpackScalar is the pre-M6 bit-at-a-time reference kept in the test so the
+// word-at-a-time kernel can be checked bit-identical against it across widths.
+func bitunpackScalar(b []byte, n int, width uint8) []uint64 {
+	out := make([]uint64, n)
+	if width == 0 {
+		return out
+	}
+	bitpos := 0
+	for i := range out {
+		var v uint64
+		for k := uint8(0); k < width; k++ {
+			if bitpos>>3 < len(b) && b[bitpos>>3]&(1<<uint(bitpos&7)) != 0 {
+				v |= 1 << k
+			}
+			bitpos++
+		}
+		out[i] = v
+	}
+	return out
+}
+
+// TestBitunpackMatchesScalar is the M6 correctness gate: the word-at-a-time kernel
+// must return byte-for-byte what the old bit-at-a-time loop did, for every width a
+// column can carry (1..64) and across counts that straddle 8-byte boundaries and the
+// packed tail, including a value whose field spills past the 64-bit load window.
+func TestBitunpackMatchesScalar(t *testing.T) {
+	for width := uint8(1); width <= 64; width++ {
+		var mask uint64 = 1<<width - 1
+		if width == 64 {
+			mask = ^uint64(0)
+		}
+		for _, n := range []int{1, 2, 7, 8, 9, 63, 64, 65, 127, 200} {
+			vals := make([]uint64, n)
+			for i := range vals {
+				vals[i] = (uint64(i)*0x9E3779B97F4A7C15 + uint64(width)) & mask
+			}
+			packed := bitpack(vals, width)
+			want := bitunpackScalar(packed, n, width)
+			got := bitunpack(packed, n, width)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("width %d n %d: kernel disagrees with scalar\n want %v\n got  %v", width, n, want, got)
+			}
+			// And it must reconstruct the values it packed.
+			if !reflect.DeepEqual(got, vals) {
+				t.Fatalf("width %d n %d: kernel did not round-trip the packed values", width, n)
+			}
+		}
+	}
+}
+
+// BenchmarkBitunpack measures the kernel across the widths a real store carries, so
+// the M6 speedup is a captured number and not a claim.
+func BenchmarkBitunpack(b *testing.B) {
+	for _, width := range []uint8{4, 8, 12, 16, 24, 32, 48, 64} {
+		var mask uint64 = 1<<width - 1
+		if width == 64 {
+			mask = ^uint64(0)
+		}
+		const n = 4096
+		vals := make([]uint64, n)
+		for i := range vals {
+			vals[i] = (uint64(i)*0x9E3779B97F4A7C15 + uint64(width)) & mask
+		}
+		packed := bitpack(vals, width)
+		b.Run("w"+strconv.Itoa(int(width)), func(b *testing.B) {
+			b.SetBytes(int64(n * 8))
+			for range b.N {
+				sink := bitunpack(packed, n, width)
+				_ = sink
+			}
+		})
+		b.Run("scalar-w"+strconv.Itoa(int(width)), func(b *testing.B) {
+			b.SetBytes(int64(n * 8))
+			for range b.N {
+				sink := bitunpackScalar(packed, n, width)
+				_ = sink
+			}
+		})
 	}
 }
 

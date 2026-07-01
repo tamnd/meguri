@@ -43,6 +43,12 @@ const (
 	EncRLE      uint8 = 4
 	EncFSST     uint8 = 5
 	EncDeltaFOR uint8 = 6
+	// EncFrontCode marks a blob page whose payload is front-coded: each string is
+	// stored as the shared-prefix length with the previous string in the page plus
+	// the literal suffix, the first string of every page a restart (shared 0). It is
+	// a meguri extension past tatami's enum (Spec 2074 M1), reversed back to the raw
+	// arena bytes on decode so the *Ref offsets are unchanged.
+	EncFrontCode uint8 = 7
 )
 
 // Header flag bits.
@@ -54,6 +60,10 @@ const (
 	FlagSeensetIsRibbon  uint16 = 1 << 4
 	FlagHasMPHF          uint16 = 1 << 5
 	FlagFooterCompressed uint16 = 1 << 6
+	// FlagBlobFrontCoded records that the string blob region's pages are front-coded
+	// (EncFrontCode) rather than raw. A reader that does not know the layout rejects
+	// the file rather than misresolving a ref against bytes it cannot reverse.
+	FlagBlobFrontCoded uint16 = 1 << 7
 )
 
 // Region ids, the fixed order regions appear in a .meguri file.
@@ -96,7 +106,16 @@ func encoder() *zstd.Encoder {
 
 func decoder() *zstd.Decoder {
 	zstdDecOnce.Do(func() {
-		zstdDec, _ = zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
+		// Concurrency 0 means GOMAXPROCS, so concurrent DecodeAll calls run in
+		// parallel instead of serializing on a single decode slot. The decoder is a
+		// process-wide singleton shared by every open shard, so the sharded store's
+		// parallel confirm path (N workers each decoding their shard's key pages at
+		// once) is only parallel if the decoder lets that many decodes proceed. A
+		// concurrency of 1 quietly serialized them, which erased the per-shard
+		// speedup. Decode output is deterministic regardless of concurrency, so this
+		// does not affect the byte-stable round-trip the encoder's concurrency 1
+		// guards.
+		zstdDec, _ = zstd.NewReader(nil, zstd.WithDecoderConcurrency(0))
 	})
 	return zstdDec
 }

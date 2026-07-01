@@ -65,22 +65,52 @@ func bitpack(vals []uint64, width uint8) []byte {
 	return out
 }
 
-// bitunpack reverses bitpack, reading n values of width bits each.
+// bitunpack reverses bitpack, reading n values of width bits each. It extracts one
+// value per 64-bit word load instead of testing bit by bit: for value i the field
+// starts at bit i*width, so a single little-endian 64-bit read at that byte, shifted
+// down by the intra-byte offset, exposes the low width bits, and a value that
+// straddles the 8-byte window (width plus offset over 64) pulls the remaining high
+// bits from the next byte. This is the M6 decode kernel (doc 03): bit-identical to
+// the old bit-at-a-time loop, it replaces n*width branchy bit tests with n word
+// loads, so the widths a compaction or recrawl decodes cost a shift and a mask each,
+// not one iteration per bit. Pure Go, no on-disk byte changes.
 func bitunpack(b []byte, n int, width uint8) []uint64 {
 	out := make([]uint64, n)
 	if width == 0 {
 		return out
 	}
-	bitpos := 0
-	for i := range out {
-		var v uint64
-		for k := uint8(0); k < width; k++ {
-			if bitpos>>3 < len(b) && b[bitpos>>3]&(1<<uint(bitpos&7)) != 0 {
-				v |= 1 << k
+	w := uint(width)
+	var mask uint64 = 1<<w - 1
+	if w == 64 {
+		mask = ^uint64(0)
+	}
+	// The last byte a value can touch is (n*width-1)>>3; a full 8-byte load is safe
+	// only while the window stays inside b, so switch to a padded byte gather near
+	// the tail.
+	fastEnd := len(b) - 8
+	for i := range n {
+		bitpos := uint(i) * w
+		bytePos := int(bitpos >> 3)
+		shift := bitpos & 7
+		var lo uint64
+		if bytePos <= fastEnd {
+			lo = binary.LittleEndian.Uint64(b[bytePos:])
+		} else {
+			for k := 0; k < 8 && bytePos+k < len(b); k++ {
+				lo |= uint64(b[bytePos+k]) << (8 * uint(k))
 			}
-			bitpos++
 		}
-		out[i] = v
+		v := lo >> shift
+		if shift+w > 64 {
+			// The field's high bits spilled past the 8-byte window; the byte at
+			// bytePos+8 holds them (width <= 64, so at most one extra byte).
+			var hi uint64
+			if hp := bytePos + 8; hp < len(b) {
+				hi = uint64(b[hp])
+			}
+			v |= hi << (64 - shift)
+		}
+		out[i] = v & mask
 	}
 	return out
 }

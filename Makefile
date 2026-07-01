@@ -10,7 +10,7 @@ LDFLAGS := -s -w \
 
 export CGO_ENABLED := 0
 
-.PHONY: build install test test-short bench vet fmt tidy clean run
+.PHONY: build install test test-short bench scale-smoke scale-full vet fmt tidy clean run
 
 build:
 	go build -ldflags "$(LDFLAGS)" -o bin/$(BIN) $(PKG)
@@ -28,6 +28,16 @@ test-short:
 
 bench:
 	go test -bench=. -benchmem -run='^$$' ./...
+
+# Timed scale smoke run on the 10k profile (fast, catches breakage, not a number of
+# record). Build the corpus slices first with scripts/build-profiles.sh.
+scale-smoke: build
+	bin/$(BIN) scale -i corpus/profiles/scale-10k.jsonl --profile 10k --commit $(COMMIT)
+
+# Timed scale run on the full pinned corpus. Pass --box on a box of record for a
+# number of record; without it the run is a smoke run.
+scale-full: build
+	bin/$(BIN) scale -i corpus/urls.jsonl --profile 142k --commit $(COMMIT)
 
 vet:
 	go vet ./...

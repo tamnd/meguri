@@ -244,6 +244,47 @@ func TestMapCommand(t *testing.T) {
 	}
 }
 
+// TestDatasetCommand gates the dataset bridge end to end: pack a partition to a
+// .meguri, export it both to a single .parquet and to a Hugging Face repo folder, then
+// import each back and confirm the url count survives the round trip.
+func TestDatasetCommand(t *testing.T) {
+	dir := seedPartitionDir(t, "alpha.example", 6)
+	src := filepath.Join(t.TempDir(), "src.meguri")
+	runCmd(t, newPackCmd(), "--data", dir, "--out", src)
+
+	// Single-file mode.
+	pq := filepath.Join(t.TempDir(), "urls.parquet")
+	exp := runCmd(t, newDatasetExportCmd(), "--src", src, "--out", pq, "--codec", "zstd")
+	if !strings.Contains(exp, "rows        6") || !strings.Contains(exp, "single-file") {
+		t.Fatalf("single-file export did not report six rows:\n%s", exp)
+	}
+	back := filepath.Join(t.TempDir(), "back.meguri")
+	runCmd(t, newDatasetImportCmd(), "--in", pq, "--out", back)
+	cold := runCmd(t, newStatsCmd(), "--data", back)
+	if !strings.Contains(cold, "urls           6") {
+		t.Fatalf("single-file import lost urls:\n%s", cold)
+	}
+
+	// Repo mode: the folder carries data files, a card, and a manifest.
+	repo := filepath.Join(t.TempDir(), "repo")
+	rexp := runCmd(t, newDatasetExportCmd(), "--src", src, "--out", repo, "--repo")
+	if !strings.Contains(rexp, "(repo)") {
+		t.Fatalf("repo export did not report repo shape:\n%s", rexp)
+	}
+	if _, err := os.Stat(filepath.Join(repo, "README.md")); err != nil {
+		t.Fatalf("repo missing card: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repo, "manifest.json")); err != nil {
+		t.Fatalf("repo missing manifest: %v", err)
+	}
+	rback := filepath.Join(t.TempDir(), "rback.meguri")
+	runCmd(t, newDatasetImportCmd(), "--in", repo, "--out", rback)
+	rcold := runCmd(t, newStatsCmd(), "--data", rback)
+	if !strings.Contains(rcold, "urls           6") {
+		t.Fatalf("repo import lost urls:\n%s", rcold)
+	}
+}
+
 // findMeguriFile returns the first .meguri snapshot in a partition directory.
 func findMeguriFile(t *testing.T, dir string) string {
 	t.Helper()

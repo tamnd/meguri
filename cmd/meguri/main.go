@@ -33,6 +33,7 @@ func main() {
 	root.AddCommand(newScheduleCmd())
 	root.AddCommand(newSeedCmd())
 	root.AddCommand(newSeedpackCmd())
+	root.AddCommand(newShardCmd())
 	root.AddCommand(newServeCmd())
 	root.AddCommand(newStatsCmd())
 

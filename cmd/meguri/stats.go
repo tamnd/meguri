@@ -153,6 +153,24 @@ func statsCold(cmd *cobra.Command, path string) error {
 	}
 	hasSchedule := ins.Flags&format.FlagHasSchedule != 0
 	hasSeenFilter := ins.Flags&format.FlagHasSeenset != 0
-	_, err = fmt.Fprintf(out, "  schedule index %v   seen filter %v\n", hasSchedule, hasSeenFilter)
-	return err
+	blobFrontCoded := ins.Flags&format.FlagBlobFrontCoded != 0
+	if _, err := fmt.Fprintf(out, "  schedule index %v   seen filter %v   blob front-coded %v\n", hasSchedule, hasSeenFilter, blobFrontCoded); err != nil {
+		return err
+	}
+	// The per-region breakdown, each region's on-disk bytes and its share per URL.
+	// The string_blob line is the M1 lever: front-coding shrinks it and the file
+	// total drops with it, both measured here against the layout baseline.
+	if _, err := fmt.Fprintf(out, "  regions:\n"); err != nil {
+		return err
+	}
+	for _, reg := range ins.Regions {
+		perURL := 0.0
+		if ins.URLCount > 0 {
+			perURL = float64(reg.Length) / float64(ins.URLCount)
+		}
+		if _, err := fmt.Fprintf(out, "    %-12s %14d B  %7.2f B/url\n", reg.Name, reg.Length, perURL); err != nil {
+			return err
+		}
+	}
+	return nil
 }

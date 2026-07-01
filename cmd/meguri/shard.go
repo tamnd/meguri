@@ -39,6 +39,7 @@ func newShardCmd() *cobra.Command {
 	cmd.AddCommand(newShardDedupCmd())
 	cmd.AddCommand(newShardRecrawlCmd())
 	cmd.AddCommand(newShardCompactCmd())
+	cmd.AddCommand(newShardScheduleCmd())
 	return cmd
 }
 
@@ -579,6 +580,117 @@ func buildShardDelta(seedShardPath string, updates, inserts int, nowHours uint32
 		seen++
 	}
 	return d, nil
+}
+
+func newShardScheduleCmd() *cobra.Command {
+	var (
+		store string
+		now   uint32
+		batch int
+		pool  int
+	)
+	cmd := &cobra.Command{
+		Use:   "schedule",
+		Short: "Drain the due-dispatch scan across every shard, the k-way fan-out",
+		Long:  "schedule fans a bounded DueCursor across all shards and drains every row due at or before --now, at most --pool shards resident at once. Because the shards tile the hostkey space in ascending order and each cursor emits its shard in key order, the global due order is shard-index order and the k-way merge is a parallel per-shard drain; each cursor holds one column page at a time, so the resident cost is the pool, not the store. This measures the scheduler read fan-out the design specifies.",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if store == "" {
+				return fmt.Errorf("--store is required")
+			}
+			if batch <= 0 {
+				return fmt.Errorf("--batch must be > 0")
+			}
+			if now == 0 {
+				now = uint32(time.Now().Unix() / 3600)
+			}
+			return runShardSchedule(cmd.OutOrStdout(), store, now, batch, pool)
+		},
+	}
+	cmd.Flags().StringVar(&store, "store", "", "store directory holding the shard .meguri files and manifest")
+	cmd.Flags().Uint32Var(&now, "now", 0, "horizon in epoch-hours; a row with 0 < NextDue <= now is due (0 = wall-clock now)")
+	cmd.Flags().IntVar(&batch, "batch", 65536, "keys pulled per NextBatch call, the scheduler's bounded drain unit")
+	cmd.Flags().IntVar(&pool, "pool", 0, "concurrent shard drains (0 = number of cores)")
+	return cmd
+}
+
+// runShardSchedule opens the store and drains every shard's due cursor across a bounded
+// pool, counting the due keys and reporting per-shard and aggregate numbers. Each worker
+// holds one shard's cursor, which pages one column window at a time, so the resident cost
+// is bounded by the pool regardless of shard count.
+func runShardSchedule(stdout io.Writer, store string, now uint32, batch, pool int) error {
+	s, err := live.OpenStore(store)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = s.Close() }()
+	n := s.Len()
+	if pool <= 0 {
+		pool = runtime.NumCPU()
+	}
+	if pool > n {
+		pool = n
+	}
+
+	perShard := make([]uint64, n)
+	var due, batches atomic.Uint64
+	var firstErr error
+	var errMu sync.Mutex
+
+	start := time.Now()
+	var wg sync.WaitGroup
+	work := make(chan int)
+	for range pool {
+		wg.Go(func() {
+			for i := range work {
+				cur, e := s.Shard(i).DueCursor(now)
+				if e != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf("shard %d due cursor: %w", i, e)
+					}
+					errMu.Unlock()
+					continue
+				}
+				var shardDue uint64
+				for {
+					keys, be := cur.NextBatch(batch)
+					if be != nil {
+						errMu.Lock()
+						if firstErr == nil {
+							firstErr = fmt.Errorf("shard %d next batch: %w", i, be)
+						}
+						errMu.Unlock()
+						break
+					}
+					if len(keys) == 0 {
+						break
+					}
+					shardDue += uint64(len(keys))
+					batches.Add(1)
+				}
+				perShard[i] = shardDue
+				due.Add(shardDue)
+			}
+		})
+	}
+	for i := range n {
+		work <- i
+	}
+	close(work)
+	wg.Wait()
+	wall := time.Since(start)
+	if firstErr != nil {
+		return firstErr
+	}
+
+	d := due.Load()
+	fmt.Fprintf(stdout, "shard schedule: %d shards, pool %d, %d due keys in %d batches, %s wall, %s due/s\n",
+		n, pool, d, batches.Load(), wall.Round(time.Millisecond), humanRate(int(d), wall))
+	for i := range n {
+		fmt.Fprintf(stdout, "  shard %05d  %d due\n", i, perShard[i])
+	}
+	return nil
 }
 
 // seedItemSource adapts a .mgs shard reader to a live.Source, deriving each URL's key

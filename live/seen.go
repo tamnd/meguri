@@ -16,37 +16,61 @@ import (
 // compaction merge-join both emit sorted), so a duplicate is always adjacent to its
 // twin and is dropped in place. The ribbon needs each key exactly once or its linear
 // system is over-determined and the solve fails.
+//
+// A large seal partitions its keys into shards at collection so the solve at Marshal
+// runs one small ribbon per shard in parallel (dedup/ribbon_sharded.go) instead of
+// one linear system over the whole set. Collection-time sharding keeps only one copy
+// of the keys, so the shards cost the same memory a single key slice would; a key
+// routes to its shard by dedup.RibbonShardIndex, and since equal keys hash alike they
+// land in the same shard adjacent to each other, so the in-place duplicate drop still
+// works per shard. The shard count comes from the seal's size hint, which every seal
+// path knows, and the filter blob records it so the query path routes identically.
 type seenBuilder struct {
-	r    int
-	keys []m.URLKey
+	r      int
+	shards [][]m.URLKey
 }
 
-// newSeenBuilder sizes an empty collector. hint pre-grows the key slice to the
-// expected distinct count so a large seal does not repeatedly reallocate; the fpRate
-// picks the ribbon fingerprint width r, the same one-sided false-positive knob the
+// newSeenBuilder sizes an empty collector. hint is the expected distinct key count: it
+// picks the shard count (dedup.RibbonShardCount) and pre-grows each shard slice to its
+// share of the hint so a large seal does not repeatedly reallocate. The fpRate picks
+// the ribbon fingerprint width r, the same one-sided false-positive knob the
 // blocked-Bloom took (dedup.RibbonBitsForFPR).
 func newSeenBuilder(fpRate float64, hint uint64) *seenBuilder {
+	shardCount := dedup.RibbonShardCount(int(hint))
+	shards := make([][]m.URLKey, shardCount)
+	// Per-shard headroom over the mean so ordinary Poisson spread across shards does
+	// not trigger a synchronized reallocation as they all fill together.
+	per := int(hint)/shardCount + int(hint)/(shardCount*16) + 64
+	for i := range shards {
+		shards[i] = make([]m.URLKey, 0, per)
+	}
 	return &seenBuilder{
-		r:    dedup.RibbonBitsForFPR(fpRate),
-		keys: make([]m.URLKey, 0, hint),
+		r:      dedup.RibbonBitsForFPR(fpRate),
+		shards: shards,
 	}
 }
 
-// addSorted records a key that arrives in nondecreasing URLKey order, dropping an
-// exact repeat of the last key. This is the collection point on the seal merge
+// addSorted records a key that arrives in nondecreasing URLKey order, routing it to
+// its shard and dropping an exact repeat of that shard's last key. Equal keys hash to
+// the same shard and arrive adjacent, so the per-shard tail check drops the duplicate
+// the ribbon solve cannot take twice. This is the collection point on the seal merge
 // loops, where the rows are already key-ordered.
 func (s *seenBuilder) addSorted(key m.URLKey) {
-	if n := len(s.keys); n > 0 && s.keys[n-1] == key {
+	idx := dedup.RibbonShardIndex(key, len(s.shards))
+	sh := s.shards[idx]
+	if n := len(sh); n > 0 && sh[n-1] == key {
 		return
 	}
-	s.keys = append(s.keys, key)
+	s.shards[idx] = append(sh, key)
 }
 
 // marshal solves the ribbon over the collected keys and returns the seen-set region
 // blob plus its realized bits per key, the residency-gate number the build reports.
-// An empty key set marshals to an empty ribbon that answers every probe false.
+// With one shard this is the single kind-1 ribbon; with more it is the kind-2 sharded
+// ribbon solved in parallel. An empty key set marshals to an empty ribbon that answers
+// every probe false.
 func (s *seenBuilder) marshal() ([]byte, float64, error) {
-	blob, err := dedup.BuildRibbonFilter(s.keys, dedup.WithRibbonBits(s.r))
+	blob, err := dedup.BuildShardedRibbonFilter(s.shards, dedup.WithRibbonBits(s.r))
 	if err != nil {
 		return nil, 0, err
 	}

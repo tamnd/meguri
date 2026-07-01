@@ -116,3 +116,79 @@ func buildOneShard(outDir string, sp ShardBuildSpec) ShardBuildResult {
 func shardFileName(i int) string {
 	return fmt.Sprintf("shard-%05d.meguri", i)
 }
+
+// ShardRecrawlResult pairs a shard's recrawl fold result with its manifest index and
+// any error, so the driver reports per-shard outcomes without ordering assumptions.
+type ShardRecrawlResult struct {
+	Index  int
+	Result RecrawlResult
+	Err    error
+}
+
+// RecrawlSharded folds a crawl outcome into every due row of every shard and writes the
+// store's next generation, K shards at a time (Spec 2074 doc 07, the parallel write and
+// the direct OOM fix). Each shard's fold is one bounded live.Recrawl into outDir with the
+// same filename, so the whole-keyspace encode that overran the box is replaced by K
+// bounded per-shard encodes and K (the pool) is the backpressure knob the monolith
+// lacked. mkOpts fills the recrawl knobs for a shard; the driver sets OutPath and TmpDir.
+// A shard is owned by exactly one worker for its whole fold, the single-writer rule.
+//
+// The output manifest carries the input ranges unchanged (a fold introduces no keys and
+// moves no host across a boundary) with each shard's FileBytes and counts refreshed and
+// Generation bumped. It is written only if every shard folded, so a partial generation is
+// never published.
+func RecrawlSharded(inDir, outDir string, in StoreManifest, mkOpts func(ShardRef) RecrawlOptions, pool int) (StoreManifest, []ShardRecrawlResult, error) {
+	if pool <= 0 {
+		pool = runtime.NumCPU()
+	}
+	if pool > len(in.Shards) {
+		pool = len(in.Shards)
+	}
+	results := make([]ShardRecrawlResult, len(in.Shards))
+
+	var wg sync.WaitGroup
+	work := make(chan int)
+	for range pool {
+		wg.Go(func() {
+			for i := range work {
+				ref := in.Shards[i]
+				opts := mkOpts(ref)
+				opts.OutPath = filepath.Join(outDir, ref.Path)
+				opts.TmpDir = outDir
+				res, err := Recrawl(filepath.Join(inDir, ref.Path), opts)
+				results[i] = ShardRecrawlResult{Index: ref.Index, Result: res, Err: err}
+			}
+		})
+	}
+	for i := range in.Shards {
+		work <- i
+	}
+	close(work)
+	wg.Wait()
+
+	var man StoreManifest
+	man.Version = in.Version
+	man.Shards = make([]ShardRef, len(in.Shards))
+	var firstErr error
+	for i, r := range results {
+		if r.Err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("shard %d: %w", in.Shards[i].Index, r.Err)
+			}
+			continue
+		}
+		ref := in.Shards[i]
+		ref.URLCount = r.Result.URLCount
+		ref.HostCount = r.Result.HostCount
+		ref.FileBytes = r.Result.FileBytes
+		ref.Generation++
+		man.Shards[i] = ref
+	}
+	if firstErr != nil {
+		return StoreManifest{}, results, firstErr
+	}
+	if err := WriteStoreManifest(outDir, man); err != nil {
+		return StoreManifest{}, results, err
+	}
+	return man, results, nil
+}

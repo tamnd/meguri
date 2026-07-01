@@ -37,6 +37,7 @@ func newShardCmd() *cobra.Command {
 	}
 	cmd.AddCommand(newShardBuildCmd())
 	cmd.AddCommand(newShardDedupCmd())
+	cmd.AddCommand(newShardRecrawlCmd())
 	return cmd
 }
 
@@ -48,6 +49,7 @@ func newShardBuildCmd() *cobra.Command {
 		codec    string
 		fpr      float64
 		pageRows int
+		nowHours uint32
 	)
 	cmd := &cobra.Command{
 		Use:   "build",
@@ -64,7 +66,7 @@ func newShardBuildCmd() *cobra.Command {
 			if codec == "none" || codec == "raw" {
 				cd = format.CodecNone
 			}
-			return runShardBuild(cmd.OutOrStdout(), seedDir, store, pool, cd, fpr, pageRows)
+			return runShardBuild(cmd.OutOrStdout(), seedDir, store, pool, cd, fpr, pageRows, nowHours)
 		},
 	}
 	cmd.Flags().StringVar(&seedDir, "seed", "", "seed directory holding the .mgs shards and manifest")
@@ -73,12 +75,13 @@ func newShardBuildCmd() *cobra.Command {
 	cmd.Flags().StringVar(&codec, "codec", "zstd", "shard body codec: zstd or none")
 	cmd.Flags().Float64Var(&fpr, "fpr", 1e-4, "seen-set filter false-positive budget per shard (the spec target)")
 	cmd.Flags().IntVar(&pageRows, "page-rows", 65536, "column page-row cap; a filter false positive confirms against one page, so this bounds the per-confirm decode")
+	cmd.Flags().Uint32Var(&nowHours, "now-hours", 0, "epoch-hours stamped as FirstSeen and NextDue on every row; a later recrawl --now makes these rows due")
 	return cmd
 }
 
 // runShardBuild reads the seed manifest and builds every shard's .meguri with the
 // bounded pool, then reports per-shard and aggregate numbers.
-func runShardBuild(stdout io.Writer, seedDir, store string, pool int, codec uint8, fpr float64, pageRows int) error {
+func runShardBuild(stdout io.Writer, seedDir, store string, pool int, codec uint8, fpr float64, pageRows int, nowHours uint32) error {
 	man, err := seed.ReadManifest(seedDir)
 	if err != nil {
 		return err
@@ -107,6 +110,7 @@ func runShardBuild(stdout io.Writer, seedDir, store string, pool int, codec uint
 				Codec:        codec,
 				FPRate:       fpr,
 				PageRows:     pageRows,
+				NowHours:     nowHours,
 			},
 		}
 	}
@@ -253,6 +257,107 @@ func dedupOneShard(seedDir, store string, ref live.ShardRef) (probes, base, hits
 		}
 	}
 	return probes, eng.BaseProbes(), hits, nil
+}
+
+func newShardRecrawlCmd() *cobra.Command {
+	var (
+		store    string
+		out      string
+		now      uint32
+		tau      float64
+		change   float64
+		pool     int
+		pageRows int
+		codec    string
+		fpr      float64
+	)
+	cmd := &cobra.Command{
+		Use:   "recrawl",
+		Short: "Fold a crawl outcome into every due row of every shard, K shards at a time",
+		Long:  "recrawl runs the Spec 2074 doc 07 write half: each shard folds a typed outcome into its due rows and writes its next generation, at most --pool shards at once, so the whole-keyspace encode that OOM-killed the monolith becomes K bounded per-shard encodes. The input store is read from --store and the next generation is written to --out.",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if store == "" || out == "" {
+				return fmt.Errorf("--store and --out are required")
+			}
+			if pageRows <= 0 {
+				return fmt.Errorf("--page-rows must be > 0 so key columns stay paged in the new generation")
+			}
+			cd := format.CodecZstd
+			if codec == "none" || codec == "raw" {
+				cd = format.CodecNone
+			}
+			if now == 0 {
+				now = uint32(time.Now().Unix() / 3600)
+			}
+			return runShardRecrawl(cmd.OutOrStdout(), store, out, now, tau, change, pool, pageRows, cd, fpr)
+		},
+	}
+	cmd.Flags().StringVar(&store, "store", "", "input store directory holding the shard .meguri files and manifest")
+	cmd.Flags().StringVar(&out, "out", "", "output directory for the next generation's shard files and manifest")
+	cmd.Flags().Uint32Var(&now, "now", 0, "epoch-hours the fold treats as now; a row with 0 < NextDue <= now is due (0 = wall-clock now, past every build --now-hours stamp)")
+	cmd.Flags().Float64Var(&tau, "tau", 1e-4, "water level the freshness allocation reschedules against")
+	cmd.Flags().Float64Var(&change, "change", 0.2, "probability a folded outcome is a real content change (the rest are 304 no-change)")
+	cmd.Flags().IntVar(&pool, "pool", 0, "concurrent shard folds, the K backpressure knob (0 = number of cores)")
+	cmd.Flags().IntVar(&pageRows, "page-rows", 65536, "column page-row cap for the new generation")
+	cmd.Flags().StringVar(&codec, "codec", "zstd", "shard body codec: zstd or none")
+	cmd.Flags().Float64Var(&fpr, "fpr", 1e-4, "filter FP budget when a shard carries no filter to reuse")
+	return cmd
+}
+
+// runShardRecrawl reads the input store manifest and folds a crawl outcome into every due
+// row of every shard with the bounded pool, writing the next generation to out and
+// reporting per-shard and aggregate numbers.
+func runShardRecrawl(stdout io.Writer, store, out string, now uint32, tau, change float64, pool, pageRows int, codec uint8, fpr float64) error {
+	man, err := live.ReadStoreManifest(store)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		return err
+	}
+	if pool <= 0 {
+		pool = runtime.NumCPU()
+	}
+
+	mkOpts := func(_ live.ShardRef) live.RecrawlOptions {
+		return live.RecrawlOptions{
+			PageRows:   pageRows,
+			Codec:      codec,
+			NowHours:   now,
+			FPRate:     fpr,
+			Tau:        tau,
+			ChangeRate: change,
+			Seed:       1,
+		}
+	}
+
+	start := time.Now()
+	sm, results, err := live.RecrawlSharded(store, out, man, mkOpts, pool)
+	wall := time.Since(start)
+	if err != nil {
+		return err
+	}
+
+	var urls, recrawled, carried, changed, noChange int
+	var bytes int64
+	for _, r := range results {
+		urls += r.Result.URLCount
+		recrawled += r.Result.Recrawled
+		carried += r.Result.Carried
+		changed += r.Result.Changed
+		noChange += r.Result.NoChange
+		bytes += r.Result.FileBytes
+	}
+	fmt.Fprintf(stdout, "shard recrawl: %d shards, pool %d, %d urls (%d recrawled, %d carried, %d changed, %d no-change), %.2f GiB, %s wall, %s recrawled/s\n",
+		len(sm.Shards), pool, urls, recrawled, carried, changed, noChange,
+		float64(bytes)/(1<<30), wall.Round(time.Millisecond), humanRate(recrawled, wall))
+	for _, r := range results {
+		ref := sm.Shards[r.Index]
+		fmt.Fprintf(stdout, "  shard %05d  %d urls  %d recrawled  %d carried  gen %d  %.1f MiB\n",
+			r.Index, r.Result.URLCount, r.Result.Recrawled, r.Result.Carried, ref.Generation, float64(ref.FileBytes)/(1<<20))
+	}
+	return nil
 }
 
 // seedItemSource adapts a .mgs shard reader to a live.Source, deriving each URL's key

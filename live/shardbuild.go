@@ -2,6 +2,8 @@ package live
 
 import (
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -92,6 +94,111 @@ func BuildSharded(outDir string, specs []ShardBuildSpec, pool int) (StoreManifes
 		return StoreManifest{}, results, err
 	}
 	return man, results, nil
+}
+
+// ShardCompactResult pairs a shard's compaction result with its manifest index, whether
+// the shard was folded or carried cold, and any error.
+type ShardCompactResult struct {
+	Index   int
+	Result  CompactResult
+	Skipped bool // true when the shard had no delta and its file was copied unchanged
+	Err     error
+}
+
+// CompactSharded folds each shard's delta into its base and writes the store's next
+// generation, K shards at a time (Spec 2074 doc 07). deltas is indexed by manifest
+// position; a shard whose delta is nil or empty is not re-encoded, its file is copied
+// through and its generation kept, which is the design's "a cold range never compacts"
+// property. A shard with a delta runs one bounded live.Compact into outDir, so the fold
+// is the same per-shard bounded encode the recrawl proved, and pool is the K knob.
+//
+// The output manifest keeps the input ranges; a folded shard refreshes its counts and
+// file bytes and bumps its generation, a carried shard keeps its ref verbatim. It is
+// written only if every shard succeeded, so a partial generation is never published.
+func CompactSharded(inDir, outDir string, in StoreManifest, deltas []*Delta, mkOpts func(ShardRef) CompactOptions, pool int) (StoreManifest, []ShardCompactResult, error) {
+	if len(deltas) != len(in.Shards) {
+		return StoreManifest{}, nil, fmt.Errorf("deltas length %d does not match shard count %d", len(deltas), len(in.Shards))
+	}
+	if pool <= 0 {
+		pool = runtime.NumCPU()
+	}
+	if pool > len(in.Shards) {
+		pool = len(in.Shards)
+	}
+	results := make([]ShardCompactResult, len(in.Shards))
+
+	var wg sync.WaitGroup
+	work := make(chan int)
+	for range pool {
+		wg.Go(func() {
+			for i := range work {
+				ref := in.Shards[i]
+				d := deltas[i]
+				if d == nil || d.Len() == 0 {
+					err := copyFile(filepath.Join(inDir, ref.Path), filepath.Join(outDir, ref.Path))
+					results[i] = ShardCompactResult{Index: ref.Index, Skipped: true, Err: err}
+					continue
+				}
+				opts := mkOpts(ref)
+				opts.OutPath = filepath.Join(outDir, ref.Path)
+				opts.TmpDir = outDir
+				res, err := Compact(filepath.Join(inDir, ref.Path), d, opts)
+				results[i] = ShardCompactResult{Index: ref.Index, Result: res, Err: err}
+			}
+		})
+	}
+	for i := range in.Shards {
+		work <- i
+	}
+	close(work)
+	wg.Wait()
+
+	var man StoreManifest
+	man.Version = in.Version
+	man.Shards = make([]ShardRef, len(in.Shards))
+	var firstErr error
+	for i, r := range results {
+		if r.Err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("shard %d: %w", in.Shards[i].Index, r.Err)
+			}
+			continue
+		}
+		ref := in.Shards[i]
+		if !r.Skipped {
+			ref.URLCount = r.Result.URLCount
+			ref.HostCount = r.Result.HostCount
+			ref.FileBytes = r.Result.FileBytes
+			ref.Generation++
+		}
+		man.Shards[i] = ref
+	}
+	if firstErr != nil {
+		return StoreManifest{}, results, firstErr
+	}
+	if err := WriteStoreManifest(outDir, man); err != nil {
+		return StoreManifest{}, results, err
+	}
+	return man, results, nil
+}
+
+// copyFile copies src to dst byte for byte, used to carry a cold shard (no delta) into
+// the next generation's directory without re-encoding it.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // buildOneShard opens the shard's source and runs a single BulkLoad into its shard

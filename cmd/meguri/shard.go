@@ -38,6 +38,7 @@ func newShardCmd() *cobra.Command {
 	cmd.AddCommand(newShardBuildCmd())
 	cmd.AddCommand(newShardDedupCmd())
 	cmd.AddCommand(newShardRecrawlCmd())
+	cmd.AddCommand(newShardCompactCmd())
 	return cmd
 }
 
@@ -358,6 +359,226 @@ func runShardRecrawl(stdout io.Writer, store, out string, now uint32, tau, chang
 			r.Index, r.Result.URLCount, r.Result.Recrawled, r.Result.Carried, ref.Generation, float64(ref.FileBytes)/(1<<20))
 	}
 	return nil
+}
+
+func newShardCompactCmd() *cobra.Command {
+	var (
+		seedDir  string
+		store    string
+		out      string
+		updates  int
+		inserts  int
+		now      uint32
+		pool     int
+		pageRows int
+		codec    string
+		fpr      float64
+	)
+	cmd := &cobra.Command{
+		Use:   "compact",
+		Short: "Fold a per-shard delta of updates and inserts into every shard, K shards at a time",
+		Long:  "compact runs the Spec 2074 doc 07 delta-merge write: each shard folds a bounded delta (recrawl updates against keys it already holds, plus discoveries perturbed absent) into its base and writes its next generation, at most --pool shards at once. A shard with no delta is copied through, not re-encoded, so a cold range never compacts. The delta comes from each shard's own seed slice, so no key crosses a shard.",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if seedDir == "" || store == "" || out == "" {
+				return fmt.Errorf("--seed, --store and --out are required")
+			}
+			if pageRows <= 0 {
+				return fmt.Errorf("--page-rows must be > 0 so key columns stay paged in the new generation")
+			}
+			cd := format.CodecZstd
+			if codec == "none" || codec == "raw" {
+				cd = format.CodecNone
+			}
+			if now == 0 {
+				now = uint32(time.Now().Unix() / 3600)
+			}
+			return runShardCompact(cmd.OutOrStdout(), seedDir, store, out, updates, inserts, now, pool, pageRows, cd, fpr)
+		},
+	}
+	cmd.Flags().StringVar(&seedDir, "seed", "", "seed directory holding the .mgs shards; the delta is drawn from each shard's slice")
+	cmd.Flags().StringVar(&store, "store", "", "input store directory holding the shard .meguri files and manifest")
+	cmd.Flags().StringVar(&out, "out", "", "output directory for the next generation's shard files and manifest")
+	cmd.Flags().IntVar(&updates, "updates", 1000000, "total recrawl updates across all shards (existing keys re-fetched with fresh crawl state), split evenly per shard")
+	cmd.Flags().IntVar(&inserts, "inserts", 250000, "total new discoveries across all shards (keys perturbed absent from the base), split evenly per shard")
+	cmd.Flags().Uint32Var(&now, "now", 0, "epoch-hours stamped on delta writes (0 = wall-clock now)")
+	cmd.Flags().IntVar(&pool, "pool", 0, "concurrent shard folds, the K backpressure knob (0 = number of cores)")
+	cmd.Flags().IntVar(&pageRows, "page-rows", 65536, "column page-row cap for the new generation")
+	cmd.Flags().StringVar(&codec, "codec", "zstd", "shard body codec: zstd or none")
+	cmd.Flags().Float64Var(&fpr, "fpr", 1e-4, "filter FP budget when a shard carries no filter to reuse")
+	return cmd
+}
+
+// runShardCompact builds one bounded delta per shard from that shard's seed slice, then
+// folds every delta into the store with the bounded pool, reporting per-shard and
+// aggregate numbers.
+func runShardCompact(stdout io.Writer, seedDir, store, out string, updates, inserts int, now uint32, pool, pageRows int, codec uint8, fpr float64) error {
+	man, err := live.ReadStoreManifest(store)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		return err
+	}
+	if pool <= 0 {
+		pool = runtime.NumCPU()
+	}
+	n := len(man.Shards)
+	if n == 0 {
+		return fmt.Errorf("store has no shards")
+	}
+
+	// Split the totals evenly across shards; the delta is drawn from each shard's own
+	// seed slice, so a shard's updates collide with its base and its inserts are absent
+	// from it, no key crossing a shard boundary.
+	updPer := updates / n
+	insPer := inserts / n
+
+	deltaStart := time.Now()
+	deltas := make([]*live.Delta, n)
+	var dErr error
+	var dMu sync.Mutex
+	var wg sync.WaitGroup
+	dwork := make(chan int)
+	for range pool {
+		wg.Go(func() {
+			for i := range dwork {
+				d, e := buildShardDelta(filepath.Join(seedDir, seedShardName(man.Shards[i].Index)), updPer, insPer, now)
+				if e != nil {
+					dMu.Lock()
+					if dErr == nil {
+						dErr = fmt.Errorf("shard %d delta: %w", man.Shards[i].Index, e)
+					}
+					dMu.Unlock()
+					continue
+				}
+				deltas[i] = d
+			}
+		})
+	}
+	for i := range man.Shards {
+		dwork <- i
+	}
+	close(dwork)
+	wg.Wait()
+	if dErr != nil {
+		return dErr
+	}
+	deltaWall := time.Since(deltaStart)
+
+	var deltaEntries int
+	for _, d := range deltas {
+		if d != nil {
+			deltaEntries += d.Len()
+		}
+	}
+
+	mkOpts := func(_ live.ShardRef) live.CompactOptions {
+		return live.CompactOptions{
+			PageRows: pageRows,
+			Codec:    codec,
+			FPRate:   fpr,
+			NowHours: now,
+		}
+	}
+
+	start := time.Now()
+	sm, results, err := live.CompactSharded(store, out, man, deltas, mkOpts, pool)
+	wall := time.Since(start)
+	if err != nil {
+		return err
+	}
+
+	var urls, carried, updated, inserted, skipped int
+	var bytes int64
+	for _, r := range results {
+		if r.Skipped {
+			skipped++
+			continue
+		}
+		urls += r.Result.URLCount
+		carried += r.Result.Carried
+		updated += r.Result.Updated
+		inserted += r.Result.Inserted
+	}
+	for i := range sm.Shards {
+		bytes += sm.Shards[i].FileBytes
+		if results[i].Skipped {
+			urls += sm.Shards[i].URLCount
+		}
+	}
+	fmt.Fprintf(stdout, "shard compact: %d shards (%d folded, %d cold-carried), pool %d, %d delta entries built in %s\n",
+		len(sm.Shards), len(sm.Shards)-skipped, skipped, pool, deltaEntries, deltaWall.Round(time.Millisecond))
+	fmt.Fprintf(stdout, "  %d urls out (%d carried, %d updated, %d inserted), %.2f GiB, %s wall, %s urls/s\n",
+		urls, carried, updated, inserted, float64(bytes)/(1<<30), wall.Round(time.Millisecond), humanRate(urls, wall))
+	for _, r := range results {
+		ref := sm.Shards[r.Index]
+		if r.Skipped {
+			fmt.Fprintf(stdout, "  shard %05d  cold-carried  gen %d  %.1f MiB\n", r.Index, ref.Generation, float64(ref.FileBytes)/(1<<20))
+			continue
+		}
+		fmt.Fprintf(stdout, "  shard %05d  %d urls  %d updated  %d inserted  gen %d  %.1f MiB\n",
+			r.Index, r.Result.URLCount, r.Result.Updated, r.Result.Inserted, ref.Generation, float64(ref.FileBytes)/(1<<20))
+	}
+	return nil
+}
+
+// buildShardDelta draws a bounded delta from one shard's seed slice: the first `updates`
+// URLs become recrawl updates (same key, so they collide with the base and take the
+// merge's tie path), the next `inserts` become discoveries with the pathkey perturbed so
+// the key is guaranteed absent and the merge takes the insert path. It mirrors the
+// single-file benchmark's buildLiveDelta so the sharded and single-file compaction
+// measure the same write mix.
+func buildShardDelta(seedShardPath string, updates, inserts int, nowHours uint32) (*live.Delta, error) {
+	src, err := newSeedItemSource(seedShardPath)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = src.Close() }()
+	d := live.NewDelta()
+	seen := 0
+	for {
+		it, ok, e := src.Next()
+		if e != nil {
+			return nil, e
+		}
+		if !ok {
+			break
+		}
+		if seen < updates {
+			d.Put(live.DeltaEntry{
+				Rec: meguri.URLRecord{
+					URLKey:          it.Key,
+					Status:          meguri.StatusCrawled,
+					Priority:        0.5,
+					FirstSeen:       nowHours,
+					LastCrawled:     nowHours,
+					NextDue:         nowHours + 24,
+					CrawlCount:      1,
+					DiscoverySource: meguri.SourceSeed,
+				},
+				URL:  it.URL,
+				Host: it.Host,
+			})
+		} else if seen < updates+inserts {
+			key := it.Key
+			key.PathKey ^= pathPerturb
+			d.Put(live.DeltaEntry{
+				Rec: meguri.URLRecord{
+					URLKey:          key,
+					Status:          meguri.StatusScheduled,
+					Priority:        0.5,
+					DiscoverySource: meguri.SourceLink,
+				},
+				URL:  it.URL,
+				Host: it.Host,
+			})
+		} else {
+			break
+		}
+		seen++
+	}
+	return d, nil
 }
 
 // seedItemSource adapts a .mgs shard reader to a live.Source, deriving each URL's key

@@ -190,32 +190,34 @@ func (scaleDrainFetcher) Fetch(_ context.Context, req fetch.Request) (meguri.Out
 // job of `meguri bench`; this measures the numbers a clock and a box produce.
 func newScaleCmd() *cobra.Command {
 	var (
-		input            string
-		profile          string
-		box              string
-		commit           string
-		outDir           string
-		doSeed           bool
-		doRun            bool
-		doInspect        bool
-		doIngest         bool
-		residentBudget   int
-		seedMode         string
-		streamCheckpoint bool
-		pageRows         int
-		spillArena       bool
-		arenaBudget      int64
-		diskIndex        bool
-		mergeBatch       int
-		doCheckpoint     bool
-		doLive           bool
-		liveExpect       uint64
-		liveRunRows      int
-		liveSample       int
-		liveFP           float64
-		liveCompact      bool
-		liveCompactUpd   int
-		liveCompactIns   int
+		input             string
+		profile           string
+		box               string
+		commit            string
+		outDir            string
+		doSeed            bool
+		doRun             bool
+		doInspect         bool
+		doIngest          bool
+		residentBudget    int
+		seedMode          string
+		streamCheckpoint  bool
+		pageRows          int
+		spillArena        bool
+		arenaBudget       int64
+		diskIndex         bool
+		mergeBatch        int
+		doCheckpoint      bool
+		doLive            bool
+		liveExpect        uint64
+		liveRunRows       int
+		liveSample        int
+		liveFP            float64
+		liveCompact       bool
+		liveCompactUpd    int
+		liveCompactIns    int
+		liveSchedule      bool
+		liveScheduleBatch int
 	)
 	cmd := &cobra.Command{
 		Use:   "scale",
@@ -814,6 +816,82 @@ func newScaleCmd() *cobra.Command {
 						rssNote(compRSS))
 					result.Stages = append(result.Stages, compactStage)
 				}
+
+				// Schedule sub-stage: the Stage 3 read, "find the next URL to
+				// dispatch". It opens the newest generation (the gen2 file when a
+				// compaction ran, else the base) and drains the due set off the mapped
+				// file with the bounded DueCursor, so a scheduler pulls work in capped
+				// batches instead of materializing the whole next_due column. The now is
+				// set past every scheduled due time, so the whole backlog is due and no
+				// page is pruned by the future-zone pushdown: this is the heaviest
+				// dispatch scan, the one to size the box against. The residency proof is
+				// the same as the write path: the scan reads next_due and key pages in
+				// stored order, so the base streams through as reclaimable cache rather
+				// than a resident working set.
+				if liveSchedule {
+					schedPath := livePath
+					if liveCompact {
+						schedPath = filepath.Join(outDir, fmt.Sprintf("%s.gen2.meguri", tag))
+					}
+					var (
+						schedDispatched int
+						schedBatches    int
+						schedLat        latStats
+						schedRate       float64
+						schedRSS        scale.RSSSplit
+						schedBytes      int64
+					)
+					scheduleStage, err := profiledStage(pprofDir, "live-schedule", tag, func() (scale.StageResult, error) {
+						return scale.StageResultFromLive(0, func() (uint64, error) {
+							if fi, se := os.Stat(schedPath); se == nil {
+								schedBytes = fi.Size()
+							}
+							eng, e := live.Open(schedPath)
+							if e != nil {
+								return 0, e
+							}
+							defer func() { _ = eng.Close() }()
+							cur, e := eng.DueCursor(^uint32(0))
+							if e != nil {
+								return 0, e
+							}
+							lat := newLatHist()
+							drainT0 := time.Now()
+							for {
+								t0 := time.Now()
+								batch, be := cur.NextBatch(liveScheduleBatch)
+								if be != nil {
+									return 0, be
+								}
+								if batch == nil {
+									break
+								}
+								lat.observe(time.Since(t0))
+								schedDispatched += len(batch)
+								schedBatches++
+							}
+							drainWall := time.Since(drainT0)
+							schedLat = lat.stats()
+							if drainWall > 0 {
+								schedRate = float64(schedDispatched) / drainWall.Seconds()
+							}
+							schedRSS = scale.ReadRSSSplit()
+							return uint64(schedBytes), nil
+						})
+					})
+					if err != nil {
+						return fmt.Errorf("live-schedule stage: %w", err)
+					}
+					scheduleStage = scale.WithURLs(scheduleStage, schedDispatched)
+					scheduleStage.RSS = schedRSS
+					scheduleStage.Disk = scale.DiskSummary{BytesRead: uint64(schedBytes)}
+					scheduleStage.Notes = fmt.Sprintf(
+						"%d urls dispatched off the mapped file in %d batches of %d, %s, NextBatch p50 %s p90 %s p99 %s max %s, dispatch %s urls/s",
+						schedDispatched, schedBatches, liveScheduleBatch,
+						rssNote(schedRSS),
+						schedLat.p50, schedLat.p90, schedLat.p99, schedLat.max, humanCount(schedRate))
+					result.Stages = append(result.Stages, scheduleStage)
+				}
 			}
 
 			// Write the JSON ledger entry and the human summary.
@@ -859,6 +937,8 @@ func newScaleCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&liveCompact, "live-compact", false, "run the Stage 2 write path (spec 2073 doc 08): buffer a bounded delta of recrawl updates and inserts, then compact it into the base .meguri to produce the next file generation with an atomic swap")
 	cmd.Flags().IntVar(&liveCompactUpd, "live-compact-updates", 1000000, "number of recrawl updates to buffer in the delta before compacting (existing keys re-fetched with fresh crawl state)")
 	cmd.Flags().IntVar(&liveCompactIns, "live-compact-inserts", 250000, "number of new keys to insert through the delta (discoveries not in the base)")
+	cmd.Flags().BoolVar(&liveSchedule, "live-schedule", false, "run the Stage 3 scheduler read (spec 2073 doc 08): drain the due set off the newest generation with the bounded DueCursor, capturing dispatch throughput and the anon/file RSS split")
+	cmd.Flags().IntVar(&liveScheduleBatch, "live-schedule-batch", 10000, "due-key batch cap for the schedule dispatch scan (the scheduler pulls work in capped batches, not the whole due set at once)")
 	return cmd
 }
 

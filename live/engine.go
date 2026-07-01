@@ -112,6 +112,16 @@ func (e *Engine) GetURL(key m.URLKey) (m.URLRecord, bool, error) {
 // paths (DueByWheel, Schedule, URLRows), which read the file directly.
 func (e *Engine) Reader() *format.Reader { return e.base }
 
+// DueCursor opens a bounded due-dispatch scan over the base file for the rows due
+// at or before now, the scheduler read of doc 08 Stage 3. It streams due keys off
+// the mapped file in caller-capped batches rather than materializing the whole
+// next_due column, so a scheduler pulls the next work at 100M without a
+// multi-gigabyte transient. A now the file's footer proves nothing is due for
+// yields an empty cursor without decoding a column.
+func (e *Engine) DueCursor(now uint32) (*format.DueCursor, error) {
+	return e.base.DueCursor(now)
+}
+
 // URLCount is the number of URLs in the base file.
 func (e *Engine) URLCount() int { return e.urlCount }
 

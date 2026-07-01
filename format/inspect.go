@@ -238,6 +238,7 @@ func flagNames(flags uint16) string {
 		{FlagHasSchedule, "schedule"},
 		{FlagHasSeenset, "seenset"},
 		{FlagHasBlob, "blob"},
+		{FlagBlobFrontCoded, "front-coded"},
 		{FlagSeensetIsRibbon, "ribbon"},
 		{FlagHasMPHF, "mphf"},
 		{FlagFooterCompressed, "footer-zstd"},

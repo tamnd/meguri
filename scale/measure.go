@@ -11,9 +11,13 @@ import (
 // the process reached during it. readRusage is supplied per platform (measure_unix.go
 // via getrusage, measure_windows.go via the process API).
 type rusageSnapshot struct {
-	user time.Duration
-	sys  time.Duration
-	rss  uint64
+	user    time.Duration
+	sys     time.Duration
+	rss     uint64
+	majflt  uint64 // major page faults: the ones that hit the disk, the mmap-read signal
+	minflt  uint64 // minor page faults: served from the page cache, no disk
+	inblock uint64 // block input operations charged to the process
+	oublock uint64 // block output operations charged to the process
 }
 
 // StageResultFromSeed measures a seed-type stage: fn builds the frontier and
@@ -128,6 +132,12 @@ func stageMetrics(stage string, urls int, fn func() (written uint64, err error))
 		Disk: DiskSummary{
 			BytesWritten: written,
 			OutputBytes:  written,
+		},
+		IO: IOSummary{
+			MajorFaults: ruAfter.majflt - ruBefore.majflt,
+			MinorFaults: ruAfter.minflt - ruBefore.minflt,
+			BlockIn:     ruAfter.inblock - ruBefore.inblock,
+			BlockOut:    ruAfter.oublock - ruBefore.oublock,
 		},
 	}
 	if peakHeap < after.HeapInuse {

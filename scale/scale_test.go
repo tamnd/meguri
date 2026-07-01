@@ -2,6 +2,7 @@ package scale
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -107,6 +108,59 @@ func TestStageMetricsCountsWork(t *testing.T) {
 	}
 	if res.AllocBytesPerURL <= 0 {
 		t.Fatal("alloc per url should be positive")
+	}
+}
+
+func TestStageMetricsStampsIO(t *testing.T) {
+	res, err := StageResultFromSeed(1000, func() (uint64, error) {
+		// Touch a few MB so the stage takes some minor faults growing the heap;
+		// the exact counts are platform-charged, so the assertion only checks the
+		// delta is a sane non-underflowed value, not a specific number.
+		sink := make([][]byte, 0, 256)
+		for range 256 {
+			sink = append(sink, make([]byte, 4096))
+		}
+		_ = sink
+		return 0, nil
+	})
+	if err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	// getrusage counters only grow, so a stage delta can never exceed a plausible
+	// ceiling for a few-MB workload; a wild value would mean the delta underflowed
+	// (subtracting a larger cumulative from a smaller one).
+	if res.IO.MajorFaults > 1<<40 || res.IO.MinorFaults > 1<<40 {
+		t.Fatalf("IO delta looks underflowed: major=%d minor=%d", res.IO.MajorFaults, res.IO.MinorFaults)
+	}
+}
+
+func TestStageResultJSONOmitsEmptyIOAndLatency(t *testing.T) {
+	// A stage with no IO and no hot op drops both keys, so a reader never sees an
+	// empty io block imply IO happened or a null latency imply a measured op.
+	bare, err := json.Marshal(StageResult{Stage: "seed", URLs: 10})
+	if err != nil {
+		t.Fatalf("marshal bare: %v", err)
+	}
+	if s := string(bare); strings.Contains(s, "\"io\"") || strings.Contains(s, "\"latency\"") {
+		t.Fatalf("bare stage should omit io and latency, got %s", s)
+	}
+	// A stage that took faults and measured a hot op carries both, machine-readably.
+	full := StageResult{
+		Stage: "live-schedule",
+		URLs:  100,
+		IO:    IOSummary{MajorFaults: 12107, MinorFaults: 900},
+		Latency: &LatencySummary{
+			Op: "NextBatch", Samples: 1536, P50Ns: 4096, P99Ns: 65536, MaxNs: 131072,
+		},
+	}
+	out, err := json.Marshal(full)
+	if err != nil {
+		t.Fatalf("marshal full: %v", err)
+	}
+	for _, want := range []string{"\"major_faults\":12107", "\"op\":\"NextBatch\"", "\"p99_ns\":65536"} {
+		if !strings.Contains(string(out), want) {
+			t.Fatalf("full stage json missing %q, got %s", want, out)
+		}
 	}
 }
 

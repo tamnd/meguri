@@ -86,22 +86,61 @@ type DiskSummary struct {
 	FsyncP99Ms   float64 `json:"fsync_p99_ms"`
 }
 
+// IOSummary is the kernel-charged IO side of a stage, read as a getrusage delta.
+// MajorFaults is the load-bearing metric for the file-backed engine: a major fault
+// is a page the mmap read pulled off the disk, so its per-stage delta is that stage's
+// real read-IO, the same figure /usr/bin/time labels "Major (requiring I/O) page
+// faults". MinorFaults are served from the page cache with no disk touch, so the
+// major/minor ratio reads how well the working set fits cache. BlockIn/BlockOut are
+// the process's charged block-layer operations; on Linux they read zero for page-cache
+// and mmap traffic (the block accounting is charged at fault time, not to the process),
+// so MajorFaults, not BlockIn, is the mmap read signal to trust.
+type IOSummary struct {
+	MajorFaults uint64 `json:"major_faults"`
+	MinorFaults uint64 `json:"minor_faults"`
+	BlockIn     uint64 `json:"block_in"`
+	BlockOut    uint64 `json:"block_out"`
+}
+
+// LatencySummary is the structured form of a per-op latency histogram: the percentile
+// edges and the max, in nanoseconds, plus the sample count and the engine-only rate
+// (count over summed observed durations, isolating the measured op from the corpus
+// parse the stage wall also includes). The command already renders these into the
+// stage Notes; this carries the same figures machine-readably into the ledger JSON so
+// a regression check can read p99 without parsing prose. Percentiles are the
+// log2-bucket upper edge, so they are order-of-magnitude exact, which is what a
+// hundreds-of-nanoseconds per-op latency needs.
+type LatencySummary struct {
+	Op            string  `json:"op"` // the measured operation, e.g. PutURL, Seen, NextBatch
+	Samples       uint64  `json:"samples"`
+	P50Ns         uint64  `json:"p50_ns"`
+	P90Ns         uint64  `json:"p90_ns"`
+	P99Ns         uint64  `json:"p99_ns"`
+	MaxNs         uint64  `json:"max_ns"`
+	EngineOpsPerS float64 `json:"engine_ops_per_second"`
+}
+
 // StageResult is one measured pipeline stage: what it processed, how long it took
-// in wall and CPU, the memory it cost, the disk it touched, and the throughput that
-// implies. Derived per-URL numbers (alloc/url, bytes/url) are computed from the
-// counts and the URL total so a reader does not recompute them.
+// in wall and CPU, the memory it cost, the disk and kernel IO it touched, the per-op
+// latency where the stage has a hot op, and the throughput that implies. Derived
+// per-URL numbers (alloc/url, bytes/url) are computed from the counts and the URL
+// total so a reader does not recompute them. Network has no field: the scale path is
+// offline (the seed is a local .mgs and no stage fetches), so there is no network IO
+// to measure and an empty field would only imply otherwise.
 type StageResult struct {
-	Stage            string      `json:"stage"`
-	URLs             int         `json:"urls"`
-	WallSeconds      float64     `json:"wall_seconds"`
-	CPU              CPUTime     `json:"cpu"`
-	Mem              MemSummary  `json:"mem"`
-	Disk             DiskSummary `json:"disk"`
-	URLsPerSecond    float64     `json:"urls_per_second"`     // count / wall, paired with CPU below
-	URLsPerCPUSec    float64     `json:"urls_per_cpu_second"` // count / user CPU, the load-stable rate
-	AllocBytesPerURL float64     `json:"alloc_bytes_per_url"`
-	RSS              RSSSplit    `json:"rss_split,omitzero"` // anon/file resident split, the doc 08 residency term
-	Notes            string      `json:"notes,omitempty"`
+	Stage            string          `json:"stage"`
+	URLs             int             `json:"urls"`
+	WallSeconds      float64         `json:"wall_seconds"`
+	CPU              CPUTime         `json:"cpu"`
+	Mem              MemSummary      `json:"mem"`
+	Disk             DiskSummary     `json:"disk"`
+	IO               IOSummary       `json:"io,omitzero"`         // kernel-charged faults and block ops, the read-IO term
+	URLsPerSecond    float64         `json:"urls_per_second"`     // count / wall, paired with CPU below
+	URLsPerCPUSec    float64         `json:"urls_per_cpu_second"` // count / user CPU, the load-stable rate
+	AllocBytesPerURL float64         `json:"alloc_bytes_per_url"`
+	RSS              RSSSplit        `json:"rss_split,omitzero"` // anon/file resident split, the doc 08 residency term
+	Latency          *LatencySummary `json:"latency,omitempty"`  // per-op histogram where the stage has a hot op
+	Notes            string          `json:"notes,omitempty"`
 }
 
 // Result aggregates a whole scale run: its provenance, the profile it ran, and one

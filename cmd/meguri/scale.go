@@ -425,6 +425,7 @@ func newScaleCmd() *cobra.Command {
 					ingestDisk     uint64
 					ingestSnap     uint64
 					ingestLat      latStats
+					ingestLatSum   *scale.LatencySummary
 				)
 				ingestStage, err := profiledStage(pprofDir, "ingest", tag, func() (scale.StageResult, error) {
 					return scale.StageResultFromIngest(len(lines), func() (uint64, error) {
@@ -494,6 +495,7 @@ func newScaleCmd() *cobra.Command {
 							return 0, e
 						}
 						ingestLat = putLat.stats()
+						ingestLatSum = putLat.summary("PutURL")
 						// Held residency: the live heap the store holds with the budget
 						// in force, measured before the checkpoint so it is the capped
 						// resident footprint, not the checkpoint encode spike.
@@ -546,6 +548,7 @@ func newScaleCmd() *cobra.Command {
 					float64(ingestDisk)/float64(max(ingestStage.URLs, 1)),
 					float64(ingestSnap)/float64(max(ingestStage.URLs, 1)),
 					ingestLat.p50, ingestLat.p90, ingestLat.p99, ingestLat.max)
+				ingestStage.Latency = ingestLatSum
 				result.Stages = append(result.Stages, ingestStage)
 			}
 
@@ -619,13 +622,14 @@ func newScaleCmd() *cobra.Command {
 				// never decodes a page. The handful of confirmed hits are false
 				// positives (a perturbed key is never really present).
 				var (
-					dedupURLs int
-					dedupBase uint64
-					dedupHit  int
-					dedupLat  latStats
-					dedupRate float64
-					dedupRSS  scale.RSSSplit
-					dedupBPU  float64
+					dedupURLs   int
+					dedupBase   uint64
+					dedupHit    int
+					dedupLat    latStats
+					dedupLatSum *scale.LatencySummary
+					dedupRate   float64
+					dedupRSS    scale.RSSSplit
+					dedupBPU    float64
 				)
 				const pathPerturb = 0x8000000000000001
 				dedupStage, err := profiledStage(pprofDir, "live-dedup", tag, func() (scale.StageResult, error) {
@@ -664,6 +668,7 @@ func newScaleCmd() *cobra.Command {
 							}
 						}
 						dedupLat = lat.stats()
+						dedupLatSum = lat.summary("Seen")
 						dedupRate = lat.engineRate()
 						dedupBase = eng.BaseProbes()
 						dedupRSS = scale.ReadRSSSplit()
@@ -680,6 +685,7 @@ func newScaleCmd() *cobra.Command {
 					dedupURLs, dedupURLs-int(dedupBase), dedupBase,
 					100*float64(dedupBase)/float64(max(dedupURLs, 1)), dedupHit, dedupBPU,
 					rssNote(dedupRSS), dedupLat.p50, dedupLat.p99, humanCount(dedupRate))
+				dedupStage.Latency = dedupLatSum
 				result.Stages = append(result.Stages, dedupStage)
 
 				// Rediscover sub-stage: the minority path, a rediscovery that hits the
@@ -689,11 +695,12 @@ func newScaleCmd() *cobra.Command {
 				// not run over the whole corpus, because the slow path's per-op cost is
 				// what we characterize, not its aggregate (a real stream hits it rarely).
 				var (
-					rediscSeen int
-					rediscN    int
-					rediscLat  latStats
-					rediscRate float64
-					rediscRSS  scale.RSSSplit
+					rediscSeen   int
+					rediscN      int
+					rediscLat    latStats
+					rediscLatSum *scale.LatencySummary
+					rediscRate   float64
+					rediscRSS    scale.RSSSplit
 				)
 				rediscStage, err := profiledStage(pprofDir, "live-rediscover", tag, func() (scale.StageResult, error) {
 					return scale.StageResultFromLive(0, func() (uint64, error) {
@@ -738,6 +745,7 @@ func newScaleCmd() *cobra.Command {
 							}
 						}
 						rediscLat = lat.stats()
+						rediscLatSum = lat.summary("Seen")
 						rediscRate = lat.engineRate()
 						rediscRSS = scale.ReadRSSSplit()
 						return uint64(buildRes.FileBytes), nil
@@ -754,6 +762,7 @@ func newScaleCmd() *cobra.Command {
 					rediscSeen, rediscN, 64,
 					rssNote(rediscRSS),
 					rediscLat.p50, rediscLat.p90, rediscLat.p99, rediscLat.max, humanCount(rediscRate))
+				rediscStage.Latency = rediscLatSum
 				result.Stages = append(result.Stages, rediscStage)
 
 				// Compact sub-stage: the Stage 2 write path. Buffer a bounded delta of
@@ -839,6 +848,7 @@ func newScaleCmd() *cobra.Command {
 						schedDispatched int
 						schedBatches    int
 						schedLat        latStats
+						schedLatSum     *scale.LatencySummary
 						schedRate       float64
 						schedRSS        scale.RSSSplit
 						schedBytes      int64
@@ -874,6 +884,7 @@ func newScaleCmd() *cobra.Command {
 							}
 							drainWall := time.Since(drainT0)
 							schedLat = lat.stats()
+							schedLatSum = lat.summary("NextBatch")
 							if drainWall > 0 {
 								schedRate = float64(schedDispatched) / drainWall.Seconds()
 							}
@@ -892,6 +903,7 @@ func newScaleCmd() *cobra.Command {
 						schedDispatched, schedBatches, liveScheduleBatch,
 						rssNote(schedRSS),
 						schedLat.p50, schedLat.p90, schedLat.p99, schedLat.max, humanCount(schedRate))
+					scheduleStage.Latency = schedLatSum
 					result.Stages = append(result.Stages, scheduleStage)
 				}
 
@@ -1236,6 +1248,23 @@ func (h *latHist) stats() latStats {
 		p90: pick((h.count*90 + 99) / 100),
 		p99: pick((h.count*99 + 99) / 100),
 		max: edge(maxB),
+	}
+}
+
+// summary renders the histogram into the structured scale.LatencySummary the ledger
+// carries. It tags the figures with the op name so a reader knows which hot path they
+// measure, and pairs the percentile edges with the sample count and the engine-only
+// rate. It is the machine-readable twin of the p50/p90/p99 the stage Notes print.
+func (h *latHist) summary(op string) *scale.LatencySummary {
+	s := h.stats()
+	return &scale.LatencySummary{
+		Op:            op,
+		Samples:       h.count,
+		P50Ns:         uint64(s.p50),
+		P90Ns:         uint64(s.p90),
+		P99Ns:         uint64(s.p99),
+		MaxNs:         uint64(s.max),
+		EngineOpsPerS: h.engineRate(),
 	}
 }
 

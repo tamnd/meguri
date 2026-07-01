@@ -49,9 +49,15 @@ func (a *ArenaSeqReader) decodeNext() (bool, error) {
 		a.full = true
 		return false, nil
 	}
-	_, payload, consumed, err := readPage(a.region[a.off:])
+	h, payload, consumed, err := readPage(a.region[a.off:])
 	if err != nil {
 		return false, err
+	}
+	if h.encoding == EncFrontCode {
+		payload, err = unFrontCodePayload(payload)
+		if err != nil {
+			return false, err
+		}
 	}
 	a.off += consumed
 	a.window = append(a.window, payload...)

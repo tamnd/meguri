@@ -63,6 +63,14 @@ type Partition struct {
 	// mechanism it turns on.
 	MaxPageRows int
 
+	// BlobFrontCode asks the encoder to front-code the string blob region (Spec 2074
+	// M1): each string stored as the shared-prefix length with the previous string
+	// in its page plus the literal suffix, ahead of the block codec. Off by default
+	// so a partition that does not opt in stays byte-for-byte the same and the pinned
+	// size baselines do not move; the live engine's writers set it. The transform is
+	// reversed to the exact raw arena on decode, so the *Ref offsets are unchanged.
+	BlobFrontCode bool
+
 	Meta map[string]string // optional string metadata, keys sorted on write
 }
 

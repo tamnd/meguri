@@ -167,16 +167,17 @@ func Compact(basePath string, delta *Delta, opts CompactOptions) (CompactResult,
 	// reader never sees a half-written generation.
 	tmpOut := opts.OutPath + ".tmp"
 	p := &format.Partition{
-		ID:           opts.PartitionID,
-		HostKeyLo:    hostKeyLo,
-		HostKeyHi:    hostKeyHi,
-		CreatedHours: opts.NowHours,
-		DefaultCodec: opts.Codec,
-		Hosts:        hostRecs,
-		StringsAt:    arena.file(),
-		StringsSize:  arena.size(),
-		SeenFilter:   filter.Marshal(),
-		MaxPageRows:  opts.PageRows,
+		ID:            opts.PartitionID,
+		HostKeyLo:     hostKeyLo,
+		HostKeyHi:     hostKeyHi,
+		CreatedHours:  opts.NowHours,
+		DefaultCodec:  opts.Codec,
+		Hosts:         hostRecs,
+		StringsAt:     arena.file(),
+		StringsSize:   arena.size(),
+		SeenFilter:    filter.Marshal(),
+		MaxPageRows:   opts.PageRows,
+		BlobFrontCode: true,
 	}
 	source := &recordSource{r: bufio.NewReaderSize(recFile, 1<<20)}
 	encErr := format.StreamEncodeToFile(tmpOut, source, opts.PageRows, p, work)

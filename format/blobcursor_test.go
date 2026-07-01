@@ -25,7 +25,7 @@ func TestArenaSeqReader(t *testing.T) {
 
 	// Frame the arena into 24-byte pages so most spans cross at least one page edge.
 	var region bytes.Buffer
-	if _, err := streamBlobRegion(&region, bytes.NewReader(arena), int64(len(arena)), 24, CodecZstd); err != nil {
+	if _, err := streamBlobRegion(&region, bytes.NewReader(arena), int64(len(arena)), 24, CodecZstd, false); err != nil {
 		t.Fatalf("streamBlobRegion: %v", err)
 	}
 

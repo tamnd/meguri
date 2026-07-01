@@ -131,14 +131,14 @@ func StreamEncodeToFile(path string, src URLRecordSource, maxRows int, p *Partit
 		if p.StringsSize > 0 {
 			off := pos
 			rc := crc32.New(castagnoli)
-			n, e := streamBlobRegion(io.MultiWriter(w, rc), p.StringsAt, p.StringsSize, 0, codec)
+			n, e := streamBlobRegion(io.MultiWriter(w, rc), p.StringsAt, p.StringsSize, 0, codec, p.BlobFrontCode)
 			if e != nil {
 				return e
 			}
 			pos += uint64(n)
 			regions = append(regions, regionDesc{id: RegionStringBlob, offset: off, length: uint64(n), crc: rc.Sum32()})
 		}
-	} else if blob := encodeBlobRegion(p.Strings, codec); len(blob) > 0 {
+	} else if blob := encodeBlobRegion(p.Strings, codec, p.BlobFrontCode); len(blob) > 0 {
 		if err = writeRegion(RegionStringBlob, blob); err != nil {
 			return err
 		}
@@ -189,6 +189,9 @@ func StreamEncodeToFile(path string, src URLRecordSource, maxRows int, p *Partit
 	}
 	if _, ok := findRegion(regions, RegionStringBlob); ok {
 		flags |= FlagHasBlob
+		if p.BlobFrontCode {
+			flags |= FlagBlobFrontCoded
+		}
 	}
 	h := &Header{
 		VersionMajor: VersionMajor,
@@ -225,8 +228,8 @@ type URLRecordSource interface {
 type colStream struct {
 	schema column // id, width, kind, enc, codec; data is unused here
 
-	f       *os.File   // temp file holding this column's encoded pages in order
-	crc     io.Writer  // crc32c hash over the page span, fed each page
+	f       *os.File  // temp file holding this column's encoded pages in order
+	crc     io.Writer // crc32c hash over the page span, fed each page
 	sum     func() uint32
 	written uint64 // bytes spilled to f so far
 

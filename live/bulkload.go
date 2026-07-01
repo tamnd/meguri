@@ -29,12 +29,12 @@ type Source interface {
 
 // BuildOptions configures a bulk build.
 type BuildOptions struct {
-	Path         string // output .meguri file
-	TmpDir       string // scratch for sort runs, the arena, and the records temp
-	ExpectedKeys uint64 // sizes the resident filter; the corpus row count is exact
-	RunRows      int    // sort buffer cap in rows (0 = 1<<20)
-	PageRows     int    // encoder page row cap (0 = single page, not for scale)
-	Codec        uint8  // format.CodecZstd for the compact file
+	Path         string  // output .meguri file
+	TmpDir       string  // scratch for sort runs, the arena, and the records temp
+	ExpectedKeys uint64  // sizes the resident filter; the corpus row count is exact
+	RunRows      int     // sort buffer cap in rows (0 = 1<<20)
+	PageRows     int     // encoder page row cap (0 = single page, not for scale)
+	Codec        uint8   // format.CodecZstd for the compact file
 	FPRate       float64 // filter false-positive budget (0 = 1%)
 	NowHours     uint32  // epoch-hours stamped as FirstSeen and NextDue
 	PartitionID  uint32
@@ -46,9 +46,9 @@ type BuildOptions struct {
 
 // BuildResult reports what a bulk build produced.
 type BuildResult struct {
-	URLCount  int
-	HostCount int
-	FileBytes int64
+	URLCount   int
+	HostCount  int
+	FileBytes  int64
 	BitsPerURL float64
 }
 
@@ -226,16 +226,17 @@ func BulkLoad(src Source, opts BuildOptions) (BuildResult, error) {
 	// the records temp; the arena temp is the string region read through StringsAt.
 	filterBytes := filter.Marshal()
 	p := &format.Partition{
-		ID:           opts.PartitionID,
-		HostKeyLo:    hostKeyLo,
-		HostKeyHi:    hostKeyHi,
-		CreatedHours: opts.NowHours,
-		DefaultCodec: opts.Codec,
-		Hosts:        hostRecs,
-		StringsAt:    arena.file(),
-		StringsSize:  arena.size(),
-		SeenFilter:   filterBytes,
-		MaxPageRows:  opts.PageRows,
+		ID:            opts.PartitionID,
+		HostKeyLo:     hostKeyLo,
+		HostKeyHi:     hostKeyHi,
+		CreatedHours:  opts.NowHours,
+		DefaultCodec:  opts.Codec,
+		Hosts:         hostRecs,
+		StringsAt:     arena.file(),
+		StringsSize:   arena.size(),
+		SeenFilter:    filterBytes,
+		MaxPageRows:   opts.PageRows,
+		BlobFrontCode: true,
 	}
 	source := &recordSource{r: bufio.NewReaderSize(recFile, 1<<20)}
 	encErr := format.StreamEncodeToFile(opts.Path, source, opts.PageRows, p, work)

@@ -204,16 +204,17 @@ func Recrawl(basePath string, opts RecrawlOptions) (RecrawlResult, error) {
 	// Phase 3: streaming columnar encode into a temp file, then an atomic rename.
 	tmpOut := opts.OutPath + ".tmp"
 	p := &format.Partition{
-		ID:           opts.PartitionID,
-		HostKeyLo:    hostKeyLo,
-		HostKeyHi:    hostKeyHi,
-		CreatedHours: opts.NowHours,
-		DefaultCodec: opts.Codec,
-		Hosts:        hostRecs,
-		StringsAt:    arena.file(),
-		StringsSize:  arena.size(),
-		SeenFilter:   filter.Marshal(),
-		MaxPageRows:  opts.PageRows,
+		ID:            opts.PartitionID,
+		HostKeyLo:     hostKeyLo,
+		HostKeyHi:     hostKeyHi,
+		CreatedHours:  opts.NowHours,
+		DefaultCodec:  opts.Codec,
+		Hosts:         hostRecs,
+		StringsAt:     arena.file(),
+		StringsSize:   arena.size(),
+		SeenFilter:    filter.Marshal(),
+		MaxPageRows:   opts.PageRows,
+		BlobFrontCode: true,
 	}
 	source := &recordSource{r: bufio.NewReaderSize(recFile, 1<<20)}
 	encErr := format.StreamEncodeToFile(tmpOut, source, opts.PageRows, p, work)

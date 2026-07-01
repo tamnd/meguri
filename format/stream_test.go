@@ -216,27 +216,37 @@ func streamTestPartition(codec uint8, maxRows int, urls []m.URLRecord) *Partitio
 // offsets, which index the uncompressed arena, survive the multi-page framing.
 func TestStreamBlobRegionRoundTrip(t *testing.T) {
 	arena := []byte{0}
+	prefix := []byte("https://example.com/path/")
 	for i := range 5000 {
-		arena = binary.AppendUvarint(arena, uint64(len("https://example.com/path/")+i%7))
-		arena = append(arena, []byte("https://example.com/path/")...)
-		arena = append(arena, byte('a'+i%26))
+		// A valid self-delimiting arena: each span's declared length matches the
+		// bytes that follow. The shared prefix plus a varying-length suffix gives
+		// the front-coding path real prefix sharing to reverse, and the raw path
+		// still frames the same bytes opaquely.
+		suf := i%7 + 1
+		arena = binary.AppendUvarint(arena, uint64(len(prefix)+suf))
+		arena = append(arena, prefix...)
+		for j := range suf {
+			arena = append(arena, byte('a'+(i+j)%26))
+		}
 	}
-	for _, codec := range []uint8{CodecNone, CodecZstd} {
-		for _, chunk := range []int{1, 7, 64, 1000, len(arena), len(arena) + 1} {
-			var got bytes.Buffer
-			n, err := streamBlobRegion(&got, bytes.NewReader(arena), int64(len(arena)), chunk, codec)
-			if err != nil {
-				t.Fatalf("codec=%d chunk=%d: stream: %v", codec, chunk, err)
-			}
-			if int(n) != got.Len() {
-				t.Fatalf("codec=%d chunk=%d: reported len %d != written %d", codec, chunk, n, got.Len())
-			}
-			back, err := decodeBlobRegion(got.Bytes())
-			if err != nil {
-				t.Fatalf("codec=%d chunk=%d: decode: %v", codec, chunk, err)
-			}
-			if !bytes.Equal(back, arena) {
-				t.Fatalf("codec=%d chunk=%d: arena round trip differs (%d vs %d bytes)", codec, chunk, len(back), len(arena))
+	for _, frontCode := range []bool{false, true} {
+		for _, codec := range []uint8{CodecNone, CodecZstd} {
+			for _, chunk := range []int{1, 7, 64, 1000, len(arena), len(arena) + 1} {
+				var got bytes.Buffer
+				n, err := streamBlobRegion(&got, bytes.NewReader(arena), int64(len(arena)), chunk, codec, frontCode)
+				if err != nil {
+					t.Fatalf("fc=%v codec=%d chunk=%d: stream: %v", frontCode, codec, chunk, err)
+				}
+				if int(n) != got.Len() {
+					t.Fatalf("fc=%v codec=%d chunk=%d: reported len %d != written %d", frontCode, codec, chunk, n, got.Len())
+				}
+				back, err := decodeBlobRegion(got.Bytes())
+				if err != nil {
+					t.Fatalf("fc=%v codec=%d chunk=%d: decode: %v", frontCode, codec, chunk, err)
+				}
+				if !bytes.Equal(back, arena) {
+					t.Fatalf("fc=%v codec=%d chunk=%d: arena round trip differs (%d vs %d bytes)", frontCode, codec, chunk, len(back), len(arena))
+				}
 			}
 		}
 	}

@@ -43,6 +43,12 @@ const (
 	EncRLE      uint8 = 4
 	EncFSST     uint8 = 5
 	EncDeltaFOR uint8 = 6
+	// EncFrontCode marks a blob page whose payload is front-coded: each string is
+	// stored as the shared-prefix length with the previous string in the page plus
+	// the literal suffix, the first string of every page a restart (shared 0). It is
+	// a meguri extension past tatami's enum (Spec 2074 M1), reversed back to the raw
+	// arena bytes on decode so the *Ref offsets are unchanged.
+	EncFrontCode uint8 = 7
 )
 
 // Header flag bits.
@@ -54,6 +60,10 @@ const (
 	FlagSeensetIsRibbon  uint16 = 1 << 4
 	FlagHasMPHF          uint16 = 1 << 5
 	FlagFooterCompressed uint16 = 1 << 6
+	// FlagBlobFrontCoded records that the string blob region's pages are front-coded
+	// (EncFrontCode) rather than raw. A reader that does not know the layout rejects
+	// the file rather than misresolving a ref against bytes it cannot reverse.
+	FlagBlobFrontCoded uint16 = 1 << 7
 )
 
 // Region ids, the fixed order regions appear in a .meguri file.

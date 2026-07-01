@@ -54,7 +54,7 @@ func Encode(p *Partition) ([]byte, error) {
 	seenOff := pos
 	pos += uint64(len(seenRegion))
 
-	blobRegion := encodeBlobRegion(p.Strings, codec)
+	blobRegion := encodeBlobRegion(p.Strings, codec, p.BlobFrontCode)
 	strOff := pos
 	pos += uint64(len(blobRegion))
 
@@ -116,6 +116,9 @@ func Encode(p *Partition) ([]byte, error) {
 	}
 	if len(p.Strings) > 0 {
 		flags |= FlagHasBlob
+		if p.BlobFrontCode {
+			flags |= FlagBlobFrontCoded
+		}
 	}
 	h := &Header{
 		VersionMajor: VersionMajor,
@@ -233,7 +236,7 @@ func EncodeToFile(path string, p *Partition) (err error) {
 			return err
 		}
 	}
-	if blob := encodeBlobRegion(p.Strings, codec); len(blob) > 0 {
+	if blob := encodeBlobRegion(p.Strings, codec, p.BlobFrontCode); len(blob) > 0 {
 		if err = writeRegion(RegionStringBlob, blob); err != nil {
 			return err
 		}
@@ -291,6 +294,9 @@ func EncodeToFile(path string, p *Partition) (err error) {
 	}
 	if _, ok := findRegion(regions, RegionStringBlob); ok {
 		flags |= FlagHasBlob
+		if p.BlobFrontCode {
+			flags |= FlagBlobFrontCoded
+		}
 	}
 	h := &Header{
 		VersionMajor: VersionMajor,

@@ -209,6 +209,7 @@ func newScaleCmd() *cobra.Command {
 		mergeBatch        int
 		doCheckpoint      bool
 		doLive            bool
+		liveOpen          string
 		liveExpect        uint64
 		liveRunRows       int
 		liveSample        int
@@ -564,52 +565,66 @@ func newScaleCmd() *cobra.Command {
 			// box caps, file is the mapped base the kernel reclaims first.
 			if doLive {
 				livePath := filepath.Join(outDir, fmt.Sprintf("%s.live.meguri", tag))
-				if err := os.Remove(livePath); err != nil && !os.IsNotExist(err) {
-					return err
-				}
 				var (
 					buildRes live.BuildResult
 					buildRSS scale.RSSSplit
 				)
-				buildStage, err := profiledStage(pprofDir, "live-build", tag, func() (scale.StageResult, error) {
-					return scale.StageResultFromLive(0, func() (uint64, error) {
-						src, e := newCorpusSource(input)
-						if e != nil {
-							return 0, e
-						}
-						r, e := live.BulkLoad(src, live.BuildOptions{
-							Path:         livePath,
-							TmpDir:       outDir,
-							ExpectedKeys: liveExpect,
-							RunRows:      liveRunRows,
-							PageRows:     pageRows,
-							FPRate:       liveFP,
-							Codec:        format.CodecZstd,
-							NowHours:     uint32(time.Now().Unix() / 3600),
-							Status:       meguri.StatusScheduled,
-							Source:       meguri.SourceSeed,
-						})
-						if e != nil {
+				// --live-open points the read passes at an existing .meguri and skips the
+				// build sub-stage, so dedup, rediscover, and schedule replay a prebuilt
+				// store without a 35-minute rebuild or its scratch. The build's only
+				// downstream input is the file's byte size (dedup and compact stamp it as
+				// BytesRead), so a Stat is all the later stages need from a skipped build.
+				if liveOpen != "" {
+					livePath = liveOpen
+					fi, se := os.Stat(livePath)
+					if se != nil {
+						return fmt.Errorf("live-open %q: %w", liveOpen, se)
+					}
+					buildRes.FileBytes = fi.Size()
+				} else {
+					if err := os.Remove(livePath); err != nil && !os.IsNotExist(err) {
+						return err
+					}
+					buildStage, err := profiledStage(pprofDir, "live-build", tag, func() (scale.StageResult, error) {
+						return scale.StageResultFromLive(0, func() (uint64, error) {
+							src, e := newCorpusSource(input)
+							if e != nil {
+								return 0, e
+							}
+							r, e := live.BulkLoad(src, live.BuildOptions{
+								Path:         livePath,
+								TmpDir:       outDir,
+								ExpectedKeys: liveExpect,
+								RunRows:      liveRunRows,
+								PageRows:     pageRows,
+								FPRate:       liveFP,
+								Codec:        format.CodecZstd,
+								NowHours:     uint32(time.Now().Unix() / 3600),
+								Status:       meguri.StatusScheduled,
+								Source:       meguri.SourceSeed,
+							})
+							if e != nil {
+								_ = src.close()
+								return 0, e
+							}
 							_ = src.close()
-							return 0, e
-						}
-						_ = src.close()
-						buildRes = r
-						buildRSS = scale.ReadRSSSplit()
-						return uint64(r.FileBytes), nil
+							buildRes = r
+							buildRSS = scale.ReadRSSSplit()
+							return uint64(r.FileBytes), nil
+						})
 					})
-				})
-				if err != nil {
-					return fmt.Errorf("live-build stage: %w", err)
+					if err != nil {
+						return fmt.Errorf("live-build stage: %w", err)
+					}
+					buildStage = scale.WithURLs(buildStage, buildRes.URLCount)
+					buildStage.RSS = buildRSS
+					buildStage.Notes = fmt.Sprintf(
+						"%d urls, %d hosts, file %.2f B/url, filter %.2f bits/url, anon %s after build",
+						buildRes.URLCount, buildRes.HostCount,
+						float64(buildRes.FileBytes)/float64(max(buildRes.URLCount, 1)),
+						buildRes.BitsPerURL, humanRSSBytes(buildRSS.AnonBytes))
+					result.Stages = append(result.Stages, buildStage)
 				}
-				buildStage = scale.WithURLs(buildStage, buildRes.URLCount)
-				buildStage.RSS = buildRSS
-				buildStage.Notes = fmt.Sprintf(
-					"%d urls, %d hosts, file %.2f B/url, filter %.2f bits/url, anon %s after build",
-					buildRes.URLCount, buildRes.HostCount,
-					float64(buildRes.FileBytes)/float64(max(buildRes.URLCount, 1)),
-					buildRes.BitsPerURL, humanRSSBytes(buildRSS.AnonBytes))
-				result.Stages = append(result.Stages, buildStage)
 
 				// Dedup sub-stage: map the file back and replay the corpus as a stream
 				// of fresh discoveries, the common intake case. Each key is perturbed so
@@ -1017,6 +1032,7 @@ func newScaleCmd() *cobra.Command {
 	cmd.Flags().IntVar(&mergeBatch, "merge-batch", 0, "discoveries to accumulate before folding into the DRUM repository (0 picks the 2M default); smaller batches merge more often for less in-flight RAM")
 	cmd.Flags().BoolVar(&doCheckpoint, "checkpoint", true, "write the durable checkpoint after ingest; set false to measure pure ingest residency without the snapshot encode (the durable log+drum+arena store survives without the .meguri export)")
 	cmd.Flags().BoolVar(&doLive, "live", false, "drive the clean-room file-backed engine (spec 2073 doc 08): bulk-load the corpus into one mmapped .meguri file, then replay it as a dedup pass, capturing the anon/file RSS split")
+	cmd.Flags().StringVar(&liveOpen, "live-open", "", "open an existing .meguri for the live read passes instead of building one; skips the build sub-stage so dedup, rediscover, and schedule replay a prebuilt store without a rebuild")
 	cmd.Flags().Uint64Var(&liveExpect, "live-expect", 0, "expected distinct URL count for the live build (sizes the resident filter; 0 picks 1M, pass the real corpus size for a 100M run)")
 	cmd.Flags().IntVar(&liveRunRows, "live-run-rows", 0, "external-sort buffer cap in rows for the live build (0 picks 1M, the bounded-memory sort window)")
 	cmd.Flags().IntVar(&liveSample, "live-sample", 100000, "present-key sample size for the live-rediscover stage (the base point-lookup latency is characterized on a sample, not the whole corpus)")

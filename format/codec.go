@@ -96,7 +96,16 @@ func encoder() *zstd.Encoder {
 
 func decoder() *zstd.Decoder {
 	zstdDecOnce.Do(func() {
-		zstdDec, _ = zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
+		// Concurrency 0 means GOMAXPROCS, so concurrent DecodeAll calls run in
+		// parallel instead of serializing on a single decode slot. The decoder is a
+		// process-wide singleton shared by every open shard, so the sharded store's
+		// parallel confirm path (N workers each decoding their shard's key pages at
+		// once) is only parallel if the decoder lets that many decodes proceed. A
+		// concurrency of 1 quietly serialized them, which erased the per-shard
+		// speedup. Decode output is deterministic regardless of concurrency, so this
+		// does not affect the byte-stable round-trip the encoder's concurrency 1
+		// guards.
+		zstdDec, _ = zstd.NewReader(nil, zstd.WithDecoderConcurrency(0))
 	})
 	return zstdDec
 }

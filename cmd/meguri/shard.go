@@ -46,6 +46,7 @@ func newShardBuildCmd() *cobra.Command {
 		store   string
 		pool    int
 		codec   string
+		fpr     float64
 	)
 	cmd := &cobra.Command{
 		Use:   "build",
@@ -59,19 +60,20 @@ func newShardBuildCmd() *cobra.Command {
 			if codec == "none" || codec == "raw" {
 				cd = format.CodecNone
 			}
-			return runShardBuild(cmd.OutOrStdout(), seedDir, store, pool, cd)
+			return runShardBuild(cmd.OutOrStdout(), seedDir, store, pool, cd, fpr)
 		},
 	}
 	cmd.Flags().StringVar(&seedDir, "seed", "", "seed directory holding the .mgs shards and manifest")
 	cmd.Flags().StringVar(&store, "store", "", "output directory for the shard .meguri files and store manifest")
 	cmd.Flags().IntVar(&pool, "pool", 0, "concurrent shard builds (0 = number of cores)")
 	cmd.Flags().StringVar(&codec, "codec", "zstd", "shard body codec: zstd or none")
+	cmd.Flags().Float64Var(&fpr, "fpr", 1e-4, "seen-set filter false-positive budget per shard (the spec target)")
 	return cmd
 }
 
 // runShardBuild reads the seed manifest and builds every shard's .meguri with the
 // bounded pool, then reports per-shard and aggregate numbers.
-func runShardBuild(stdout io.Writer, seedDir, store string, pool int, codec uint8) error {
+func runShardBuild(stdout io.Writer, seedDir, store string, pool int, codec uint8, fpr float64) error {
 	man, err := seed.ReadManifest(seedDir)
 	if err != nil {
 		return err
@@ -98,6 +100,7 @@ func runShardBuild(stdout io.Writer, seedDir, store string, pool int, codec uint
 				TmpDir:       store,
 				ExpectedKeys: expect,
 				Codec:        codec,
+				FPRate:       fpr,
 			},
 		}
 	}

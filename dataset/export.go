@@ -226,8 +226,15 @@ type arenaResolver interface {
 // walk jumps backward and one shared random reader (the whole arena resident) serves all
 // three. seq reports which kind so the caller knows whether a backward etag ref is a
 // real loss or cannot happen.
+//
+// MEGURI_FORCE_SEQ=1 forces the sequential resolvers regardless of the flag. It exists for
+// a legacy file whose arena is ascending and key-ordered but whose header predates
+// FlagBlobFrontCoded, so the gate would otherwise fall back to the whole-arena random path
+// that a 100M export cannot afford. decodeNext passes a raw page through unchanged, so the
+// override reads such a file correctly; do not set it on an engine checkpoint, whose arena
+// is not key-ordered and would resolve wrong strings.
 func newArenaResolvers(r *format.Reader) (host, url, etag arenaResolver, seq bool, err error) {
-	if r.Header().Flags&format.FlagBlobFrontCoded != 0 {
+	if r.Header().Flags&format.FlagBlobFrontCoded != 0 || os.Getenv("MEGURI_FORCE_SEQ") == "1" {
 		return r.ArenaSeqReader(), r.ArenaSeqReader(), r.ArenaSeqReader(), true, nil
 	}
 	rand, err := r.ArenaRandReader()

@@ -327,6 +327,7 @@ func newShardRecrawlCmd() *cobra.Command {
 		pageRows int
 		codec    string
 		fpr      float64
+		cpuProf  string
 	)
 	cmd := &cobra.Command{
 		Use:   "recrawl",
@@ -347,9 +348,21 @@ func newShardRecrawlCmd() *cobra.Command {
 			if now == 0 {
 				now = uint32(time.Now().Unix() / 3600)
 			}
+			if cpuProf != "" {
+				cf, err := os.Create(cpuProf)
+				if err != nil {
+					return err
+				}
+				defer cf.Close()
+				if err := pprof.StartCPUProfile(cf); err != nil {
+					return err
+				}
+				defer pprof.StopCPUProfile()
+			}
 			return runShardRecrawl(cmd.OutOrStdout(), store, out, now, tau, change, pool, pageRows, cd, fpr)
 		},
 	}
+	cmd.Flags().StringVar(&cpuProf, "cpuprofile", "", "write a CPU profile of the recrawl fold to this path")
 	cmd.Flags().StringVar(&store, "store", "", "input store directory holding the shard .meguri files and manifest")
 	cmd.Flags().StringVar(&out, "out", "", "output directory for the next generation's shard files and manifest")
 	cmd.Flags().Uint32Var(&now, "now", 0, "epoch-hours the fold treats as now; a row with 0 < NextDue <= now is due (0 = wall-clock now, past every build --now-hours stamp)")
@@ -429,6 +442,7 @@ func newShardCompactCmd() *cobra.Command {
 		pageRows int
 		codec    string
 		fpr      float64
+		cpuProf  string
 	)
 	cmd := &cobra.Command{
 		Use:   "compact",
@@ -449,9 +463,21 @@ func newShardCompactCmd() *cobra.Command {
 			if now == 0 {
 				now = uint32(time.Now().Unix() / 3600)
 			}
+			if cpuProf != "" {
+				cf, err := os.Create(cpuProf)
+				if err != nil {
+					return err
+				}
+				defer cf.Close()
+				if err := pprof.StartCPUProfile(cf); err != nil {
+					return err
+				}
+				defer pprof.StopCPUProfile()
+			}
 			return runShardCompact(cmd.OutOrStdout(), seedDir, store, out, updates, inserts, now, pool, pageRows, cd, fpr)
 		},
 	}
+	cmd.Flags().StringVar(&cpuProf, "cpuprofile", "", "write a CPU profile of the compaction fold to this path")
 	cmd.Flags().StringVar(&seedDir, "seed", "", "seed directory holding the .mgs shards; the delta is drawn from each shard's slice")
 	cmd.Flags().StringVar(&store, "store", "", "input store directory holding the shard .meguri files and manifest")
 	cmd.Flags().StringVar(&out, "out", "", "output directory for the next generation's shard files and manifest")

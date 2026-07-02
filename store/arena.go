@@ -1,9 +1,6 @@
 package store
 
-import (
-	"encoding/binary"
-	"os"
-)
+import "encoding/binary"
 
 // The string arena is the live form of the .meguri string region (doc 10 section
 // 7, doc 11 section 3.3): a flat byte buffer where every entry is a uvarint
@@ -54,23 +51,4 @@ func readArenaBytes(arena []byte, off uint64) []byte {
 		return nil
 	}
 	return arena[start:end]
-}
-
-// writeFileSync writes b to path and fsyncs it before returning, so the file is
-// on the device when the call completes. The checkpoint uses it for the .meguri
-// snapshot, whose durability the superblock commit then depends on.
-func writeFileSync(path string, b []byte) error {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
-	}
-	if _, err := f.Write(b); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return err
-	}
-	return f.Close()
 }

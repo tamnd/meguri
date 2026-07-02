@@ -11,8 +11,8 @@ import (
 
 // The ribbon filter is the cold, read-mostly form of the seen-set's approximate
 // tier (doc 08, section 3.2): a static one-sided membership filter that holds the
-// same keys as the blocked-Bloom filter at about 7 bits per url instead of 11,
-// the 30% space win the spec calls for. It is build-once: a frozen snapshot
+// same keys as the blocked-Bloom filter at about 8 bits per url instead of 11,
+// the space win the spec calls for. It is build-once: a frozen snapshot
 // solves a banded linear system over the keys, and a query recomputes a few words
 // and compares, so it never inserts. The membership contract is identical to the
 // blocked-Bloom filter, one-sided: a key that was built into the filter always
@@ -31,8 +31,8 @@ import (
 
 const (
 	ribbonWidth      = 64   // band width in slots, one uint64 coefficient row
-	defaultRibbonR   = 7    // fingerprint bits, ~7 bits/url and a 2^-7 false-positive rate
-	ribbonLoad       = 0.90 // keys per slot target; m = ceil(n/load), the space-vs-solve knob
+	defaultRibbonR   = 7    // fingerprint bits, ~8 bits/url and a 2^-7 false-positive rate
+	ribbonLoad       = 0.85 // keys per slot target; m = ceil(n/load), the space-vs-solve knob
 	maxRibbonSeeds   = 64   // hash reseeds tried before growing the table
 	maxRibbonGrows   = 4    // table growth steps before giving up
 	maxRibbonRBits   = 16   // a fingerprint fits in a uint16 slot
@@ -91,11 +91,16 @@ func ribbonDerive(key meguri.URLKey, seed uint32, m int, rbits uint) (start int,
 }
 
 // solveRibbon attempts to build the slot values for keys at a fixed table size m
-// and seed. It returns ok=false when the banded system is inconsistent or a row's
-// support runs past the table, the signal to reseed or grow.
-func solveRibbon(keys []meguri.URLKey, rbits uint, seed uint32, m int) (z []uint16, ok bool) {
-	rows := make([]uint64, m) // rows[i]: coefficient row pivoted at slot i, low bit set when occupied
-	rhs := make([]uint16, m)  // rhs[i]: the fingerprint accumulated at pivot i
+// and seed into caller-provided scratch, reused across reseeds so a failed attempt
+// does not churn the heap with a fresh rows/rhs/z. rows, rhs, and z must each be at
+// least m long; solveRibbon clears the m-prefix it uses. It returns false when the
+// banded system is inconsistent or a row's support runs past the table, the signal
+// to reseed or grow. On true, z[:m] holds the solved slot values.
+func solveRibbon(keys []meguri.URLKey, rbits uint, seed uint32, m int, rows []uint64, rhs, z []uint16) bool {
+	rows = rows[:m] // rows[i]: coefficient row pivoted at slot i, low bit set when occupied
+	rhs = rhs[:m]   // rhs[i]: the fingerprint accumulated at pivot i
+	clear(rows)
+	clear(rhs)
 	for _, key := range keys {
 		start, coeff, fp := ribbonDerive(key, seed, m, rbits)
 		i := start
@@ -104,7 +109,7 @@ func solveRibbon(keys []meguri.URLKey, rbits uint, seed uint32, m int) (z []uint
 		for {
 			if cr == 0 {
 				if b != 0 {
-					return nil, false // inconsistent equation
+					return false // inconsistent equation
 				}
 				break // redundant equation, consistent
 			}
@@ -112,7 +117,7 @@ func solveRibbon(keys []meguri.URLKey, rbits uint, seed uint32, m int) (z []uint
 			i += j
 			cr >>= uint(j)
 			if i >= m {
-				return nil, false // band ran past the table
+				return false // band ran past the table
 			}
 			if rows[i] == 0 {
 				rows[i] = cr
@@ -126,8 +131,10 @@ func solveRibbon(keys []meguri.URLKey, rbits uint, seed uint32, m int) (z []uint
 		}
 	}
 	// Back-substitute: a slot's value is its pivot fingerprint XOR the values of
-	// the slots its row still references, filled from the high slots down.
-	z = make([]uint16, m)
+	// the slots its row still references, filled from the high slots down. z is
+	// cleared first so a non-pivot slot reads as zero the way a fresh make would.
+	z = z[:m]
+	clear(z)
 	for i := m - 1; i >= 0; i-- {
 		if rows[i] == 0 {
 			continue
@@ -143,20 +150,42 @@ func solveRibbon(keys []meguri.URLKey, rbits uint, seed uint32, m int) (z []uint
 		}
 		z[i] = v
 	}
-	return z, true
+	return true
 }
 
 // buildRibbon solves the filter over keys, reseeding on a failed system and
 // growing the table after a run of failed seeds. On real key sets the first seed
 // almost always solves; the growth loop is the backstop a pathological set needs.
+// The rows/rhs/z scratch is allocated once and cleared between reseeds, so a set
+// that needs many seeds does not allocate a fresh multi-megabyte buffer per attempt.
+//
+// The width-64 band has a construction threshold near 0.86 load: below it a random
+// system solves on the first seed, above it the odds of a solvable system fall off
+// fast as n grows. Small sets hide this (finite-size softness lets 0.90 solve at
+// 1e5), but a measured sweep put 0.90 at 4/8 seeds solving at 1e7 and 8/8 at 0.85,
+// so ribbonLoad sits at 0.85 to keep large seals a single solve instead of a reseed
+// storm that grows the table. Sharding (ribbon_sharded.go) keeps each solve to a few
+// hundred thousand keys, well inside where 0.85 solves on the first seed.
 func buildRibbon(keys []meguri.URLKey, rbits uint) (*ribbon, error) {
 	n := len(keys)
 	m := int(math.Ceil(float64(n) / ribbonLoad))
 	m = max(m, ribbonWidth*2) // floor so the band fits and the start range is positive
+	var (
+		rows []uint64
+		rhs  []uint16
+		z    []uint16
+	)
 	for range maxRibbonGrows {
+		if cap(rows) < m {
+			rows = make([]uint64, m)
+			rhs = make([]uint16, m)
+			z = make([]uint16, m)
+		}
 		for seed := range uint32(maxRibbonSeeds) {
-			if z, ok := solveRibbon(keys, rbits, seed, m); ok {
-				return &ribbon{z: z, m: m, rbits: rbits, seed: seed, n: uint64(n)}, nil
+			if solveRibbon(keys, rbits, seed, m, rows, rhs, z) {
+				out := make([]uint16, m)
+				copy(out, z[:m])
+				return &ribbon{z: out, m: m, rbits: rbits, seed: seed, n: uint64(n)}, nil
 			}
 		}
 		m += m/20 + ribbonWidth // grow about 5% and retry the seeds
@@ -277,6 +306,20 @@ func unpackBits(b []byte, count int, rbits uint) []uint16 {
 		nbits -= rbits
 	}
 	return out
+}
+
+// RibbonBitsForFPR maps a target false-positive rate to the ribbon fingerprint
+// width that meets it. A ribbon's realized FPR is exactly 2^-r for the r-bit
+// fingerprint compare, independent of the key distribution, so r is the smallest
+// width with 2^-r <= fp, that is ceil(-log2(fp)). It is clamped to the 1..16 a
+// uint16 slot holds. The region's bits per key is then r/load, so a 1e-4 target
+// maps to r=14 and about 15.6 bits per key, a third under the blocked-Bloom's 22.
+func RibbonBitsForFPR(fp float64) int {
+	if fp <= 0 || fp >= 1 {
+		return defaultRibbonR
+	}
+	r := int(math.Ceil(-math.Log2(fp)))
+	return min(max(r, 1), maxRibbonRBits)
 }
 
 // RibbonOption configures a ribbon snapshot build.

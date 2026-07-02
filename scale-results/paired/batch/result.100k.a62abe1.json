@@ -1,0 +1,74 @@
+{
+  "profile": "100k",
+  "provenance": {
+    "box": "",
+    "commit": "a62abe1+batch",
+    "corpus": "corpus/profiles/scale-100k.jsonl",
+    "goos": "darwin",
+    "goarch": "arm64",
+    "num_cpu": 10
+  },
+  "started_at": "2026-06-30T05:32:53Z",
+  "stages": [
+    {
+      "stage": "seed",
+      "urls": 100000,
+      "wall_seconds": 0.104799292,
+      "cpu": {
+        "user_seconds": 0.117937,
+        "sys_seconds": 0.007761
+      },
+      "mem": {
+        "peak_rss_bytes": 143048704,
+        "peak_heap_inuse_bytes": 151740416,
+        "total_alloc_bytes": 211310632,
+        "mallocs": 99645,
+        "num_gc": 5,
+        "gc_pause_total_ns": 157918,
+        "gc_cpu_fraction": 0.011444065938095936
+      },
+      "disk": {
+        "bytes_written": 2486102,
+        "bytes_read": 0,
+        "output_bytes": 2486102,
+        "fsync_count": 0,
+        "fsync_p50_ms": 0,
+        "fsync_p99_ms": 0
+      },
+      "urls_per_second": 954204.9196286555,
+      "urls_per_cpu_second": 847910.3250040276,
+      "alloc_bytes_per_url": 2113.10632,
+      "notes": "97580 urls resident after dedup"
+    },
+    {
+      "stage": "run",
+      "urls": 97580,
+      "wall_seconds": 0.062543458,
+      "cpu": {
+        "user_seconds": 0.068106,
+        "sys_seconds": 0.023029
+      },
+      "mem": {
+        "peak_rss_bytes": 146702336,
+        "peak_heap_inuse_bytes": 66904064,
+        "total_alloc_bytes": 16157144,
+        "mallocs": 194958,
+        "num_gc": 0,
+        "gc_pause_total_ns": 0,
+        "gc_cpu_fraction": 0.0068964941598493295
+      },
+      "disk": {
+        "bytes_written": 0,
+        "bytes_read": 0,
+        "output_bytes": 0,
+        "fsync_count": 0,
+        "fsync_p50_ms": 0,
+        "fsync_p99_ms": 0
+      },
+      "urls_per_second": 1560195.1526249158,
+      "urls_per_cpu_second": 1432766.5697589053,
+      "alloc_bytes_per_url": 165.5784382045501
+    }
+  ],
+  "pprof_dir": "scale-results/paired/batch/pprof"
+}

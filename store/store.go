@@ -27,6 +27,7 @@ import (
 	"sync/atomic"
 
 	"github.com/tamnd/meguri"
+	"github.com/tamnd/meguri/drum"
 	"github.com/tamnd/meguri/format"
 )
 
@@ -74,7 +75,29 @@ type Store struct {
 	arenaMu sync.Mutex
 	arena   []byte // string region, uvarint-length-prefixed entries, offset 0 reserved
 
+	// Stage A spilled arena (spec 2072 doc 05): when set, the canonical-URL strings
+	// are not kept resident in arena above; they live in a derived spill file read
+	// by byte offset through a bounded LRU (spill), and arenaLen is the next offset
+	// the file will assign. arena stays nil in this mode. The spill file is a pure
+	// cache, rebuilt at Open from the snapshot string region plus the kindIntern log
+	// frames, so its durability is the log's, not its own.
+	spill        *spilledArena
+	spillFile    *os.File
+	arenaLen     int64  // next offset the spill file will assign (logical length)
+	arenaFlushed int64  // bytes of arenaLen already written to spillFile
+	arenaPending []byte // interned entries not yet flushed to spillFile
+
 	shards [numShards]urlShard
+
+	// Stage B disk index (spec 2072 doc 04): when set, the URL location index lives
+	// in an on-disk DRUM instead of the resident shards map, so the index no longer
+	// costs ~80-90 B/url resident (the ~8 GiB held heap the size ladder measured at
+	// 100M). The shards map stays allocated but unused for URLs in this mode; the
+	// host table and arena are unchanged. mergeBatch is the unmerged-discovery count
+	// that triggers a fold into the repository.
+	diskIndex  bool
+	drum       *drum.DRUM
+	mergeBatch int64
 
 	hostMu sync.Mutex
 	hosts  map[uint64]*hostLoc
@@ -102,7 +125,34 @@ type Options struct {
 	ResidentBudget int        // max resident URL records, 0 = unbounded
 	PartitionID    uint32     // stamped into the .meguri snapshot
 	CreatedHours   uint32     // build time, epoch-hours
+
+	// SpillArena turns on the Stage A spilled arena (spec 2072 doc 05): the
+	// canonical-URL string region lives in a disk-backed spill file read through a
+	// bounded LRU instead of a fully resident []byte, removing ~70 B/url (~7 GiB at
+	// 100M) from the held heap. ArenaBudget is the LRU's resident byte ceiling
+	// (B_arena); 0 with SpillArena on picks a default working-set budget.
+	SpillArena  bool
+	ArenaBudget int64
+
+	// DiskIndex turns on the Stage B on-disk DRUM index (spec 2072 doc 04): the URL
+	// location index moves out of the resident shards map into a sorted on-disk
+	// repository, removing the ~80-90 B/url resident index term. MergeBatch is the
+	// number of buffered discoveries that triggers a merge into the repository; 0
+	// picks a default.
+	DiskIndex  bool
+	MergeBatch int
 }
+
+// defaultMergeBatch is the unmerged-discovery count that triggers a DRUM merge when
+// MergeBatch is left 0: 2,000,000 entries, large enough that each merge amortizes
+// the repository sweep over a big batch (doc 04 section 5.1) while keeping the
+// in-flight buffer and the staleness window bounded.
+const defaultMergeBatch = 2_000_000
+
+// defaultArenaBudget is the B_arena used when SpillArena is on and ArenaBudget is
+// left 0: 64 MiB, the doc 52 measured sweet spot where the spill is a clear win on
+// the 10M corpus (the dispatch working set is far below the full arena at scale).
+const defaultArenaBudget = 64 << 20
 
 // Open opens or recovers a partition store rooted at dir. If dir holds a valid
 // checkpoint, Open loads the .meguri snapshot, rebuilds the index, and replays
@@ -130,6 +180,18 @@ func Open(dir string, opts Options) (*Store, error) {
 	for i := range s.shards {
 		s.shards[i].m = make(map[meguri.URLKey]*urlLoc)
 	}
+	if opts.DiskIndex {
+		s.diskIndex = true
+		s.mergeBatch = int64(opts.MergeBatch)
+		if s.mergeBatch <= 0 {
+			s.mergeBatch = defaultMergeBatch
+		}
+		d, err := drum.Open(dir, drum.Options{})
+		if err != nil {
+			return nil, err
+		}
+		s.drum = d
+	}
 
 	meta, err := readSuperblock(s.superPath())
 	if err == ErrNoCheckpoint {
@@ -143,7 +205,136 @@ func Open(dir string, opts Options) (*Store, error) {
 	if err := s.recover(meta); err != nil {
 		return nil, err
 	}
+	if opts.SpillArena {
+		budget := opts.ArenaBudget
+		if budget <= 0 {
+			budget = defaultArenaBudget
+		}
+		if err := s.enableArenaSpill(budget); err != nil {
+			return nil, err
+		}
+	}
 	return s, nil
+}
+
+// arenaPath is the spill file holding the disk-backed string region (Stage A). It
+// is a derived cache, rebuilt at every Open from the recovered resident arena, so
+// it carries no superblock pointer and needs no crash-consistency of its own.
+func (s *Store) arenaPath() string { return filepath.Join(s.dir, "arena.bin") }
+
+// enableArenaSpill switches the store onto the Stage A spilled arena (spec 2072
+// doc 05) after recover has rebuilt the resident arena. It writes the recovered
+// arena bytes to the spill file verbatim (so a byte offset into the file is the
+// same arena offset the resident []byte used), opens it for positioned reads
+// through a B_arena-bounded LRU, and drops the resident copy so the held heap no
+// longer carries the ~70 B/url string region. Offsets are preserved exactly, so
+// every URLRef a record holds resolves identically before and after the switch.
+func (s *Store) enableArenaSpill(budget int64) error {
+	s.arenaMu.Lock()
+	defer s.arenaMu.Unlock()
+
+	// Disk-index spill mode: arena.bin is the durable home of the string region
+	// (#43), not a derived cache. Intern dropped the kindIntern frames, so the
+	// recovered resident arena is empty and the file on disk is the only record of
+	// the strings. Reopen it in place and take its byte length as the live arena
+	// length; truncating it (the fresh path below) would erase every interned URL.
+	// A zero-length or absent file means a fresh store, so fall through and create it.
+	// recover leaves the resident arena at the 1-byte offset-0 sentinel when no
+	// kindIntern frame was replayed (the #43 disk-index case), so sentinel-only
+	// counts as empty here; a larger arena means an older log still carried the
+	// frames and the create path below rebuilds arena.bin from them.
+	if s.diskIndex && len(s.arena) <= 1 {
+		if fi, err := os.Stat(s.arenaPath()); err == nil && fi.Size() > 0 {
+			f, err := os.OpenFile(s.arenaPath(), os.O_RDWR, 0o644)
+			if err != nil {
+				return err
+			}
+			n := fi.Size()
+			s.arenaLen = n
+			s.arenaFlushed = n
+			s.spillFile = f
+			s.spill = newSpilledArena(f, n, budget)
+			s.arena = nil
+			return nil
+		}
+	}
+
+	f, err := os.OpenFile(s.arenaPath(), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteAt(s.arena, 0); err != nil {
+		f.Close()
+		return err
+	}
+	s.arenaLen = int64(len(s.arena))
+	s.arenaFlushed = s.arenaLen // the initial region is fully on disk
+	s.spillFile = f
+	s.spill = newSpilledArena(f, s.arenaLen, budget)
+	s.arena = nil // free the resident region; the spill file is the source now
+	return nil
+}
+
+// arenaFlushThreshold is the pending-buffer size at which the spill appender
+// flushes to the file in one positioned write. Buffering turns the per-intern
+// WriteAt (one blocking syscall per URL, the dominant spill ingest cost measured
+// in doc 52) into one write per ~1 MiB of interned strings, roughly 15000 URLs,
+// without changing durability: arena.bin is a derived cache rebuilt from the
+// kindIntern log frames at Open, so an unflushed tail is recovered, not lost.
+const arenaFlushThreshold = 1 << 20
+
+// appendSpill buffers a freshly interned entry and returns the offset it was
+// placed at, advancing the logical arena length and the reader's size bound. The
+// bytes are flushed to the spill file in ~1 MiB blocks (flushArena), or on demand
+// before a read that would touch the unflushed tail. The caller holds arenaMu, so
+// the offset assignment and the buffer append are one step against any reader.
+func (s *Store) appendSpill(entry []byte) (uint64, error) {
+	off := uint64(s.arenaLen)
+	s.arenaPending = append(s.arenaPending, entry...)
+	s.arenaLen += int64(len(entry))
+	s.spill.setSize(s.arenaLen)
+	if len(s.arenaPending) >= arenaFlushThreshold {
+		if err := s.flushArena(); err != nil {
+			return 0, err
+		}
+	}
+	return off, nil
+}
+
+// flushArena writes the pending interned bytes to the spill file at the flushed
+// watermark and advances it. It is called under arenaMu when the buffer fills,
+// before a read of the unflushed tail, and before the checkpoint reads the whole
+// region back. A no-op when the buffer is empty.
+func (s *Store) flushArena() error {
+	if len(s.arenaPending) == 0 {
+		return nil
+	}
+	if _, err := s.spillFile.WriteAt(s.arenaPending, s.arenaFlushed); err != nil {
+		return err
+	}
+	s.arenaFlushed += int64(len(s.arenaPending))
+	s.arenaPending = s.arenaPending[:0]
+	return nil
+}
+
+// readArenaRegion returns the whole string region as a flat buffer for the
+// checkpoint's snapshot string region, the durable home of the canonical URL
+// strings (spec 2072 doc 05 section 2b). The caller holds arenaMu. In spill mode
+// the resident s.arena is nil, so the region is read back from the spill file
+// (the pending tail flushed first so the file holds it all); this is a
+// checkpoint-time full read, not a steady-state cost, and the streaming
+// checkpoint explicitly materializes the arena in its shell. Without spill the
+// resident arena is copied directly.
+func (s *Store) readArenaRegion() []byte {
+	if s.spill == nil {
+		return append([]byte(nil), s.arena...)
+	}
+	_ = s.flushArena()
+	strs := make([]byte, s.arenaLen)
+	if _, err := s.spillFile.ReadAt(strs, 0); err != nil {
+		return strs[:0]
+	}
+	return strs
 }
 
 func (s *Store) superPath() string           { return filepath.Join(s.dir, "super") }
@@ -167,17 +358,41 @@ func (s *Store) Intern(str string) (uint64, error) {
 	if str == "" {
 		return 0, nil
 	}
-	s.arenaMu.Lock()
-	off := uint64(len(s.arena))
 	entry := appendUvarint(nil, uint64(len(str)))
 	entry = append(entry, str...)
-	s.arena = append(s.arena, entry...)
+	s.arenaMu.Lock()
+	var off uint64
+	if s.spill != nil {
+		var err error
+		if off, err = s.appendSpill(entry); err != nil {
+			s.arenaMu.Unlock()
+			return 0, err
+		}
+	} else {
+		off = uint64(len(s.arena))
+		s.arena = append(s.arena, entry...)
+	}
 	s.arenaMu.Unlock()
-	if _, _, err := s.log.append(kindIntern, 0, nil, entry); err != nil {
-		return 0, err
+	// In disk-index spill mode the spill file is the durable home of the string
+	// region (#43), so the kindIntern frame is dropped: it would be a second copy of
+	// the bytes already in arena.bin, the single largest removable waste in the log
+	// (~79 B/url, the doc 00 disk drift). Recovery reads the strings back from
+	// arena.bin directly. Every other mode keeps logging the frame: resident-arena
+	// stores have no spill file, and non-disk-index spill stores rotate the log at
+	// each checkpoint and rebuild the post-checkpoint arena tail from it.
+	if !s.internDurableInArena() {
+		if _, _, err := s.log.append(kindIntern, 0, nil, entry); err != nil {
+			return 0, err
+		}
 	}
 	return off, nil
 }
+
+// internDurableInArena reports whether interned strings are durable in the spill
+// file alone, so the kindIntern log frame can be skipped. That holds only when the
+// arena is spilled and the index is the DRUM (the 100M path), where the log is
+// never rotated and arena.bin is reopened in place at recovery.
+func (s *Store) internDurableInArena() bool { return s.spill != nil && s.diskIndex }
 
 // Str reads back the string interned at off, the inverse of Intern. A zero or
 // out-of-range offset returns the empty string, so the none sentinel and a stale
@@ -185,6 +400,14 @@ func (s *Store) Intern(str string) (uint64, error) {
 func (s *Store) Str(off uint64) string {
 	s.arenaMu.Lock()
 	defer s.arenaMu.Unlock()
+	if s.spill != nil {
+		if off >= uint64(s.arenaFlushed) && off < uint64(s.arenaLen) {
+			if err := s.flushArena(); err != nil {
+				return ""
+			}
+		}
+		return s.spill.readArenaAt(off)
+	}
 	return readArena(s.arena, off)
 }
 
@@ -201,14 +424,25 @@ func (s *Store) InternRobots(blob []byte) (uint64, error) {
 		return 0, nil
 	}
 	packed := format.PackRobots(blob, s.codec)
-	s.arenaMu.Lock()
-	off := uint64(len(s.arena))
 	entry := appendUvarint(nil, uint64(len(packed)))
 	entry = append(entry, packed...)
-	s.arena = append(s.arena, entry...)
+	s.arenaMu.Lock()
+	var off uint64
+	if s.spill != nil {
+		var err error
+		if off, err = s.appendSpill(entry); err != nil {
+			s.arenaMu.Unlock()
+			return 0, err
+		}
+	} else {
+		off = uint64(len(s.arena))
+		s.arena = append(s.arena, entry...)
+	}
 	s.arenaMu.Unlock()
-	if _, _, err := s.log.append(kindIntern, 0, nil, entry); err != nil {
-		return 0, err
+	if !s.internDurableInArena() {
+		if _, _, err := s.log.append(kindIntern, 0, nil, entry); err != nil {
+			return 0, err
+		}
 	}
 	return off, nil
 }
@@ -220,7 +454,18 @@ func (s *Store) InternRobots(blob []byte) (uint64, error) {
 // rather than panicking.
 func (s *Store) Robots(off uint64) []byte {
 	s.arenaMu.Lock()
-	packed := readArenaBytes(s.arena, off)
+	var packed []byte
+	if s.spill != nil {
+		if off >= uint64(s.arenaFlushed) && off < uint64(s.arenaLen) {
+			if err := s.flushArena(); err != nil {
+				s.arenaMu.Unlock()
+				return nil
+			}
+		}
+		packed = s.spill.readArenaBytesAt(off)
+	} else {
+		packed = readArenaBytes(s.arena, off)
+	}
 	codec := s.codec
 	s.arenaMu.Unlock()
 	if len(packed) == 0 {
@@ -249,6 +494,19 @@ func (s *Store) PutURL(rec *meguri.URLRecord) (uint64, error) {
 		return 0, err
 	}
 
+	if s.diskIndex {
+		// The body is durable in the log frame at off; the DRUM holds only the
+		// location, folded into the repository on the next merge. No resident record,
+		// no resident index slot, so the held heap does not grow per URL.
+		if err := s.drum.Discover(rec.URLKey, off, lsn); err != nil {
+			return 0, err
+		}
+		if err := s.maybeMerge(); err != nil {
+			return 0, err
+		}
+		return lsn, nil
+	}
+
 	cp := *rec
 	sh := s.shard(rec.URLKey)
 	sh.mu.Lock()
@@ -270,6 +528,17 @@ func (s *Store) PutURL(rec *meguri.URLRecord) (uint64, error) {
 // GetURL returns the current record for key, materializing it from disk if it was
 // evicted. The bool is false if the key is absent or tombstoned.
 func (s *Store) GetURL(key meguri.URLKey) (meguri.URLRecord, bool) {
+	if s.diskIndex {
+		off, _, present, err := s.drum.Locate(key)
+		if err != nil || !present {
+			return meguri.URLRecord{}, false
+		}
+		_, _, _, val, err := s.log.readAt(off)
+		if err != nil {
+			return meguri.URLRecord{}, false
+		}
+		return decodeURL(key, val), true
+	}
 	sh := s.shard(key)
 	sh.mu.RLock()
 	loc := sh.m[key]
@@ -314,6 +583,12 @@ func (s *Store) DeleteURL(key meguri.URLKey) error {
 	}
 	if err := s.log.commit(off + int64(frameHeaderSize+16+4)); err != nil {
 		return err
+	}
+	if s.diskIndex {
+		if err := s.drum.Tombstone(key, off, lsn); err != nil {
+			return err
+		}
+		return s.maybeMerge()
 	}
 	sh := s.shard(key)
 	sh.mu.Lock()
@@ -366,6 +641,12 @@ func (s *Store) GetHost(key uint64) (meguri.HostRecord, bool) {
 
 // URLCount reports the number of live (non-tombstoned) URL records.
 func (s *Store) URLCount() int {
+	if s.diskIndex {
+		_ = s.forceMerge()
+		var n int
+		_ = s.drum.ScanRepo(func(meguri.URLKey, int64, uint64) error { n++; return nil })
+		return n
+	}
 	var n int
 	for i := range s.shards {
 		sh := &s.shards[i]
@@ -432,8 +713,30 @@ func putU64(b []byte, v uint64) {
 
 // Close flushes the log and closes the file.
 func (s *Store) Close() error {
+	// Flush and sync the spilled arena tail before anything else. In disk-index
+	// spill mode arena.bin is the durable home of the string region (#43), so a
+	// post-checkpoint intern buffered in arenaPending must reach the file or a
+	// recovered URLRef into the tail would dangle. A no-op in the other modes, where
+	// arena.bin is a derived cache the log can rebuild.
+	if s.spill != nil {
+		s.arenaMu.Lock()
+		if err := s.flushArena(); err != nil {
+			s.arenaMu.Unlock()
+			return err
+		}
+		if err := s.spillFile.Sync(); err != nil {
+			s.arenaMu.Unlock()
+			return err
+		}
+		s.arenaMu.Unlock()
+	}
 	if err := s.log.syncAll(); err != nil {
 		return err
+	}
+	if s.diskIndex && s.drum != nil {
+		if err := s.drum.Close(); err != nil {
+			return err
+		}
 	}
 	return s.log.close()
 }
@@ -473,6 +776,23 @@ func (s *Store) CheckpointFrom(part *format.Partition) error {
 // shared body of Checkpoint (snapshot sourced from the store's own index) and
 // CheckpointFrom (snapshot sourced from a caller's frontier).
 func (s *Store) commit(part *format.Partition) error {
+	// Stream the snapshot to disk one region at a time rather than materializing
+	// the whole image and writing it in a second pass: at 100M urls the doubled
+	// in-memory image is several GB of avoidable checkpoint transient on top of the
+	// record slice the snapshot already pays (scale doc 12, F4). EncodeToFile
+	// produces byte-identical output, pinned by TestEncodeToFileMatchesEncode.
+	return s.commitSnap(len(part.Strings), func(path string) error {
+		return format.EncodeToFile(path, part)
+	})
+}
+
+// commitSnap is the durable half every checkpoint shares: it writes the next
+// snapshot file (via writeSnap, which the caller picks: the materializing
+// EncodeToFile, or the bounded StreamEncodeToFile), rotates the log so
+// post-checkpoint updates continue the LSN sequence in a fresh log, and commits
+// the two-slot superblock only after the snapshot is durable. arenaLen is the
+// string region length the superblock records for recovery.
+func (s *Store) commitSnap(arenaLen int, writeSnap func(path string) error) error {
 	// The consistent cut: the frontier LSN the snapshot is consistent as of is the
 	// store's next LSN, captured before the rotation. The simplest correct cut for
 	// a frontier that can briefly pause its own dispatch is to checkpoint between
@@ -481,12 +801,36 @@ func (s *Store) commit(part *format.Partition) error {
 
 	nextGen := s.gen + 1
 	snapName := fmt.Sprintf("snap-%d.meguri", nextGen)
-	img, err := format.Encode(part)
-	if err != nil {
+	if err := writeSnap(s.snapPath(snapName)); err != nil {
 		return err
 	}
-	if err := writeFileSync(s.snapPath(snapName), img); err != nil {
-		return err
+
+	if s.diskIndex {
+		// Disk-index mode: the DRUM repository is the durable index and the append-only
+		// log is the durable body store its offsets address, so the log is not rotated
+		// or reclaimed at a checkpoint. Rotating it would strand every offset the DRUM
+		// holds for a record that was not re-logged after the cut. The .meguri snapshot
+		// is written as a portable export (redistribution, cold archive), not as the
+		// local home of the bodies. Compacting the body log, or paging bodies out of the
+		// columnar snapshot so the log can be reclaimed, is the doc 14 follow-up; until
+		// then the body log grows with the corpus, which is the on-disk body term the
+		// size ladder already budgets, not a resident cost.
+		meta := checkpointMeta{
+			gen:      nextGen,
+			frontier: frontier,
+			arenaLen: uint64(arenaLen),
+			snapshot: snapName,
+			logName:  s.logName,
+		}
+		if err := writeSuperblock(s.superPath(), meta); err != nil {
+			return err
+		}
+		prevGen := s.gen
+		s.gen = nextGen
+		if prevGen > 0 {
+			_ = os.Remove(s.snapPath(fmt.Sprintf("snap-%d.meguri", prevGen)))
+		}
+		return nil
 	}
 
 	// Rotate to a fresh log that continues the LSN sequence, so post-checkpoint
@@ -504,7 +848,7 @@ func (s *Store) commit(part *format.Partition) error {
 	meta := checkpointMeta{
 		gen:      nextGen,
 		frontier: frontier,
-		arenaLen: uint64(len(part.Strings)),
+		arenaLen: uint64(arenaLen),
 		snapshot: snapName,
 		logName:  newLogName,
 	}
@@ -533,28 +877,42 @@ func (s *Store) commit(part *format.Partition) error {
 // through the index means a larger-than-memory store checkpoints by streaming,
 // not by holding the whole frontier resident.
 func (s *Store) snapshotPartition() *format.Partition {
-	urls := make([]meguri.URLRecord, 0, s.URLCount())
-	for i := range s.shards {
-		sh := &s.shards[i]
-		sh.mu.RLock()
-		for key, loc := range sh.m {
-			if loc.tomb {
-				continue
-			}
-			if loc.rec != nil {
-				urls = append(urls, *loc.rec)
-				continue
-			}
-			off := loc.off
-			sh.mu.RUnlock()
+	var urls []meguri.URLRecord
+	if s.diskIndex {
+		// The repository is already globally sorted by URLKey, the snapshot's row
+		// order, so a scan yields the records in order with no extra sort. Bodies are
+		// read from the log at the location the DRUM stored.
+		_ = s.forceMerge()
+		_ = s.drum.ScanRepo(func(key meguri.URLKey, off int64, _ uint64) error {
 			if _, _, _, val, err := s.log.readAt(off); err == nil {
 				urls = append(urls, decodeURL(key, val))
 			}
+			return nil
+		})
+	} else {
+		urls = make([]meguri.URLRecord, 0, s.URLCount())
+		for i := range s.shards {
+			sh := &s.shards[i]
 			sh.mu.RLock()
+			for key, loc := range sh.m {
+				if loc.tomb {
+					continue
+				}
+				if loc.rec != nil {
+					urls = append(urls, *loc.rec)
+					continue
+				}
+				off := loc.off
+				sh.mu.RUnlock()
+				if _, _, _, val, err := s.log.readAt(off); err == nil {
+					urls = append(urls, decodeURL(key, val))
+				}
+				sh.mu.RLock()
+			}
+			sh.mu.RUnlock()
 		}
-		sh.mu.RUnlock()
+		sort.Slice(urls, func(i, j int) bool { return urls[i].URLKey.Less(urls[j].URLKey) })
 	}
-	sort.Slice(urls, func(i, j int) bool { return urls[i].URLKey.Less(urls[j].URLKey) })
 
 	s.hostMu.Lock()
 	hosts := make([]meguri.HostRecord, 0, len(s.hosts))
@@ -571,7 +929,7 @@ func (s *Store) snapshotPartition() *format.Partition {
 		lo, hi = hosts[0].HostKey, hosts[len(hosts)-1].HostKey
 	}
 	s.arenaMu.Lock()
-	strs := append([]byte(nil), s.arena...)
+	strs := s.readArenaRegion()
 	s.arenaMu.Unlock()
 	return &format.Partition{
 		ID:           s.id,
@@ -606,7 +964,14 @@ func (s *Store) recover(meta checkpointMeta) error {
 		s.created = part.CreatedHours
 		s.codec = part.DefaultCodec
 		s.hostKeyLo, s.hostKeyHi = part.HostKeyLo, part.HostKeyHi
-		if len(part.Strings) > 0 {
+		// In disk-index mode the log is never rotated (commitSnap keeps it as the body
+		// store), so it holds every intern frame since gen 0 and the replay below
+		// rebuilds the arena at its exact original offsets, starting from the same
+		// offset-0 sentinel. Loading the snapshot Strings too would prepend a full
+		// second copy, so a post-checkpoint re-intern (Intern never dedups) whose offset
+		// is L would resolve into the duplicated region instead of its own string. The
+		// snapshot is an export here, not the arena's home, so its Strings are not read.
+		if len(part.Strings) > 0 && !s.diskIndex {
 			s.arena = append([]byte(nil), part.Strings...)
 		}
 		// Snapshot rows load resident and pinned: their bodies have no log offset
@@ -616,9 +981,19 @@ func (s *Store) recover(meta checkpointMeta) error {
 		// churn of records pulled in, updated, and spilled (doc 11 section 6.3). A
 		// per-row random read of the columnar snapshot, which would let the cold base
 		// spill too, is the doc 14 follow-up.
-		for i := range part.URLs {
-			rec := part.URLs[i]
-			s.shard(rec.URLKey).m[rec.URLKey] = &urlLoc{rec: &rec, lsn: 0}
+		//
+		// In disk-index mode the URL index of record is the DRUM repository, which is
+		// durable on disk and reopened intact, so the snapshot rows are not loaded into
+		// any resident map and not re-fed to the DRUM: the .meguri snapshot is a
+		// projection of the repository (snapshotPartition streams it from ScanRepo), so
+		// the repository already holds every snapshot key. Migrating a non-disk-index
+		// snapshot into the DRUM is the doc 09 path and is not done here; disk-index
+		// stores are grown disk-index from the start.
+		if !s.diskIndex {
+			for i := range part.URLs {
+				rec := part.URLs[i]
+				s.shard(rec.URLKey).m[rec.URLKey] = &urlLoc{rec: &rec, lsn: 0}
+			}
 		}
 		for i := range part.Hosts {
 			h := part.Hosts[i]
@@ -642,6 +1017,18 @@ func (s *Store) recover(meta checkpointMeta) error {
 			s.arena = append(s.arena, fr.val...)
 		case kindURL:
 			key := meguri.URLKeyFromBytes([16]byte(fr.key))
+			if s.diskIndex {
+				// The log frame carries the body's offset and lsn the DRUM indexes by,
+				// so replay folds the post-merge tail back into the DRUM. The tail is
+				// the writes since the last merge whose in-memory buckets were lost on
+				// the crash; re-feeding already-merged keys is idempotent (the merge
+				// dedups by key and keeps the highest lsn). A final merge after replay
+				// makes them durable in the repository again.
+				if fr.tomb {
+					return s.drum.Tombstone(key, fr.off, fr.lsn)
+				}
+				return s.drum.Insert(key, fr.off, fr.lsn)
+			}
 			sh := s.shard(key)
 			loc := sh.m[key]
 			if loc == nil {
@@ -673,6 +1060,15 @@ func (s *Store) recover(meta checkpointMeta) error {
 	})
 	if err != nil {
 		return err
+	}
+
+	// Fold the replayed tail into the repository so a point read right after Open is
+	// served from disk, not the overlay, and the next checkpoint streams a complete
+	// repository.
+	if s.diskIndex {
+		if err := s.forceMerge(); err != nil {
+			return err
+		}
 	}
 
 	// Resume past the highest durable LSN so the next write cannot collide with a

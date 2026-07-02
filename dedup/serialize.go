@@ -31,10 +31,11 @@ import (
 // the ribbon static form (doc 08, section 3.2), which serializes through the same
 // region behind the same one-sided contract.
 const (
-	filterBlobVersion      uint8 = 1
-	filterKindBlockedBloom uint8 = 0
-	filterKindRibbon       uint8 = 1 // reserved, not yet emitted
-	filterBlobHeaderSize         = 8
+	filterBlobVersion       uint8 = 1
+	filterKindBlockedBloom  uint8 = 0
+	filterKindRibbon        uint8 = 1 // single static ribbon, one linear system
+	filterKindShardedRibbon uint8 = 2 // ribbon split into independent per-shard systems
+	filterBlobHeaderSize          = 8
 )
 
 // errBadFilterBlob is returned when a filter blob is truncated, the wrong
@@ -106,6 +107,12 @@ func UnmarshalFilter(b []byte) (*ResidentFilter, error) {
 			return nil, err
 		}
 		return &ResidentFilter{mem: rb}, nil
+	case filterKindShardedRibbon:
+		sr, err := unmarshalShardedRibbon(b)
+		if err != nil {
+			return nil, err
+		}
+		return &ResidentFilter{mem: sr}, nil
 	default:
 		return nil, errBadFilterBlob
 	}

@@ -539,6 +539,65 @@ func (f *Frontier) Seed(url, host string, priority float32, firstSeen, nextDue u
 	if f.seen.Seen(key) {
 		return
 	}
+	f.seedNew(url, host, key, hk, priority, firstSeen, nextDue, crawlDelay)
+}
+
+// SeedSpec is one candidate for SeedBatch: the same arguments Seed takes, carried
+// as a value so a caller can accumulate a window of seeds and intake them in one
+// DRUM pass.
+type SeedSpec struct {
+	URL        string
+	Host       string
+	Priority   float32
+	FirstSeen  uint32
+	NextDue    uint32
+	CrawlDelay uint16
+}
+
+// SeedBatch is the scale form of Seed: it intakes a whole window of candidates in
+// one pass, so the dedup authority pays one batched insert per bucket instead of a
+// sorted-slice shift per key. The per-key Seen path is O(n^2) on a host's run
+// because each new key shifts half its HostKey bucket (the memmove a seed-stage
+// CPU profile is dominated by); SeedBatch checks membership with the cheap binary
+// search and defers every insert to one DRUM InsertBatch, turning the intake into
+// O(n log n). The scheduling, host setup, and prioritization per accepted seed are
+// identical to Seed, so a frontier seeded by SeedBatch is byte-for-byte the one
+// seeded by the equivalent Seed loop. Within-window duplicates dedup against the
+// first occurrence, and a key already resident (a prior batch, a recovery) is
+// skipped, so SeedBatch is idempotent exactly as Seed is.
+func (f *Frontier) SeedBatch(seeds []SeedSpec) {
+	if len(seeds) == 0 {
+		return
+	}
+	pending := make([]meguri.URLKey, 0, len(seeds))
+	inWindow := make(map[meguri.URLKey]struct{}, len(seeds))
+	for i := range seeds {
+		s := seeds[i]
+		hk := meguri.HostKeyOf(s.Host)
+		key := meguri.URLKey{HostKey: hk, PathKey: meguri.PathKeyOf(PathOf(s.URL))}
+		// A key already in the durable set is a rediscovery; a key already accepted
+		// earlier in this window dedups against that first occurrence. Both checks
+		// are reads (binary search, map lookup), not the shifting insert.
+		if f.seen.Contains(key) {
+			continue
+		}
+		if _, dup := inWindow[key]; dup {
+			continue
+		}
+		inWindow[key] = struct{}{}
+		pending = append(pending, key)
+		f.seedNew(s.URL, s.Host, key, hk, s.Priority, s.FirstSeen, s.NextDue, s.CrawlDelay)
+	}
+	// One DRUM pass folds every accepted key into both tiers; the per-seed work
+	// above already built the records and scheduled them.
+	f.seen.InsertBatch(pending)
+}
+
+// seedNew records and schedules a seed whose key has already been confirmed new.
+// It is the body Seed and SeedBatch share, the half that is per-seed local work
+// (record build, host setup, prioritization, schedule) with no dedup cost, so the
+// two intake paths cannot drift.
+func (f *Frontier) seedNew(url, host string, key meguri.URLKey, hk uint64, priority float32, firstSeen, nextDue uint32, crawlDelay uint16) {
 	rec := &meguri.URLRecord{
 		URLKey:          key,
 		HostKey:         hk,

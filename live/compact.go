@@ -85,7 +85,10 @@ func Compact(basePath string, delta *Delta, opts CompactOptions) (CompactResult,
 	// delta added the way the blocked-Bloom was; instead the merge-join below hands
 	// every emitted key up in sorted order and this collector builds the filter once at
 	// seal. Sizing the key slice for base+delta avoids reallocation during the merge.
-	seen := newSeenBuilder(opts.FPRate, uint64(base.URLCount()+len(entries)))
+	seen, err := newSeenBuilder(opts.FPRate, uint64(base.URLCount()+len(entries)), work)
+	if err != nil {
+		return res, err
+	}
 
 	// One sequential arena reader serves the whole read: host strings sit at the low
 	// end of the base arena (BulkLoad interns hosts before URLs) and the URL strings
@@ -136,7 +139,11 @@ func Compact(basePath string, delta *Delta, opts CompactOptions) (CompactResult,
 		if !ok {
 			break
 		}
-		seen.addSorted(rec.URLKey)
+		if e := seen.addSorted(rec.URLKey); e != nil {
+			_ = arena.close()
+			_ = recFile.Close()
+			return res, e
+		}
 		encodeRow(rowBuf[:], &rec)
 		if _, e := recW.Write(rowBuf[:]); e != nil {
 			_ = arena.close()
@@ -331,7 +338,7 @@ func (mj *mergeJoin) next() (m.URLRecord, bool, error) {
 			if err != nil {
 				return m.URLRecord{}, false, err
 			}
-			ref, err := mj.arena.intern(string(s))
+			ref, err := mj.arena.internBytes(s)
 			if err != nil {
 				return m.URLRecord{}, false, err
 			}

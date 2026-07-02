@@ -92,7 +92,10 @@ func BulkLoad(src Source, opts BuildOptions) (BuildResult, error) {
 	// sorted phase-2 merge instead of here: the ribbon (dedup/ribbon.go) is a static
 	// filter solved once over the distinct key set, and the merge hands the keys up
 	// already ordered so dups drop in place.
-	seen := newSeenBuilder(opts.FPRate, cap)
+	seen, err := newSeenBuilder(opts.FPRate, cap, work)
+	if err != nil {
+		return res, err
+	}
 	hosts := make(map[uint64]string, 1<<16)
 	rb := newRunBuilder(work, opts.RunRows)
 	for {
@@ -175,7 +178,12 @@ func BulkLoad(src Source, opts BuildOptions) (BuildResult, error) {
 		if !ok {
 			break
 		}
-		seen.addSorted(it.key)
+		if e := seen.addSorted(it.key); e != nil {
+			_ = closeRuns()
+			_ = arena.close()
+			_ = recFile.Close()
+			return res, e
+		}
 		ref, e := arena.intern(it.url)
 		if e != nil {
 			_ = closeRuns()

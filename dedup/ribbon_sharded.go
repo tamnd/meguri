@@ -98,15 +98,19 @@ func (sr *shardedRibbon) bitsPerURL() float64 {
 	return float64(slotBits) / float64(sr.n)
 }
 
-// buildShardedRibbon solves one ribbon per shard slice in parallel and returns the
-// combined filter. Each shard slice already holds its own keys, partitioned by
-// RibbonShardIndex and deduplicated by the caller. Workers are capped at the core
-// count so a many-shard seal saturates the box without oversubscribing it, and each
-// worker builds its own shard scratch inside buildRibbon so the solves do not
-// contend.
-func buildShardedRibbon(shardKeys [][]meguri.URLKey, rbits uint, n uint64) (*shardedRibbon, error) {
-	shards := make([]*ribbon, len(shardKeys))
-	workers := min(runtime.GOMAXPROCS(0), len(shardKeys))
+// buildShardedRibbonBlobs solves one ribbon per shard in parallel and returns the
+// combined kind-2 blob. It pulls each shard's keys through load(i) inside the worker,
+// solves the ribbon, marshals it to its sub-blob, and drops the ribbon and the key
+// slice before taking the next shard, so the resident set is the finished sub-blobs
+// (a few hundred KB each) plus at most one solve's keys and scratch per worker, never
+// a table proportional to the whole key count. A disk-backed load frees the 100M seal
+// off the heap this way; the in-memory load hands back a slice it already holds.
+// Workers are capped at the core count so a many-shard seal saturates the box without
+// oversubscribing it, and each worker builds its own shard scratch inside buildRibbon
+// so the solves do not contend.
+func buildShardedRibbonBlobs(shardCount int, rbits uint, n uint64, load func(i int) ([]meguri.URLKey, error)) ([]byte, error) {
+	subs := make([][]byte, shardCount)
+	workers := min(runtime.GOMAXPROCS(0), shardCount)
 	workers = max(workers, 1)
 
 	var (
@@ -115,21 +119,31 @@ func buildShardedRibbon(shardKeys [][]meguri.URLKey, rbits uint, n uint64) (*sha
 		errOnce  sync.Once
 		buildErr error
 	)
+	fail := func(err error) { errOnce.Do(func() { buildErr = err }) }
 	wg.Add(workers)
 	for range workers {
 		go func() {
 			defer wg.Done()
 			for {
 				i := int(next.Add(1)) - 1
-				if i >= len(shardKeys) {
+				if i >= shardCount {
 					return
 				}
-				rb, err := buildRibbon(shardKeys[i], rbits)
+				if buildErr != nil {
+					return
+				}
+				keys, err := load(i)
 				if err != nil {
-					errOnce.Do(func() { buildErr = err })
+					fail(err)
 					return
 				}
-				shards[i] = rb
+				rb, err := buildRibbon(keys, rbits)
+				if err != nil {
+					fail(err)
+					return
+				}
+				subs[i] = rb.marshal()
+				// rb and keys fall out of scope here, freed before the next shard.
 			}
 		}()
 	}
@@ -137,26 +151,25 @@ func buildShardedRibbon(shardKeys [][]meguri.URLKey, rbits uint, n uint64) (*sha
 	if buildErr != nil {
 		return nil, buildErr
 	}
-	return &shardedRibbon{shards: shards, n: n}, nil
+	return assembleShardedBlob(subs, n), nil
 }
 
-// marshal serializes the sharded ribbon to the kind-2 filter blob: the fixed header,
-// a u32 length index of the S per-shard blobs, then the shard blobs concatenated.
-// Each shard blob is a full kind-1 ribbon blob, so a shard round-trips through the
-// same unmarshalRibbon the single form uses.
-func (sr *shardedRibbon) marshal() []byte {
-	subs := make([][]byte, len(sr.shards))
-	total := shardedRibbonHeaderSize + 4*len(sr.shards)
-	for i, rb := range sr.shards {
-		subs[i] = rb.marshal()
-		total += len(subs[i])
+// assembleShardedBlob frames the per-shard sub-blobs into the kind-2 filter blob: the
+// fixed header, a u32 length index of the S sub-blobs, then the sub-blobs concatenated.
+// Each sub-blob is a full kind-1 ribbon blob, so a shard round-trips through the same
+// unmarshalRibbon the single form uses. Shards keep their index order so the query path
+// routes identically.
+func assembleShardedBlob(subs [][]byte, n uint64) []byte {
+	total := shardedRibbonHeaderSize + 4*len(subs)
+	for _, s := range subs {
+		total += len(s)
 	}
 	out := make([]byte, shardedRibbonHeaderSize, total)
 	out[0] = filterBlobVersion
 	out[1] = filterKindShardedRibbon
 	// out[2], out[3] reserved.
-	binary.LittleEndian.PutUint32(out[4:8], uint32(len(sr.shards)))
-	binary.LittleEndian.PutUint64(out[8:16], sr.n)
+	binary.LittleEndian.PutUint32(out[4:8], uint32(len(subs)))
+	binary.LittleEndian.PutUint64(out[8:16], n)
 	for _, s := range subs {
 		out = binary.LittleEndian.AppendUint32(out, uint32(len(s)))
 	}
@@ -232,9 +245,23 @@ func BuildShardedRibbonFilter(shardKeys [][]meguri.URLKey, opts ...RibbonOption)
 	for _, ks := range shardKeys {
 		n += uint64(len(ks))
 	}
-	sr, err := buildShardedRibbon(shardKeys, c.rbits, n)
-	if err != nil {
-		return nil, err
+	return buildShardedRibbonBlobs(len(shardKeys), c.rbits, n, func(i int) ([]meguri.URLKey, error) {
+		return shardKeys[i], nil
+	})
+}
+
+// BuildShardedRibbonFilterDisk builds the kind-2 blob solving each shard from keys the
+// loader streams back, instead of from a slice already resident. It is the large-seal
+// path: the seal spills each shard's keys to a temp file at collection and passes a
+// load that reads shard i back, so the solve holds at most a few shards' keys in memory
+// at once rather than the whole key set. shardCount must be greater than one (the seal
+// uses the single kind-1 ribbon below the shard threshold); n is the total distinct key
+// count the blob records for the query path. load(i) returns shard i's keys and need
+// not retain them after it returns.
+func BuildShardedRibbonFilterDisk(shardCount int, n uint64, load func(i int) ([]meguri.URLKey, error), opts ...RibbonOption) ([]byte, error) {
+	c := ribbonConfig{rbits: defaultRibbonR}
+	for _, o := range opts {
+		o(&c)
 	}
-	return sr.marshal(), nil
+	return buildShardedRibbonBlobs(shardCount, c.rbits, n, load)
 }

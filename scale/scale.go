@@ -125,7 +125,7 @@ type LatencySummary struct {
 // latency where the stage has a hot op, and the throughput that implies. Derived
 // per-URL numbers (alloc/url, bytes/url) are computed from the counts and the URL
 // total so a reader does not recompute them. Network has no field: the scale path is
-// offline (the seed is a local .mgs and no stage fetches), so there is no network IO
+// offline (the seed is a local .seed and no stage fetches), so there is no network IO
 // to measure and an empty field would only imply otherwise.
 type StageResult struct {
 	Stage            string          `json:"stage"`

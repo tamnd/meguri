@@ -7,7 +7,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// Reader reads a .mgs file. It mmaps the file so a block is a subslice of the
+// Reader reads a .seed file. It mmaps the file so a block is a subslice of the
 // mapping (zero copy for the raw codec) and its resident pages are reclaimable
 // page cache, not heap, matching the .meguri read path. It is safe for concurrent
 // Block calls only across distinct block indices sharing no decoder; a caller that

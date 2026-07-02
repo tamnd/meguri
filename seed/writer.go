@@ -10,7 +10,7 @@ import (
 
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
 
-// Writer builds one .mgs file, appending URL records into fixed-size blocks and
+// Writer builds one .seed file, appending URL records into fixed-size blocks and
 // writing the header, block bodies, and footer index. It is single-goroutine, the
 // one writer per shard seed. It streams: the resident cost is one block buffer plus
 // the growing block index, not the corpus.

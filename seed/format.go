@@ -1,4 +1,4 @@
-// Package seed is the meguri binary seed format, .mgs, the raw block-framed
+// Package seed is the meguri binary seed format, .seed, the raw block-framed
 // corpus input that replaces gzipped JSONL for the scale passes (Spec 2074 doc
 // 08). It is splittable at block boundaries, seekable by a per-block first-key
 // index, and parse-free: a reader pulls a URL string with a uvarint length read
@@ -38,8 +38,8 @@ const (
 	CodecZstd Codec = 1
 )
 
-// Magic marks a .mgs file.
-var Magic = [4]byte{'M', 'G', 'S', '1'}
+// Magic marks a .seed file.
+var Magic = [4]byte{'S', 'E', 'E', 'D'}
 
 var (
 	ErrShortFile    = errors.New("seed: file shorter than header")

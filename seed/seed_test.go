@@ -76,7 +76,7 @@ func TestRoundTrip(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			urls := makeURLs(tc.n)
-			path := filepath.Join(t.TempDir(), "s.mgs")
+			path := filepath.Join(t.TempDir(), "s.seed")
 			writeSeed(t, path, urls, WriterOptions{BlockSize: tc.bs, Codec: tc.codec, HostLo: 10, HostHi: 99})
 			got := readAll(t, path)
 			if len(got) != len(urls) {
@@ -107,7 +107,7 @@ func TestRoundTrip(t *testing.T) {
 // range's records and nothing else, the property the parallel driver relies on.
 func TestBlockSplit(t *testing.T) {
 	urls := makeURLs(5000)
-	path := filepath.Join(t.TempDir(), "s.mgs")
+	path := filepath.Join(t.TempDir(), "s.seed")
 	writeSeed(t, path, urls, WriterOptions{BlockSize: 2048, Codec: CodecRaw})
 	r, err := Open(path)
 	if err != nil {

@@ -72,7 +72,7 @@ func newShardBuildCmd() *cobra.Command {
 			return runShardBuild(cmd.OutOrStdout(), seedDir, store, pool, cd, fpr, pageRows, nowHours)
 		},
 	}
-	cmd.Flags().StringVar(&seedDir, "seed", "", "seed directory holding the .mgs shards and manifest")
+	cmd.Flags().StringVar(&seedDir, "seed", "", "seed directory holding the .seed shards and manifest")
 	cmd.Flags().StringVar(&store, "store", "", "output directory for the shard .meguri files and store manifest")
 	cmd.Flags().IntVar(&pool, "pool", 0, "concurrent shard builds (0 = number of cores)")
 	cmd.Flags().StringVar(&codec, "codec", "zstd", "shard body codec: zstd or none")
@@ -174,7 +174,7 @@ func newShardDedupCmd() *cobra.Command {
 			return runShardDedup(cmd.OutOrStdout(), seedDir, store, workers, confirm, trueHit)
 		},
 	}
-	cmd.Flags().StringVar(&seedDir, "seed", "", "seed directory holding the .mgs shards")
+	cmd.Flags().StringVar(&seedDir, "seed", "", "seed directory holding the .seed shards")
 	cmd.Flags().StringVar(&store, "store", "", "store directory holding the shard .meguri files and manifest")
 	cmd.Flags().IntVar(&workers, "workers", 0, "concurrent shard dedup workers (0 = number of cores)")
 	cmd.Flags().BoolVar(&confirm, "confirm", false, "confirm each filter hit against the base file (the pre-M3 exact path); default trusts the filter")
@@ -478,7 +478,7 @@ func newShardCompactCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&cpuProf, "cpuprofile", "", "write a CPU profile of the compaction fold to this path")
-	cmd.Flags().StringVar(&seedDir, "seed", "", "seed directory holding the .mgs shards; the delta is drawn from each shard's slice")
+	cmd.Flags().StringVar(&seedDir, "seed", "", "seed directory holding the .seed shards; the delta is drawn from each shard's slice")
 	cmd.Flags().StringVar(&store, "store", "", "input store directory holding the shard .meguri files and manifest")
 	cmd.Flags().StringVar(&out, "out", "", "output directory for the next generation's shard files and manifest")
 	cmd.Flags().IntVar(&updates, "updates", 1000000, "total recrawl updates across all shards (existing keys re-fetched with fresh crawl state), split evenly per shard")
@@ -774,7 +774,7 @@ func runShardSchedule(stdout io.Writer, store string, now uint32, batch, pool in
 	return nil
 }
 
-// seedItemSource adapts a .mgs shard reader to a live.Source, deriving each URL's key
+// seedItemSource adapts a .seed shard reader to a live.Source, deriving each URL's key
 // the way the engine keys it. It is the one place a seed URL becomes a live.Item; the
 // build sorts by key, so the seed's host-string order does not need to match key order.
 type seedItemSource struct {
@@ -824,7 +824,7 @@ func (s *seedItemSource) Next() (live.Item, bool, error) {
 
 func (s *seedItemSource) Close() error { return s.r.Close() }
 
-func seedShardName(i int) string { return fmt.Sprintf("shard-%05d.mgs", i) }
+func seedShardName(i int) string { return seed.ShardFileName(i) }
 
 func humanRate(n int, d time.Duration) string {
 	if d <= 0 {

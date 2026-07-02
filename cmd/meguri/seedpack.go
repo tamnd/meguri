@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -37,8 +36,8 @@ func newSeedpackCmd() *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "seedpack",
-		Short: "Convert a JSONL/plaintext URL corpus into sharded binary .mgs seeds",
-		Long:  "seedpack reads a URL corpus (JSONL {\"url\":...} or one URL per line, optionally gzipped) and writes N hostkey-range .mgs shard seeds plus a manifest, the splittable parse-free input for the sharded parallel passes. Shards tile the hostkey space in equal-width ranges, which are near equal-count because the hostkey is a uniform hash of the host.",
+		Short: "Convert a JSONL/plaintext URL corpus into sharded binary .seed seeds",
+		Long:  "seedpack reads a URL corpus (JSONL {\"url\":...} or one URL per line, optionally gzipped) and writes N hostkey-range .seed shard seeds plus a manifest, the splittable parse-free input for the sharded parallel passes. Shards tile the hostkey space in equal-width ranges, which are near equal-count because the hostkey is a uniform hash of the host.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if out == "" {
@@ -70,20 +69,12 @@ func newSeedpackCmd() *cobra.Command {
 	return cmd
 }
 
-// shardBits returns the smallest b with 2^b >= shards, so the shard count rounds up
-// to a power of two and the top b bits of a hostkey select the shard.
-func shardBits(shards int) int {
-	b := 0
-	for (1 << b) < shards {
-		b++
-	}
-	return b
-}
-
-// runSeedpack streams the corpus once, dispatching each URL to the shard writer its
-// hostkey selects, then writes the manifest. Every writer is open at once because the
-// corpus is not hostkey-sorted; the resident cost is one block buffer per shard plus
-// the growing per-shard block index, not the corpus.
+// runSeedpack streams the corpus once, dispatching each URL to the shard its hostkey
+// selects through a seed.ShardSet, then writes the manifest. Every shard writer is open at
+// once because the corpus is not hostkey-sorted; the resident cost is one block buffer per
+// shard plus the growing per-shard block index, not the corpus. The routing is the shared
+// seed.ShardSet, the same one a parallel bulk producer uses, so a seed built here and a
+// seed built from a Common Crawl parquet fan-out are byte-compatible.
 func runSeedpack(stdout io.Writer, input, out string, shards, blockSize int, codec seed.Codec) error {
 	in, closeIn, err := openCorpus(input)
 	if err != nil {
@@ -91,50 +82,13 @@ func runSeedpack(stdout io.Writer, input, out string, shards, blockSize int, cod
 	}
 	defer func() { _ = closeIn() }()
 
-	bits := shardBits(shards)
-	n := 1 << bits // actual shard count, a power of two >= shards
-	// shard = hostKey >> (64 - bits); guard bits == 0 (single shard) where the shift
-	// would be 64 and undefined.
-	shift := uint(64 - bits)
-	shardOf := func(hostKey uint64) int {
-		if bits == 0 {
-			return 0
-		}
-		return int(hostKey >> shift)
-	}
-	// Each shard i owns the half-open hostkey range [i<<shift, (i+1)<<shift); the last
-	// shard's HostHi is the max so the ranges tile the whole space with no gap.
-	hostLo := func(i int) uint64 {
-		if bits == 0 {
-			return 0
-		}
-		return uint64(i) << shift
-	}
-	hostHi := func(i int) uint64 {
-		if bits == 0 || i == n-1 {
-			return ^uint64(0)
-		}
-		return uint64(i+1) << shift
-	}
-
-	writers := make([]*seed.Writer, n)
-	for i := range writers {
-		path := filepath.Join(out, fmt.Sprintf("shard-%05d.mgs", i))
-		w, err := seed.NewWriter(path, seed.WriterOptions{
-			BlockSize: blockSize, Codec: codec, HostLo: hostLo(i), HostHi: hostHi(i),
-		})
-		if err != nil {
-			for _, prev := range writers[:i] {
-				_ = prev.Close()
-			}
-			return err
-		}
-		writers[i] = w
+	set, err := seed.NewShardSet(out, shards, blockSize, codec)
+	if err != nil {
+		return err
 	}
 
 	sc := bufio.NewScanner(in)
 	sc.Buffer(make([]byte, 0, 1<<20), 1<<24)
-	var total uint64
 	for sc.Scan() {
 		url := parseCorpusURL(sc.Bytes())
 		if url == "" {
@@ -144,43 +98,21 @@ func runSeedpack(stdout io.Writer, input, out string, shards, blockSize int, cod
 		if host == "" {
 			continue
 		}
-		if err := writers[shardOf(meguri.HostKeyOf(host))].AddString(url); err != nil {
+		if err := set.Add(meguri.HostKeyOf(host), url); err != nil {
 			return err
 		}
-		total++
 	}
 	if err := sc.Err(); err != nil {
 		return err
 	}
 
-	metas := make([]seed.ShardMeta, n)
-	for i, w := range writers {
-		metas[i] = seed.ShardMeta{
-			Index:    i,
-			Path:     fmt.Sprintf("shard-%05d.mgs", i),
-			HostLo:   hostLo(i),
-			HostHi:   hostHi(i),
-			Records:  w.Records(),
-			URLBytes: w.URLByteCount(),
-		}
-		if err := w.Close(); err != nil {
-			return err
-		}
-	}
-
-	man := seed.Manifest{
-		Version:   1,
-		BlockSize: blockSize,
-		Codec:     codec,
-		Records:   total,
-		Shards:    metas,
-	}
-	if err := seed.WriteManifest(out, man); err != nil {
+	man, err := set.Close()
+	if err != nil {
 		return err
 	}
 	fmt.Fprintf(stdout, "seedpack: %d urls into %d shards under %s (codec=%s)\n",
-		total, n, out, codecName(codec))
-	for _, m := range metas {
+		man.Records, len(man.Shards), out, codecName(codec))
+	for _, m := range man.Shards {
 		fmt.Fprintf(stdout, "  shard %05d  %d urls  %.1f MiB urls  hosts [%d,%d)\n",
 			m.Index, m.Records, float64(m.URLBytes)/(1<<20), m.HostLo, m.HostHi)
 	}

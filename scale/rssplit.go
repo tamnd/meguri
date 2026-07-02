@@ -9,9 +9,9 @@ package scale
 // the number that must stay under the box budget; FileBytes is the reclaimable
 // page cache the mapped base occupies and is expected to be large.
 type RSSSplit struct {
-	VMRSSBytes  uint64 `json:"vm_rss_bytes"`
-	AnonBytes   uint64 `json:"rss_anon_bytes"`
-	FileBytes   uint64 `json:"rss_file_bytes"`
-	ShmemBytes  uint64 `json:"rss_shmem_bytes"`
-	Available   bool   `json:"available"`
+	VMRSSBytes uint64 `json:"vm_rss_bytes"`
+	AnonBytes  uint64 `json:"rss_anon_bytes"`
+	FileBytes  uint64 `json:"rss_file_bytes"`
+	ShmemBytes uint64 `json:"rss_shmem_bytes"`
+	Available  bool   `json:"available"`
 }

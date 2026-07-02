@@ -164,10 +164,10 @@ func (rr *runReader) close() error { return rr.f.Close() }
 // runHeap is the min-heap of run readers keyed by their current item.
 type runHeap []*runReader
 
-func (h runHeap) Len() int            { return len(h) }
-func (h runHeap) Less(i, j int) bool  { return h[i].cur.key.Less(h[j].cur.key) }
-func (h runHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
-func (h *runHeap) Push(x any)         { *h = append(*h, x.(*runReader)) }
+func (h runHeap) Len() int           { return len(h) }
+func (h runHeap) Less(i, j int) bool { return h[i].cur.key.Less(h[j].cur.key) }
+func (h runHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *runHeap) Push(x any)        { *h = append(*h, x.(*runReader)) }
 func (h *runHeap) Pop() any {
 	old := *h
 	n := len(old)

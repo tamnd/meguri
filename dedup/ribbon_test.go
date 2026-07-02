@@ -120,8 +120,8 @@ func TestRibbonBitsKnob(t *testing.T) {
 // TestRibbonBitsForFPR pins the target-FPR to fingerprint-width mapping the live
 // seal uses. A ribbon's realized false-positive rate is exactly 2^-r, so r is
 // ceil(-log2(fp)) clamped to the 1..16 a uint16 slot holds. The 1e-4 seen-set
-// target maps to r=14, and at the width-64 band's 0.90 load that is r/0.90 = 15.56
-// bits per key, a third under the blocked-Bloom's measured 22.1.
+// target maps to r=14, and at the width-64 band's 0.85 load that is r/0.85 = 16.47
+// bits per key, still a clear win over the blocked-Bloom's measured 22.1.
 func TestRibbonBitsForFPR(t *testing.T) {
 	cases := []struct {
 		fp   float64

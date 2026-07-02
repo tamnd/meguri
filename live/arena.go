@@ -51,6 +51,26 @@ func (a *arenaWriter) intern(s string) (uint64, error) {
 	return off, nil
 }
 
+// internBytes is intern for a byte slice the caller already holds, avoiding the string
+// copy the []byte-to-string conversion would make. The compaction carry path resolves
+// each unchanged URL as a window slice from the sequential arena reader and re-interns
+// it, tens of millions of times, so skipping that copy removes tens of millions of short
+// allocations from the merge. The bytes are written before the call returns, so the
+// caller may reuse the slice after (the sequential reader overwrites its window on the
+// next read).
+func (a *arenaWriter) internBytes(b []byte) (uint64, error) {
+	off := a.off
+	n := binary.PutUvarint(a.tmp, uint64(len(b)))
+	if _, err := a.w.Write(a.tmp[:n]); err != nil {
+		return 0, err
+	}
+	if _, err := a.w.Write(b); err != nil {
+		return 0, err
+	}
+	a.off += uint64(n) + uint64(len(b))
+	return off, nil
+}
+
 // size is the arena length so far, the StringsSize the encoder reads.
 func (a *arenaWriter) size() int64 { return int64(a.off) }
 
